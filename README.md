@@ -7,7 +7,8 @@ An experimental, high-performance Vulkan Injection Layer that brings **real-time
 ---
 
 ### 🎥 Teaser / Preview
-*(Сюда вставляешь тот самый скриншот с башни, где тень упала как в Киберпанке!)*
+*(<img width="1279" height="1023" alt="Снимок экрана 2026-10-03 204409" src="https://github.com/user-attachments/assets/a6b61e9b-08b4-4eaa-89ef-316024ee28cf" />
+)*
 
 ### ✨ Current Features
 - 🚀 **Zero Engine Modification:** Works via custom Vulkan Layer interception.
