@@ -1,0 +1,5 @@
+0.20.0
+- Ray-traced sun shadows, characters, AO, one-bounce GI
+- Temporal accumulation + bilateral denoise
+- Sun direction smoothing, 16x anisotropic filtering
+- Experimental: a few instanced props in the acceleration structure

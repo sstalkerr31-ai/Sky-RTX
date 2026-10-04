@@ -1,0 +1,38 @@
+[size=6][b]SkyRT - hardware ray tracing for Sky: Children of the Light[/b][/size]
+
+[b]The first public mod that brings real RTX ray tracing to Sky.[/b] Not a ReShade preset: SkyRT is a Vulkan layer that rebuilds the scene as acceleration structures and traces rays against the real geometry with hardware [i]ray_query[/i].
+
+[size=5][b]What you get[/b][/size]
+[list]
+[*][b]Ray-traced sun shadows[/b] with a soft penumbra, including shadows from things that are off screen or behind walls
+[*][b]Characters cast smooth moving shadows[/b] (rebuilt every frame)
+[*][b]Ray-traced ambient occlusion[/b] and one-bounce [b]global illumination[/b] with colour bleeding
+[*][b]Denoising[/b]: bilateral blur + temporal accumulation
+[*][b]16x anisotropic filtering[/b] for sharper textures at a distance
+[*]The sun direction is read from the game
+[*]No game files are modified
+[/list]
+
+[size=5][b]Not done yet[/b][/size]
+[list]
+[*]Water and reflections
+[*]Grass / foliage in the acceleration structure
+[*]Light from fires and emissive objects, multi-bounce GI
+[/list]
+
+[size=5][b]Requirements[/b][/size]
+Windows 10/11, GPU with Vulkan ray_query support, up-to-date drivers. Tested only on an RTX 5070 Ti.
+
+[size=5][b]Installation[/b][/size]
+[list=1]
+[*]Unpack the archive to a permanent folder
+[*]Run [b]Install.bat[/b] once
+[*]Start the game with [b]Run_Sky_with_RT.bat[/b]
+[/list]
+Controls: [b]Ctrl+Home[/b] = RT on/off, [b]Ctrl+End[/b] = debug views. Settings are in SkyRT.cfg (applied live).
+
+[size=5][b]Uninstall[/b][/size]
+Run Uninstall.bat and delete the folder.
+
+[size=5][b]Notes[/b][/size]
+Experimental. Unofficial fan project, not affiliated with thatgamecompany; it only hooks the graphics API on your PC. Use at your own risk. Source code (MIT): https://github.com/sstalkerr31-ai/Sky-RTX
