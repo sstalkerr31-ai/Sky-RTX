@@ -9,6 +9,24 @@ An implicit **Vulkan layer** (`SkyRT.dll`) that adds hardware ray tracing to *Sk
 
 ---
 
+## 🥇 Why SkyRT is different
+
+As of October 2026, **no other publicly available project brings hardware ray tracing to *Sky: Children of the Light*** (searched GitHub, Nexus Mods and the web). What exists for Sky today is post-processing:
+
+| | ReShade / "RTGI" presets | **SkyRT** |
+|---|---|---|
+| Rays traced against | the depth buffer (screen space) | **real scene geometry (BLAS/TLAS)** |
+| Shadow from something off-screen or behind a wall | ❌ impossible | ✅ |
+| Shadows of moving characters | ❌ | ✅ rebuilt every frame |
+| Uses RTX hardware (`ray_query`) | ❌ | ✅ |
+| Game files modified | no | no (implicit Vulkan layer) |
+
+NVIDIA RTX Remix does not apply either: it targets DirectX 8/9 fixed-function games, not a modern Vulkan renderer like Sky's.
+
+If you know of another hardware-RT project for Sky, open an issue and it will be listed here.
+
+---
+
 ## ✨ What it does today
 
 | Feature | State |
@@ -69,6 +87,6 @@ Unofficial fan project, not affiliated with thatgamecompany. It only hooks the g
 
 ## 🇷🇺 Коротко по-русски
 
-Неявный Vulkan-слой с аппаратной трассировкой лучей для Sky: Children of the Light. Сейчас: мягкие RT-тени от солнца (в том числе от персонажей), AO и один отскок света, шумоподавление с накоплением по кадрам, анизотропная фильтрация. Вода, трава и свет от огня ещё не сделаны. Сборка: `build.bat` → `install.ps1` → запуск игры с `SKYRT_ENABLE=1`.
+Первый (из найденных нами) открытый проект с аппаратной трассировкой лучей для Sky, а не ReShade-пост-обработкой: неявный Vulkan-слой с аппаратной трассировкой лучей для Sky: Children of the Light. Сейчас: мягкие RT-тени от солнца (в том числе от персонажей), AO и один отскок света, шумоподавление с накоплением по кадрам, анизотропная фильтрация. Вода, трава и свет от огня ещё не сделаны. Сборка: `build.bat` → `install.ps1` → запуск игры с `SKYRT_ENABLE=1`.
 
 *Created by [Stalker 31]*
