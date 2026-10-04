@@ -5,8 +5,7 @@
 An implicit **Vulkan layer** (`SkyRT.dll`) that adds hardware ray tracing to *Sky: Children of the Light* without modifying the game: it hooks the Vulkan loader, rebuilds the scene as acceleration structures on the fly and composites ray-traced lighting into the game's HDR image before post-processing.
 
 ### 🎥 Preview
-<img width="1279" height="1023" alt="SkyRT preview" src="<img width="2000" height="2000" alt="04 10 2026 17_44_33" src="https://github.com/user-attachments/assets/2f8c7eaa-109c-4fa9-b472-e686fc27014d" />
-" />
+<img width="1000" alt="SkyRT: RTX OFF / RTX ON" src="https://github.com/user-attachments/assets/2f8c7eaa-109c-4fa9-b472-e686fc27014d" />
 
 ---
 
