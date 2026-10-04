@@ -1,0 +1,171 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+// SkyRT step 8, pass 2 (composite): depth/plane-aware blur of the noisy trace results, then applies them to the HDR color.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D uColor;
+layout(set = 0, binding = 1) uniform texture2D uDepth;
+layout(set = 0, binding = 3, rgba16f) uniform image2D uGI;
+layout(set = 0, binding = 4, r32f) uniform image2D uSh;
+layout(set = 0, binding = 6, rgba16f) uniform image2D uHA;     // step 20: temporal history, this frame (write): bounce rgb + AO
+layout(set = 0, binding = 7, rgba32f) uniform image2D uHB;     // shadow, depth, sample count
+layout(set = 0, binding = 8, rgba16f) uniform image2D uHAp;    // previous frame (read)
+layout(set = 0, binding = 9, rgba32f) uniform image2D uHBp;
+layout(set = 0, binding = 5, std140) uniform Params {
+    mat4 vp;
+    mat4 invVP;
+    vec4 sun;
+    vec4 cam;
+    uvec4 misc;    // x,y = size, z = mode (0 normal, 1 grid, 2 normals, 3 off, 4 AO only, 5 bounce only), w = frame
+    uvec4 flags;
+    vec4 fx;       // x = AO strength, y = AO radius, z = GI strength, w = GI range
+    vec4 fx2;
+    mat4 pvp;      // previous frame view-projection
+    vec4 tp;       // x = history valid, y = max accumulated samples
+} u;
+
+vec3 worldAt(ivec2 p, float z) {
+    vec2 ndc = (vec2(p) + 0.5) / vec2(u.misc.xy) * 2.0 - 1.0;
+    if (u.cam.w > 0.5) ndc.y = -ndc.y;
+    vec4 w = u.invVP * vec4(ndc, z, 1.0);
+    return w.xyz / w.w;
+}
+
+bool neighbour(ivec2 q, out vec3 pos) {
+    q = clamp(q, ivec2(0), ivec2(u.misc.xy) - 1);
+    float z = texelFetch(uDepth, q, 0).r;
+    pos = vec3(0.0);
+    if (z <= 0.0) return false;
+    pos = worldAt(q, z);
+    return true;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = ivec2(u.misc.xy);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+    uint mode = u.misc.z;
+    float z = texelFetch(uDepth, p, 0).r;
+    if (z <= 0.0) { imageStore(uHB, p, vec4(0.0)); return; }
+
+    vec3 P = worldAt(p, z);
+    vec3 Pr, Pl, Pu, Pd;
+    bool okR = neighbour(p + ivec2(1, 0), Pr);
+    bool okL = neighbour(p - ivec2(1, 0), Pl);
+    bool okU = neighbour(p + ivec2(0, 1), Pu);
+    bool okD = neighbour(p - ivec2(0, 1), Pd);
+    vec3 dx = vec3(0.0), dy = vec3(0.0);
+    if (okR && okL) dx = (length(Pr - P) < length(P - Pl)) ? (Pr - P) : (P - Pl);
+    else if (okR) dx = Pr - P;
+    else if (okL) dx = P - Pl;
+    if (okU && okD) dy = (length(Pu - P) < length(P - Pd)) ? (Pu - P) : (P - Pd);
+    else if (okU) dy = Pu - P;
+    else if (okD) dy = P - Pd;
+    vec3 N = cross(dx, dy);
+    float nl = length(N);
+    N = nl > 1e-20 ? N / nl : vec3(0.0, 1.0, 0.0);
+    float dist = length(u.cam.xyz - P);
+    if (dot(N, u.cam.xyz - P) < 0.0) N = -N;
+
+    vec4 c = imageLoad(uColor, p);
+    if (mode == 1u) {
+        vec3 g = abs(fract(P * 0.25) - 0.5);
+        float line = (min(min(g.x, g.y), g.z) > 0.47) ? 1.0 : 0.0;
+        imageStore(uColor, p, vec4(mix(c.rgb, vec3(1.0, 0.1, 0.9), line), c.a));
+        return;
+    }
+    if (mode == 2u) {
+        imageStore(uColor, p, vec4(N * 0.5 + 0.5, c.a));
+        return;
+    }
+
+    { // water pixels carry their final colour (trace pass marks them with a negative shadow value)
+        float shc = imageLoad(uSh, p).r;
+        if (shc < -0.5 && mode == 0u && (u.flags.x & 8u) != 0u) {
+            vec3 wc = imageLoad(uGI, p).rgb;
+            if (!(any(isnan(wc)) || any(isinf(wc)))) imageStore(uColor, p, vec4(wc, c.a));
+            imageStore(uHB, p, vec4(0.0));
+            return;
+        }
+    }
+
+    // ---- bilateral blur: same surface = close depth and close to the tangent plane
+    float tol = 0.03 + 0.01 * dist;
+    vec4 gi = vec4(0.0), gi2 = vec4(0.0);
+    float sh = 0.0, sh2 = 0.0, wsum = 0.0;
+    for (int j = -4; j <= 4; ++j) {
+        for (int i = -4; i <= 4; ++i) {
+            ivec2 q = clamp(p + ivec2(i, j), ivec2(0), sz - 1);
+            float zq = texelFetch(uDepth, q, 0).r;
+            if (zq <= 0.0) continue;
+            if (abs(zq - z) > 0.05 * z) continue;
+            vec3 Pq = worldAt(q, zq);
+            if (abs(dot(N, Pq - P)) > tol) continue;
+            float w = exp(-float(i * i + j * j) / 10.0);
+            vec4 g = imageLoad(uGI, q);
+            float sq = imageLoad(uSh, q).r;
+            if (any(isnan(g)) || any(isinf(g)) || isnan(sq) || isinf(sq) || sq < -0.5) continue;   // water pixels are not part of the land blur
+            float gl = dot(g.rgb, vec3(0.2126, 0.7152, 0.0722));
+            if (gl > 1.0) g.rgb *= 1.0 / gl;   // firefly guard
+            gi += g * w;
+            gi2 += g * g * w;
+            sh += sq * w;
+            sh2 += sq * sq * w;
+            wsum += w;
+        }
+    }
+    if (wsum <= 0.0) { gi = imageLoad(uGI, p); sh = imageLoad(uSh, p).r; gi2 = gi * gi; sh2 = sh * sh; wsum = 1.0; }
+    gi /= wsum;
+    sh /= wsum;
+    gi2 /= wsum;
+    sh2 /= wsum;
+
+    // ---- step 20: temporal accumulation. History = previous accumulated result, reprojected with the previous camera
+    // (static-world assumption), rejected where the depth disagrees (disocclusion, moving objects) and clipped to the
+    // local mean +- 1.5 sigma of this frame's samples so moving shadows leave no trail.
+    {
+        float n = 1.0;
+        if (u.tp.x > 0.5) {
+            vec4 pc = u.pvp * vec4(P, 1.0);
+            if (pc.w > 1e-6) {
+                vec2 ndc = pc.xy / pc.w;
+                if (u.cam.w > 0.5) ndc.y = -ndc.y;
+                ivec2 pp = ivec2(floor((ndc * 0.5 + 0.5) * vec2(sz)));
+                float pz = pc.z / pc.w;
+                if (all(greaterThanEqual(pp, ivec2(0))) && all(lessThan(pp, sz)) && pz > 0.0) {
+                    vec4 hb = imageLoad(uHBp, pp);
+                    if (hb.g > 0.0 && abs(hb.g - pz) < 0.03 * pz) {
+                        vec4 ha = imageLoad(uHAp, pp);
+                        if (!(any(isnan(ha)) || any(isinf(ha)) || isnan(hb.r) || isinf(hb.r))) {
+                            vec4 sg = sqrt(max(gi2 - gi * gi, vec4(0.0)));
+                            float ssg = sqrt(max(sh2 - sh * sh, 0.0));
+                            ha = clamp(ha, gi - 1.5 * sg - 0.01, gi + 1.5 * sg + 0.01);
+                            float hs = clamp(hb.r, sh - 1.5 * ssg - 0.02, sh + 1.5 * ssg + 0.02);
+                            n = min(hb.b + 1.0, max(u.tp.y, 1.0));
+                            float a = 1.0 / n;
+                            gi = mix(ha, gi, a);
+                            sh = mix(hs, sh, a);
+                        }
+                    }
+                }
+            }
+        }
+        imageStore(uHA, p, gi);
+        imageStore(uHB, p, vec4(sh, z, n, 0.0));
+    }
+
+    float fade = 1.0 - smoothstep(80.0, 200.0, dist);
+    if (mode == 4u) { imageStore(uColor, p, vec4(vec3(1.0 - clamp(u.fx.x * fade * gi.a, 0.0, 1.0)), c.a)); return; }
+    if (mode == 5u) { imageStore(uColor, p, vec4(gi.rgb, c.a)); return; }
+
+    vec3 rgb = c.rgb;
+    if ((u.flags.x & 1u) != 0u) rgb *= (1.0 - u.sun.w * (1.0 - sh));
+    if ((u.flags.x & 2u) != 0u) rgb *= (1.0 - u.fx.x * fade * gi.a);
+    if ((u.flags.x & 4u) != 0u) {
+        float lum = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
+        vec3 chroma = min(c.rgb / (lum + 0.02), vec3(2.5));  // surface tint without its brightness
+        rgb += u.fx.z * 0.5 * chroma * gi.rgb * fade;
+    }
+    if (any(isnan(rgb)) || any(isinf(rgb))) rgb = c.rgb;
+    imageStore(uColor, p, vec4(rgb, c.a));
+}

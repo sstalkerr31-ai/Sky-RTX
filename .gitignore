@@ -1,0 +1,10 @@
+*.dll
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+SkyRT_*.log
+SkyRT_shaders/
+SkyRT.cfg
+*.spv
