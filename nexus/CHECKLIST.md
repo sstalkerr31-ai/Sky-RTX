@@ -1,7 +1,7 @@
 # Publishing on Nexus Mods
 
 1. Build: `release\package_release.ps1 -Version 0.20.0` -> `dist\SkyRT-0.20.0.zip`
-2. Test the zip on a clean folder: Install.bat -> Run_Sky_with_RT.bat -> check `SkyRT_*.log`.
+2. Test the zip on a clean folder: SkyRT_Panel.exe -> Install ray tracing -> Play with rays -> check `SkyRT_*.log` (Log tab).
 3. Nexus: Sky: Children of the Light -> Upload mod -> category "Visuals and Graphics".
 4. Paste `nexus/DESCRIPTION.bbcode` into the description, upload 3-5 screenshots (RTX OFF/ON side by side),
    put `nexus/CHANGELOG.txt` into the changelog field.

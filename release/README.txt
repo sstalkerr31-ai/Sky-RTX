@@ -1,27 +1,20 @@
-SkyRT - hardware ray tracing for Sky: Children of the Light (PC)
-=================================================================
+SkyRT - ray tracing for Sky: Children of the Light (PC)
+=======================================================
+EN
+ 1. Unpack this archive anywhere (the folder can be deleted after step 3).
+ 2. Run SkyRT_Panel.exe.
+ 3. Tab "Game": click "Install ray tracing", set the path to Sky.exe, click "Play with rays".
+ 4. Tab "Graphics": presets and sliders, applied live.
+ In game: Ctrl+Home = rays on/off, Ctrl+End = debug views.
+ Uninstall: "Uninstall" in the panel.
 
-REQUIREMENTS
-  Windows 10/11, a GPU with Vulkan ray_query support (tested on an RTX 5070 Ti only), up to date drivers.
+RU
+ 1. Распакуй архив куда угодно (после шага 3 папку можно удалить).
+ 2. Запусти SkyRT_Panel.exe.
+ 3. Вкладка «Игра»: «Установить лучи», укажи путь к Sky.exe, «Играть с лучами».
+ 4. Вкладка «Графика»: пресеты и ползунки, применяются на лету.
+ В игре: Ctrl+Home - лучи вкл/выкл, Ctrl+End - режимы отладки.
+ Удаление: кнопка «Удалить лучи» в панели.
 
-INSTALL
-  1. Unpack this folder somewhere permanent. Do NOT move it afterwards (the registry stores its path).
-  2. Run Install.bat once.
-  3. Start the game with Run_Sky_with_RT.bat (first time it asks for the path to Sky.exe).
-     Steam / other launchers: set the environment variable SKYRT_ENABLE=1 for the game process.
-
-CONTROLS
-  Ctrl+Home  ray tracing on / off
-  Ctrl+End   cycle debug views
-  SkyRT.cfg (created next to SkyRT.dll on the first run) is re-read while the game runs.
-  If the game looks wrong: set taa=0 or instgeo=0, or delete SkyRT.cfg to restore defaults.
-
-UNINSTALL
-  Run Uninstall.bat, then delete the folder.
-
-LOGS
-  Every run writes SkyRT_<date>_<pid>.log next to the DLL. Attach it to bug reports.
-
-NOTES
-  The mod does not change any game files. It is an unofficial fan project, not affiliated with
-  thatgamecompany. Use at your own risk.
+Full guide / подробная инструкция: https://github.com/sstalkerr31-ai/Sky-RTX
+Unofficial fan project, use at your own risk. / Неофициальный фан-проект, на свой риск.
