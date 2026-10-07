@@ -318,7 +318,10 @@ void main() {
         if (any(isnan(emis)) || any(isinf(emis))) emis = vec3(0.0);
         // soft ceiling: however strong the lights are set, the light added to one pixel saturates at about tp.w (no blown-out pools)
         float el = dot(emis, vec3(0.2126, 0.7152, 0.0722));
-        emis *= 1.0 / (1.0 + el / max(u.tp.w, 0.05));
+        // the ceiling follows how bright the surface already is: a dark night meadow can take only a little extra light before it
+        // looks like a glow, a lit surface can take more. This makes the result much less sensitive to the strength setting.
+        float capL = min(u.tp.w, 0.02 + 1.5 * dot(c, vec3(0.2126, 0.7152, 0.0722)));
+        emis *= 1.0 / (1.0 + el / max(capL, 0.02));
         // eyes adapt: a surface that is already bright (daylight) hardly notices an extra lamp
         emis *= 1.0 / (1.0 + 2.5 * dot(c, vec3(0.2126, 0.7152, 0.0722)));
     }
