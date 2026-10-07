@@ -71,6 +71,7 @@ static int g_taa = 1;             // step 20: temporal accumulation of shadows /
 static int g_lightOn = 1;          // step 21: light from fire / candles / lamps (bright pixels of the frame become point lights), cfg light=0/1
 static float g_lightStrength = 25.0f, g_lightRange = 12.0f, g_lightThr = 2.0f;   // cfg lightstrength, lightrange (world units), lightthr (HDR brightness that counts as emissive)
 static int g_lightRays = 2, g_lightDebug = 0;   // cfg lightrays (shadow rays per pixel), lightdebug (paint the emissive pixels magenta)
+static float g_giMulti = 0.6f;   // step 22: multi-bounce GI strength 0..0.9 (cfg gimulti): the previous frame's indirect light is added to what bounce rays see
 static float g_taaN = 12.0f;      // step 20: maximum accumulated samples (cfg taan); lower = less ghosting, more noise
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
 static int g_aniso = 16;          // step 13: anisotropic filtering forced on every linear sampler (cfg: aniso=0/2/4/8/16)
@@ -2889,6 +2890,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "glint=1.0     # 0..4 sun glitter on the water\r\n"
                   "taa=1         # 1 = temporal accumulation of shadows / AO / GI (less noise)\r\n"
                   "taan=12       # max accumulated frames (lower = less ghosting, more noise)\r\n"
+                  "gimulti=0.6   # 0..0.9 multi-bounce GI: light bounces more than once (needs taa=1); 0 = single bounce\r\n"
                   "light=1       # 1 = light from fire, candles and lamps (bright pixels become light sources that cast shadows)\r\n"
                   "lightstrength=25 # 0..200 how strong that light is (a candle flame is tiny, so this needs to be large)\r\n"
                   "lightrange=12 # world units, how far the light of one source reaches\r\n"
@@ -2948,6 +2950,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "dyngeo")) g_dynGeo = v != 0.0;
         else if (!strcmp(key, "taa")) g_taa = v != 0.0;
         else if (!strcmp(key, "taan")) g_taaN = (float)std::max(1.0, std::min(64.0, v));
+        else if (!strcmp(key, "gimulti")) g_giMulti = (float)std::max(0.0, std::min(0.9, v));
         else if (!strcmp(key, "light")) g_lightOn = v != 0.0;
         else if (!strcmp(key, "lightstrength")) g_lightStrength = (float)std::max(0.0, std::min(200.0, v));
         else if (!strcmp(key, "lightrange")) g_lightRange = (float)std::max(1.0, std::min(60.0, v));
@@ -2964,7 +2967,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
              g_enabled ? 1 : 0, g_view, kViewNames[g_view % 8], g_shadows ? 1 : 0, (double)g_strength, (double)g_sunSize, g_shRays, g_aoOn ? 1 : 0,
              (double)g_aoStrength, (double)g_aoRadius, g_giOn ? 1 : 0, (double)g_giStrength, (double)g_giRange, g_aoRays, g_autoSun ? 1 : 0, g_sunAz, g_sunEl);
     if (logIt)
-        Logf("rt: emissive light: light=%d strength %.2f range %.1f threshold %.2f rays %d debug %d", g_lightOn ? 1 : 0, (double)g_lightStrength, (double)g_lightRange, (double)g_lightThr, g_lightRays, g_lightDebug ? 1 : 0);
+        Logf("rt: emissive light: light=%d strength %.2f range %.1f threshold %.2f rays %d debug %d | multi-bounce gimulti=%.2f", g_lightOn ? 1 : 0, (double)g_lightStrength, (double)g_lightRange, (double)g_lightThr, g_lightRays, g_lightDebug ? 1 : 0, (double)g_giMulti);
 }
 
 static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = next view; SkyRT.cfg is re-read when it changes
@@ -3535,7 +3538,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     par->flags[3] = g_reflOn ? 1u : 0u;
     par->fx[0] = g_aoStrength; par->fx[1] = g_aoRadius; par->fx[2] = g_giStrength; par->fx[3] = g_giRange;
     memcpy(par->pvp, d->prevVp, sizeof par->pvp);
-    par->tp[0] = useHist ? 1.0f : 0.0f; par->tp[1] = g_taaN; par->tp[2] = 0.0f; par->tp[3] = 0.0f;
+    par->tp[0] = useHist ? 1.0f : 0.0f; par->tp[1] = g_taaN; par->tp[2] = useHist ? g_giMulti : 0.0f; par->tp[3] = 0.0f;
     par->lt[0] = g_lightStrength; par->lt[1] = g_lightRange; par->lt[2] = g_lightThr; par->lt[3] = (flagsEff & 4u) ? g_giStrength * 0.5f : 0.0f;
     par->lm[0] = lightTile; par->lm[1] = lightTx; par->lm[2] = (uint32_t)g_lightRays; par->lm[3] = lightsOn ? (1u | (g_lightDebug ? 2u : 0u)) : 0u;
     par->fx2[0] = tanf(g_sunSize * 3.14159265f / 180.0f); par->fx2[1] = g_reflStrength; par->fx2[2] = (float)(d->paintInjected.load() % 100000) * 0.0133f; par->fx2[3] = g_glint;
@@ -3597,10 +3600,13 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     pre[2].image = giI;
     pre[3] = pre[2];
     pre[3].image = shI;
+    VkMemoryBarrier hmb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};   // step 22: the trace pass reads the history the previous frame's composite wrote
+    hmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    hmb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     d->CmdPipelineBarrier(cb,
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 4, pre);
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &hmb, 0, nullptr, 4, pre);
 
     // ---- pass 0 (step 21): find emissive light sources. The list is cleared, filled tile by tile and then read by the trace pass
     if (lightsOn) {

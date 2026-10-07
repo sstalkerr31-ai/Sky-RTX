@@ -55,6 +55,7 @@ TXT = {
         "rt_on": "Лучи включены", "shadows": "Тени", "ao": "AO", "gi": "GI",
         "strength": "Сила", "sunsize": "Размер солнца (мягкость), °", "rays": "Лучей на пиксель", "radius": "Радиус", "range": "Дальность",
         "taa": "Накопление по кадрам (TAA)", "taan": "Накоплено кадров (макс.)",
+        "gimulti": "Многократные отскоки света",
         "light": "Огонь, свечи и лампы освещают всё вокруг", "lightstrength": "Яркость света", "lightrange": "Дальность света", "lightthr": "Порог яркости источника", "lightrays": "Теневых лучей на пиксель", "lightdebug": "Показать найденные источники (розовым)",
         "dyngeo": "Персонажи отбрасывают лучевые тени", "instgeo": "Мелкие инстансные объекты (эксперимент)",
         "aniso": "Анизотропия", "lodbias": "Резкость текстур (LOD bias)", "restart": "применяется при следующем запуске игры",
@@ -83,6 +84,7 @@ TXT = {
         "rt_on": "Ray tracing enabled", "shadows": "Shadows", "ao": "AO", "gi": "GI",
         "strength": "Strength", "sunsize": "Sun size (softness), deg", "rays": "Rays per pixel", "radius": "Radius", "range": "Range",
         "taa": "Temporal accumulation (TAA)", "taan": "Accumulated frames (max)",
+        "gimulti": "Multi-bounce light",
         "light": "Fire, candles and lamps light their surroundings", "lightstrength": "Light strength", "lightrange": "Light range", "lightthr": "Source brightness threshold", "lightrays": "Shadow rays per pixel", "lightdebug": "Show detected sources (magenta)",
         "dyngeo": "Characters cast ray-traced shadows", "instgeo": "Small instanced props (experimental)",
         "aniso": "Anisotropic filtering", "lodbias": "Texture sharpness (LOD bias)", "restart": "applies on the next game start",
@@ -103,6 +105,7 @@ SETTINGS = {
     "gi": (1, 0, 1, "b"), "gistrength": (0.35, 0.0, 2.0, "f"), "girange": (30.0, 1.0, 200.0, "f"),
     "taa": (1, 0, 1, "b"), "taan": (12.0, 1.0, 64.0, "f"),
     "dyngeo": (1, 0, 1, "b"), "instgeo": (1, 0, 1, "b"),
+    "gimulti": (0.6, 0.0, 0.9, "f"),
     "light": (1, 0, 1, "b"), "lightstrength": (25.0, 0.0, 200.0, "f"), "lightrange": (12.0, 1.0, 60.0, "f"), "lightthr": (2.0, 0.3, 50.0, "f"),
     "lightrays": (2, 1, 4, "i"), "lightdebug": (0, 0, 1, "b"),
     "aniso": (16, 0, 16, "i"), "lodbias": (0.0, -2.0, 1.0, "f"),
@@ -364,7 +367,7 @@ class Panel(QMainWindow):
         fl = group("g_main"); add_bool(fl, "enabled", "rt_on")
         fl = group("g_sh"); add_bool(fl, "shadows", "shadows"); add_slider(fl, "strength", "strength"); add_slider(fl, "sunsize", "sunsize"); add_slider(fl, "shrays", "rays")
         fl = group("g_ao"); add_bool(fl, "ao", "ao"); add_slider(fl, "aostrength", "strength"); add_slider(fl, "aoradius", "radius"); add_slider(fl, "aorays", "rays")
-        fl = group("g_gi"); add_bool(fl, "gi", "gi"); add_slider(fl, "gistrength", "strength"); add_slider(fl, "girange", "range")
+        fl = group("g_gi"); add_bool(fl, "gi", "gi"); add_slider(fl, "gistrength", "strength"); add_slider(fl, "girange", "range"); add_slider(fl, "gimulti", "gimulti")
         fl = group("g_light"); add_bool(fl, "light", "light"); add_slider(fl, "lightstrength", "lightstrength"); add_slider(fl, "lightrange", "lightrange")
         add_slider(fl, "lightthr", "lightthr"); add_slider(fl, "lightrays", "lightrays"); add_bool(fl, "lightdebug", "lightdebug")
         fl = group("g_dn"); add_bool(fl, "taa", "taa"); add_slider(fl, "taan", "taan")

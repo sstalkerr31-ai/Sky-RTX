@@ -21,11 +21,13 @@ layout(set = 0, binding = 5, std140) uniform Params {
     uvec4 flags;   // x = bit0 shadows, bit1 AO, bit2 GI; y = shadow rays; z = hemisphere rays
     vec4 fx;       // x = AO strength, y = AO radius, z = GI strength, w = GI range
     vec4 fx2;      // x = tan(sun angular radius)
-    mat4 pvp;      // (composite only)
-    vec4 tp;       // (composite only)
+    mat4 pvp;      // previous frame view-projection
+    vec4 tp;       // x = history valid, y = max samples, z = multi-bounce strength (step 22)
     vec4 lt;       // step 21: x = light strength, y = light range, z = brightness threshold, w = GI multiplier (strength * 0.5, 0 = GI off)
     uvec4 lm;      // x = tile size, y = tiles in x, z = shadow rays per pixel for lights, w = bit0 lights on
 } u;
+layout(set = 0, binding = 8, rgba16f) uniform image2D uHAp;    // step 22: previous frame accumulated indirect light (read only here)
+layout(set = 0, binding = 9, rgba32f) uniform image2D uHBp;    // previous frame: shadow, depth, sample count
 layout(set = 0, binding = 10, std430) readonly buffer Lights {
     uint count;
     uint maxLum;
@@ -58,6 +60,25 @@ vec3 screenColor(vec3 wp, vec3 fallback, bool wantSky) {
         if (d <= 0.0 || abs(d - expected) > 0.08 * expected) return fallback;
     }
     return imageLoad(uColor, q).rgb;
+}
+
+// step 22 (multi bounce): the indirect light the previous frame computed for the surface at world position wp
+// (reprojected with the previous camera, rejected when the depth there disagrees). Added to what a bounce ray sees, it makes every
+// frame one more bounce deeper: light that bounced off the ground can bounce again off a wall.
+vec3 prevIndirect(vec3 wp) {
+    vec4 pc = u.pvp * vec4(wp, 1.0);
+    if (pc.w <= 1e-5) return vec3(0.0);
+    vec2 ndc = pc.xy / pc.w;
+    if (u.cam.w > 0.5) ndc.y = -ndc.y;
+    vec2 uv = ndc * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) return vec3(0.0);
+    ivec2 q = ivec2(uv * vec2(u.misc.xy));
+    float pz = pc.z / pc.w;
+    vec4 hb = imageLoad(uHBp, q);
+    if (!(hb.g > 0.0) || abs(hb.g - pz) > 0.05 * pz) return vec3(0.0);
+    vec4 ha = imageLoad(uHAp, q);
+    if (any(isnan(ha)) || any(isinf(ha))) return vec3(0.0);
+    return max(ha.rgb, vec3(0.0));
 }
 
 void basis(vec3 N, out vec3 T, out vec3 B) {
@@ -202,6 +223,7 @@ void main() {
     vec3 bounce = vec3(0.0);
     float occ = 0.0;
     int nH = int(u.flags.z);
+    const bool multi = u.tp.x > 0.5 && u.tp.z > 0.0;   // history valid and multi-bounce strength > 0
     if ((u.flags.x & 6u) != 0u && nH > 0) {
         float aoR = u.fx.y;
         float range = max(u.fx.w, aoR);
@@ -217,7 +239,13 @@ void main() {
             if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
                 float t = rayQueryGetIntersectionTEXT(rq, true);
                 if (t < aoR) occ += 1.0 - t / aoR;
-                bounce += tame(screenColor(origin + dir * t, c * 0.5, false));
+                vec3 hp = origin + dir * t;
+                vec3 hc = screenColor(hp, c * 0.5, false);
+                if (multi) {   // + the indirect light that surface received last frame, tinted by its own colour (chroma capped at 1: the series must converge)
+                    float hl = dot(hc, vec3(0.2126, 0.7152, 0.0722));
+                    hc += min(hc / (hl + 0.02), vec3(1.0)) * prevIndirect(hp) * u.tp.z;
+                }
+                bounce += tame(hc);
             } else {
                 bounce += tame(screenColor(origin + dir * 5000.0, c * 0.6, true));
             }

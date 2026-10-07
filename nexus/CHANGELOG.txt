@@ -1,4 +1,5 @@
 0.21.0 (in development)
+- Multi-bounce global illumination (cfg: gimulti)
 - Light from fire, candles and lamps: bright pixels of the frame become light sources with ray-traced shadows (cfg: light, lightstrength, lightrange, lightthr, lightrays, lightdebug)
 
 0.20.0
