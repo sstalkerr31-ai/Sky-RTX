@@ -74,6 +74,7 @@ static float g_lightStrength = 2.0f, g_lightRange = 4.0f, g_lightThr = 2.0f, g_l
 static int g_lightRays = 2, g_lightDebug = 0;   // cfg lightrays (shadow rays per pixel), lightdebug (paint the emissive pixels magenta)
 static float g_giMulti = 0.1f;   // step 22: multi-bounce GI strength 0..0.9 (cfg gimulti): the previous frame's indirect light is added to what bounce rays see
 static float g_taaN = 12.0f;      // step 20: maximum accumulated samples (cfg taan); lower = less ghosting, more noise
+static int g_grass = 1;           // step 24: grass (non-indexed triangle strips written by the CPU) in the acceleration structure (cfg grass=0/1)
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
 static int g_aniso = 16;          // step 13: anisotropic filtering forced on every linear sampler (cfg: aniso=0/2/4/8/16)
 static float g_lodBias = 0.0f;    // cfg: lodbias (negative = sharper textures, e.g. -0.5)
@@ -358,6 +359,7 @@ struct DeviceData {
         uint64_t vsHash = 0, fsHash = 0;      // FNV-1a of the SPIR-V of the vertex / fragment shader (stable between runs)
         bool depthTest = false, depthWrite = false, blend = false;
         uint32_t srcColor = 0, dstColor = 0;  // blend factors of attachment 0
+        uint32_t topology = 3;   // VkPrimitiveTopology (3 = triangle list, 4 = triangle strip)
     };
     std::unordered_map<VkShaderModule, uint64_t> smHash;   // regMtx
     std::unordered_map<VkPipeline, PipeInfo> pipes;
@@ -518,6 +520,7 @@ struct DeviceData {
     VkPipeline lightPipe = VK_NULL_HANDLE;           // step 21: emissive light search
     VkPipeline lmergePipe = VK_NULL_HANDLE;          // step 23: merges the candidates into persistent lights
     bool lightZeroed = false;                        // the persistent part of the light buffer was cleared once
+    VkBuffer stripBuf = VK_NULL_HANDLE; VkDeviceMemory stripMem = VK_NULL_HANDLE; VkDeviceAddress stripAddr = 0; bool stripTried = false;   // step 24: index pattern 0,1,2, 1,2,3, ... turns a triangle strip into a list for the BLAS
     VkBuffer lightBuf = VK_NULL_HANDLE, statBuf = VK_NULL_HANDLE;   // device-local light list / small host-visible copy of its header for the log
     VkDeviceMemory lightMem = VK_NULL_HANDLE, statMem = VK_NULL_HANDLE;
     char* statPtr = nullptr;
@@ -1555,6 +1558,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateGraphicsPipelines(VkDevice dev
                 }
             }
             for (const DeviceData::PipeInfo::Bind& b : pi.binds) if (b.rate != 0) pi.instanced = true;
+            if (pInfos[i].pInputAssemblyState) pi.topology = (uint32_t)pInfos[i].pInputAssemblyState->topology;
             {
                 const VkPipelineDepthStencilStateCreateInfo* ds = pInfos[i].pDepthStencilState;
                 const VkPipelineColorBlendStateCreateInfo* cbs = pInfos[i].pColorBlendState;
@@ -2818,6 +2822,101 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
     }
 }
 
+// step 24: grass. The game draws it with non-indexed vkCmdDraw (vertex shader 30f51202...): a triangle strip per patch, written by the CPU every frame
+// into a host visible buffer. It goes into the per-frame dynamic BLAS like the characters; a strip is turned into a list with a shared index pattern.
+static const uint64_t kGrassVs = 0x30f512027097e446ull;
+static const uint32_t kGrassMaxVerts = 40000;
+static bool EnsureStripIndex(DeviceData* d) {
+    if (d->stripAddr) return true;
+    if (d->stripTried) return false;
+    d->stripTried = true;
+    const VkDeviceSize bytes = (VkDeviceSize)(kGrassMaxVerts - 2) * 3 * 2;
+    if (!MakeBufEx(d, bytes, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->stripBuf, d->stripMem, d->stripAddr)) {
+        Logf("!!! rt: grass: strip index buffer could not be created - grass stays out of the rays");
+        d->stripAddr = 0;
+        return false;
+    }
+    void* mp = nullptr;
+    if (d->MapMemory(d->device, d->stripMem, 0, VK_WHOLE_SIZE, 0, &mp) != VK_SUCCESS || !mp) { d->stripAddr = 0; return false; }
+    uint16_t* ix = (uint16_t*)mp;
+    for (uint32_t k = 0; k + 2 < kGrassMaxVerts; ++k) { ix[3 * k] = (uint16_t)k; ix[3 * k + 1] = (uint16_t)(k + 1); ix[3 * k + 2] = (uint16_t)(k + 2); }
+    return true;
+}
+static void MainDrawNonIndexed(DeviceData* d, VkCommandBuffer cb, uint32_t vertexCount, uint32_t firstVertex) {
+    if (!g_grass || !g_dynGeo || vertexCount < 3 || vertexCount > kGrassMaxVerts) return;
+    {
+        std::lock_guard<std::mutex> lk(d->paintMtx);
+        if (!d->mainCb.count(cb)) return;
+    }
+    DeviceData::CmdState st{};
+    {
+        std::lock_guard<std::mutex> lk(d->cmdMtx);
+        auto it = d->cmdState.find(cb);
+        if (it == d->cmdState.end()) return;
+        st = it->second;
+    }
+    uint32_t binding = 0, vstride = 0, voff = 0, topo = 3;
+    bool fmtOk = false;
+    {
+        std::lock_guard<std::mutex> lk(d->regMtx);
+        auto pit = d->pipes.find(st.pipe);
+        if (pit == d->pipes.end() || pit->second.vsHash != kGrassVs || !pit->second.opaque || pit->second.instanced) return;
+        topo = pit->second.topology;
+        for (const DeviceData::PipeInfo::Attr& a : pit->second.attrs) {
+            if (a.loc != 0 || a.format != (uint32_t)VK_FORMAT_R32G32B32_SFLOAT) continue;
+            for (const DeviceData::PipeInfo::Bind& b : pit->second.binds)
+                if (b.binding == a.binding && b.rate == 0) { fmtOk = true; binding = a.binding; vstride = b.stride; voff = a.offset; }
+        }
+    }
+    if (!fmtOk || binding >= 8 || !st.vb[binding] || vstride < 12 || (topo != 3 && topo != 4)) return;
+    DeviceData::BufInfo vbi{};
+    if (!BufInfoOf(d, st.vb[binding], vbi)) return;
+    {
+        std::lock_guard<std::mutex> lk(d->regMtx);
+        auto mit = d->mems.find(vbi.mem);
+        if (mit == d->mems.end() || !mit->second.hostVisible) return;
+    }
+    if (topo == 4 && !EnsureStripIndex(d)) return;
+    const uint64_t vbase = st.vbOff[binding] + voff + (uint64_t)firstVertex * vstride;
+    if (vbase + (uint64_t)vertexCount * vstride > vbi.size + voff) return;
+    VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    ai.buffer = st.vb[binding];
+    const VkDeviceAddress va = d->GetBufferDeviceAddress(d->device, &ai);
+    if (!va) return;
+    VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    g.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    g.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    g.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    g.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    g.geometry.triangles.vertexData.deviceAddress = va + vbase;
+    g.geometry.triangles.vertexStride = vstride;
+    g.geometry.triangles.maxVertex = vertexCount - 1;
+    VkAccelerationStructureBuildRangeInfoKHR rg{};
+    if (topo == 4) {
+        g.geometry.triangles.indexType = VK_INDEX_TYPE_UINT16;
+        g.geometry.triangles.indexData.deviceAddress = d->stripAddr;
+        rg.primitiveCount = vertexCount - 2;
+    } else {
+        g.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+        rg.primitiveCount = vertexCount / 3;
+    }
+    std::lock_guard<std::mutex> lk(d->geoMtx);
+    DeviceData::FrameGeo& fg = d->frameGeo[cb];
+    fg.draws++;
+    if (fg.dynGeoms.size() >= 900 || fg.dynTris + rg.primitiveCount > 150000) { fg.skipOther++; return; }
+    fg.dynXf.push_back(VkTransformMatrixKHR{{{1,0,0,0},{0,1,0,0},{0,0,1,0}}});
+    fg.dynProp.push_back(0);
+    fg.dynGeoms.push_back(g);
+    fg.dynRanges.push_back(rg);
+    fg.dynKeys.push_back(GeoKey{st.vb[binding], VK_NULL_HANDLE, vbase, 0, vertexCount, vstride});
+    fg.dynMems.emplace_back(vbi.mem, VK_NULL_HANDLE);
+    fg.dynTris += rg.primitiveCount;
+    d->dynClassified++;
+    static std::atomic<uint64_t> gn{0};
+    const uint64_t n = ++gn;
+    if (n == 1 || n == 2000 || n % 200000 == 0) Logf("rt: grass patch #%llu in the rays: %u vertices, %s, vertex stride %u, %u triangles", (unsigned long long)n, vertexCount, topo == 4 ? "triangle strip" : "triangle list", vstride, rg.primitiveCount);
+}
+
 // ---------------------------------------------------------------- camera
 static bool FiniteMat(const float* m, int n) {
     for (int i = 0; i < n; ++i) if (!(m[i] > -1e9f && m[i] < 1e9f)) return false;
@@ -2905,6 +3004,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "lightrays=2   # shadow rays per pixel for those lights 1..4\r\n"
                   "lightdebug=0  # 1 = paint the pixels that are treated as light sources magenta (to tune lightthr)\r\n"
                   "instgeo=1     # 1 = instanced props in the acceleration structure\r\n"
+                  "grass=1       # 1 = grass in the acceleration structure (casts shadows, takes part in AO); 0 = off\r\n"
                   "dyngeo=1      # 1 = characters / animated meshes get their own acceleration structure rebuilt every frame (smooth shadows of moving objects)\r\n"
                   "aniso=16      # anisotropic filtering forced on all textures: 0 = leave the game alone, 2/4/8/16 (applies on next game start)\r\n"
                   "lodbias=0     # -2..1 texture sharpness shift, negative = sharper (try -0.5), applies on next game start\r\n"
@@ -2955,6 +3055,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "glint")) g_glint = (float)std::max(0.0, std::min(4.0, v));
         else if (!strcmp(key, "dumpshaders")) g_dumpShaders = v != 0.0;
         else if (!strcmp(key, "dyngeo")) g_dynGeo = v != 0.0;
+        else if (!strcmp(key, "grass")) g_grass = v != 0.0;
         else if (!strcmp(key, "taa")) g_taa = v != 0.0;
         else if (!strcmp(key, "taan")) g_taaN = (float)std::max(1.0, std::min(64.0, v));
         else if (!strcmp(key, "gimulti")) g_giMulti = (float)std::max(0.0, std::min(0.9, v));
@@ -4129,6 +4230,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDraw(VkCommandBuffer cb, uint32_t ver
             if (ShouldHide(d, cb)) return;
         }
     }
+    if (instanceCount == 1) MainDrawNonIndexed(d, cb, vertexCount, firstVertex);
     {   // step 24 diagnostic (grass): non-indexed draws are not in the acceleration structure yet. Print layout, draw arguments and the first vertices
         // of every opaque non-indexed pipeline a few times, so the grass can be decoded.
         static std::mutex nm;
@@ -4153,8 +4255,8 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDraw(VkCommandBuffer cb, uint32_t ver
                         for (const DeviceData::PipeInfo::Bind& b : pi.binds) { char t[64]; snprintf(t, sizeof t, " bind%u(stride %u,%s)", b.binding, b.stride, b.rate ? "INSTANCE" : "vertex"); line += t; }
                         line += " |";
                         for (const DeviceData::PipeInfo::Attr& at : pi.attrs) { char t[96]; snprintf(t, sizeof t, " loc%u:b%u:%s@%u", at.loc, at.binding, FormatName(at.format), at.offset); line += t; }
-                        Logf("rt: NONINDEXED vs %016llx fs %016llx | vertexCount %u instanceCount %u firstVertex %u firstInstance %u |%s",
-                             (unsigned long long)pi.vsHash, (unsigned long long)pi.fsHash, vertexCount, instanceCount, firstVertex, firstInstance, line.c_str());
+                        Logf("rt: NONINDEXED topology %u vs %016llx fs %016llx | vertexCount %u instanceCount %u firstVertex %u firstInstance %u |%s",
+                             pi.topology, (unsigned long long)pi.vsHash, (unsigned long long)pi.fsHash, vertexCount, instanceCount, firstVertex, firstInstance, line.c_str());
                         for (const DeviceData::PipeInfo::Bind& b : pi.binds) {
                             if (b.binding >= 8 || !st.vb[b.binding] || b.stride == 0 || b.stride > 128) continue;
                             DeviceData::BufInfo bi{};
