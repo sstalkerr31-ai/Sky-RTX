@@ -84,6 +84,8 @@ Presets: **Low** 1 shadow ray / 2 AO rays, no GI · **Medium** 2 / 4 (default) �
 
 Everything the panel changes lives in `%LOCALAPPDATA%\SkyRT\SkyRT.cfg` (plain `key=value` lines, re-read about once a second). You can edit it by hand.
 
+> **About the defaults.** The default values were set by the developer to match his own taste, screen and PC. They are a starting point, not a rule: change any of them to whatever looks best to you (the panel sliders, or the file by hand). The mod is still in active development and the settings may change between versions.
+
 | Key | Range | Meaning |
 |---|---|---|
 | `enabled` | 0/1 | Ray tracing on/off (0 = original picture) |
@@ -95,7 +97,7 @@ Everything the panel changes lives in `%LOCALAPPDATA%\SkyRT\SkyRT.cfg` (plain `k
 | `instgeo` | 0/1 | Small instanced props in the acceleration structure (experimental) |
 | `gimulti` | 0–0.9 | Multi-bounce GI: light bounces more than once (every frame adds a bounce, needs `taa=1`); 0 = single bounce |
 | `light` | 0/1 | Light from fire, candles and lamps: very bright pixels of the frame become light sources that light and shadow their surroundings (new, needs testing) |
-| `lightstrength` · `lightrange` | 0–200 (default 8) · 1–60 | How strong the light is, how far (world units) one source reaches |
+| `lightstrength` · `lightrange` | 0–200 (default 2) · 1–60 | How strong the light is, how far (world units) one source reaches |
 | `lightmax` | 0.05–5 | Soft ceiling of the light added to one pixel (lower = never blown out) |
 | `lightthr` · `lightrays` · `lightdebug` | 0.3–50 · 1–4 · 0/1 | Brightness above which a pixel counts as a source (the log prints the brightest pixel it saw), shadow rays per pixel, paint detected sources magenta |
 | `aniso` · `lodbias` | 0–16 · −2…1 | Anisotropic filtering, texture sharpness shift (**applied on the next game start**) |
