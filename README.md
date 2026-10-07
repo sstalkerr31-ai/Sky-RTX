@@ -96,6 +96,7 @@ Everything the panel changes lives in `%LOCALAPPDATA%\SkyRT\SkyRT.cfg` (plain `k
 | `taa` · `taan` | 0/1 · 1–64 | Temporal accumulation on/off, max accumulated frames (lower = less ghosting, more noise) |
 | `dyngeo` | 0/1 | Characters / animated meshes cast ray-traced shadows |
 | `instgeo` | 0/1 | Small instanced props in the acceleration structure (experimental) |
+| `pathtrace` | 0/1 | Screenshot mode ("path tracing"): 4x rays per pixel, up to 256 frames of accumulation, deeper bounces. Stand still for a clean picture; slow while moving. Hotkey Ctrl+Backspace |
 | `grass` | 0/1 | Grass in the acceleration structure: casts shadows and takes part in AO (experimental) |
 | `gimulti` | 0–0.9 | Multi-bounce GI: light bounces more than once (every frame adds a bounce, needs `taa=1`); 0 = single bounce |
 | `light` | 0/1 | Light from fire, candles and lamps: very bright pixels of the frame become light sources that light and shadow their surroundings (new, needs testing) |
@@ -114,6 +115,7 @@ More rays = less noise, more GPU work. Sky is usually CPU-bound, so the GPU norm
 |---|---|
 | **Ctrl+Home** | Ray tracing on/off (compare with the original picture) |
 | **Ctrl+End** | Next view: 0 full · 1 shadows only · 2 AO only · 3 bounce light only · 4 AO map (debug) · 5 bounce map (debug) · 6 grid (debug) · 7 normals (debug) |
+| **Ctrl+Backspace** | Screenshot mode ("path tracing") on/off: 4x rays, long accumulation. Stand still for a clean picture |
 
 If the picture looks strange, press **Ctrl+End** until view 0 is back (or set `view=0`).
 

@@ -74,6 +74,7 @@ static float g_lightStrength = 2.0f, g_lightRange = 4.0f, g_lightThr = 2.0f, g_l
 static int g_lightRays = 2, g_lightDebug = 0;   // cfg lightrays (shadow rays per pixel), lightdebug (paint the emissive pixels magenta)
 static float g_giMulti = 0.1f;   // step 22: multi-bounce GI strength 0..0.9 (cfg gimulti): the previous frame's indirect light is added to what bounce rays see
 static float g_taaN = 12.0f;      // step 20: maximum accumulated samples (cfg taan); lower = less ghosting, more noise
+static int g_pathTrace = 0;       // step 25: 'path tracing' / screenshot mode: 4x rays per pixel, long accumulation, deeper bounces (cfg pathtrace=0/1, Ctrl+Backspace)
 static int g_grass = 1;           // step 24: grass (non-indexed triangle strips written by the CPU) in the acceleration structure (cfg grass=0/1)
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
 static int g_aniso = 16;          // step 13: anisotropic filtering forced on every linear sampler (cfg: aniso=0/2/4/8/16)
@@ -3004,6 +3005,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "lightrays=2   # shadow rays per pixel for those lights 1..4\r\n"
                   "lightdebug=0  # 1 = paint the pixels that are treated as light sources magenta (to tune lightthr)\r\n"
                   "instgeo=1     # 1 = instanced props in the acceleration structure\r\n"
+                  "pathtrace=0   # 1 = screenshot mode ('path tracing'): 4x rays per pixel, long accumulation (stand still for a clean picture), deeper bounces; slow while moving. Ctrl+Backspace toggles\r\n"
                   "grass=1       # 1 = grass in the acceleration structure (casts shadows, takes part in AO); 0 = off\r\n"
                   "dyngeo=1      # 1 = characters / animated meshes get their own acceleration structure rebuilt every frame (smooth shadows of moving objects)\r\n"
                   "aniso=16      # anisotropic filtering forced on all textures: 0 = leave the game alone, 2/4/8/16 (applies on next game start)\r\n"
@@ -3042,12 +3044,12 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "ao")) g_aoOn = v != 0.0;
         else if (!strcmp(key, "aostrength")) g_aoStrength = (float)std::max(0.0, std::min(1.0, v));
         else if (!strcmp(key, "aoradius")) g_aoRadius = (float)std::max(0.05, std::min(20.0, v));
-        else if (!strcmp(key, "aorays")) g_aoRays = (int)std::max(1.0, std::min(8.0, v));
+        else if (!strcmp(key, "aorays")) g_aoRays = (int)std::max(1.0, std::min(32.0, v));
         else if (!strcmp(key, "gi")) g_giOn = v != 0.0;
         else if (!strcmp(key, "gistrength")) g_giStrength = (float)std::max(0.0, std::min(2.0, v));
         else if (!strcmp(key, "girange")) g_giRange = (float)std::max(1.0, std::min(200.0, v));
         else if (!strcmp(key, "sunsize")) g_sunSize = (float)std::max(0.0, std::min(10.0, v));
-        else if (!strcmp(key, "shrays")) g_shRays = (int)std::max(1.0, std::min(8.0, v));
+        else if (!strcmp(key, "shrays")) g_shRays = (int)std::max(1.0, std::min(32.0, v));
         else if (!strcmp(key, "watervs")) kWaterVs = strtoull(sv, nullptr, 16);
         else if (!strcmp(key, "waterfs")) kWaterFs = strtoull(sv, nullptr, 16);
         else if (!strcmp(key, "waterfx")) g_reflOn = v != 0.0;
@@ -3057,7 +3059,8 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "dyngeo")) g_dynGeo = v != 0.0;
         else if (!strcmp(key, "grass")) g_grass = v != 0.0;
         else if (!strcmp(key, "taa")) g_taa = v != 0.0;
-        else if (!strcmp(key, "taan")) g_taaN = (float)std::max(1.0, std::min(64.0, v));
+        else if (!strcmp(key, "taan")) g_taaN = (float)std::max(1.0, std::min(256.0, v));
+        else if (!strcmp(key, "pathtrace")) g_pathTrace = v != 0.0;
         else if (!strcmp(key, "gimulti")) g_giMulti = (float)std::max(0.0, std::min(0.9, v));
         else if (!strcmp(key, "light")) g_lightOn = v != 0.0;
         else if (!strcmp(key, "lightmax")) g_lightMax = (float)std::max(0.05, std::min(5.0, v));
@@ -3114,6 +3117,12 @@ static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = next v
     if (pd && !pdWas) ProbeKey(false);
     if (pu && !puWas) ProbeKey(true);
     puWas = pu;
+    {   // step 25: Ctrl+Backspace = screenshot ('path tracing') mode on/off
+        static bool bsWas = false;
+        const bool bs = ctrl && (GetAsyncKeyState(VK_BACK) & 0x8000) != 0;
+        if (bs && !bsWas) { g_pathTrace = !g_pathTrace; Logf("rt: KEY Ctrl+Backspace -> screenshot mode (path tracing) %s", g_pathTrace ? "ON: 4x rays, long accumulation, stand still" : "off"); }
+        bsWas = bs;
+    }
     static bool delWas = false;
     const bool del = ctrl && (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
     if (del && !delWas) PassProbeKey();
@@ -3642,12 +3651,12 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     const uint32_t lightTx = (m.w + lightTile - 1) / lightTile, lightTy = (m.h + lightTile - 1) / lightTile;
     par->misc[0] = m.w; par->misc[1] = m.h; par->misc[2] = modeEff; par->misc[3] = (uint32_t)d->paintInjected.load();
     par->flags[0] = flagsEff;
-    par->flags[1] = (uint32_t)g_shRays;
-    par->flags[2] = (uint32_t)g_aoRays;
+    par->flags[1] = (uint32_t)(g_pathTrace ? std::min(32, g_shRays * 4) : g_shRays);
+    par->flags[2] = (uint32_t)(g_pathTrace ? std::min(32, g_aoRays * 4) : g_aoRays);
     par->flags[3] = g_reflOn ? 1u : 0u;
-    par->fx[0] = g_aoStrength; par->fx[1] = g_aoRadius; par->fx[2] = g_giStrength; par->fx[3] = g_giRange;
+    par->fx[0] = g_aoStrength; par->fx[1] = g_aoRadius; par->fx[2] = g_giStrength; par->fx[3] = g_pathTrace ? std::max(g_giRange, 100.0f) : g_giRange;
     memcpy(par->pvp, d->prevVp, sizeof par->pvp);
-    par->tp[0] = useHist ? 1.0f : 0.0f; par->tp[1] = g_taaN; par->tp[2] = useHist ? g_giMulti : 0.0f; par->tp[3] = g_lightMax;
+    par->tp[0] = useHist ? 1.0f : 0.0f; par->tp[1] = g_pathTrace ? std::max(g_taaN, 256.0f) : g_taaN; par->tp[2] = useHist ? (g_pathTrace ? std::max(g_giMulti, 0.5f) : g_giMulti) : 0.0f; par->tp[3] = g_lightMax;
     par->lt[0] = g_lightStrength; par->lt[1] = g_lightRange; par->lt[2] = g_lightThr; par->lt[3] = (flagsEff & 4u) ? g_giStrength * 0.5f : 0.0f;
     par->lm[0] = lightTile; par->lm[1] = lightTx; par->lm[2] = (uint32_t)g_lightRays; par->lm[3] = lightsOn ? (1u | (g_lightDebug ? 2u : 0u)) : 0u;
     par->fx2[0] = tanf(g_sunSize * 3.14159265f / 180.0f); par->fx2[1] = g_reflStrength; par->fx2[2] = (float)(d->paintInjected.load() % 100000) * 0.0133f; par->fx2[3] = g_glint;
