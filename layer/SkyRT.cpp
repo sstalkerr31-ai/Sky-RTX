@@ -535,6 +535,7 @@ struct DeviceData {
     uint32_t histCur = 0;
     bool histValid = false;
     float prevVp[16] = {};
+    uint32_t stillFrames = 0;   // step 25: frames the camera has not moved (screenshot mode switches to full quality after a few)
     VkBuffer parBuf[16] = {};
     VkDeviceMemory parMem[16] = {};
     char* parPtr[16] = {};
@@ -3005,7 +3006,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "lightrays=2   # shadow rays per pixel for those lights 1..4\r\n"
                   "lightdebug=0  # 1 = paint the pixels that are treated as light sources magenta (to tune lightthr)\r\n"
                   "instgeo=1     # 1 = instanced props in the acceleration structure\r\n"
-                  "pathtrace=0   # 1 = screenshot mode ('path tracing'): 4x rays per pixel, long accumulation (stand still for a clean picture), deeper bounces; slow while moving. Ctrl+Backspace toggles\r\n"
+                  "pathtrace=0   # 1 = screenshot mode ('path tracing'): while the camera stands still (after ~0.3 s) 4x rays per pixel, long accumulation, deeper bounces; normal cost while moving. Ctrl+Backspace toggles\r\n"
                   "grass=1       # 1 = grass in the acceleration structure (casts shadows, takes part in AO); 0 = off\r\n"
                   "dyngeo=1      # 1 = characters / animated meshes get their own acceleration structure rebuilt every frame (smooth shadows of moving objects)\r\n"
                   "aniso=16      # anisotropic filtering forced on all textures: 0 = leave the game alone, 2/4/8/16 (applies on next game start)\r\n"
@@ -3646,17 +3647,25 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         case 7: modeEff = 2u; break;
         default: flagsEff |= 8u; if (lightsOn) flagsEff |= 16u; break;
     }
+    // step 25: screenshot mode is adaptive - full quality only while the camera stands still (a short moment after it stopped), normal cost while moving
+    bool ptFull = false;
+    if (g_pathTrace) {
+        float mvd = 0.0f;
+        for (int i = 0; i < 16; ++i) mvd = std::max(mvd, fabsf(vp[i] - d->prevVp[i]));
+        d->stillFrames = (d->histValid && mvd < 5.0e-5f) ? std::min<uint32_t>(d->stillFrames + 1, 100000u) : 0u;
+        ptFull = d->stillFrames >= 20;
+    }
     uint32_t lightTile = 48;
     while (((m.w + lightTile - 1) / lightTile) * ((m.h + lightTile - 1) / lightTile) > 4096u) lightTile += 16;
     const uint32_t lightTx = (m.w + lightTile - 1) / lightTile, lightTy = (m.h + lightTile - 1) / lightTile;
     par->misc[0] = m.w; par->misc[1] = m.h; par->misc[2] = modeEff; par->misc[3] = (uint32_t)d->paintInjected.load();
     par->flags[0] = flagsEff;
-    par->flags[1] = (uint32_t)(g_pathTrace ? std::min(32, g_shRays * 4) : g_shRays);
-    par->flags[2] = (uint32_t)(g_pathTrace ? std::min(32, g_aoRays * 4) : g_aoRays);
+    par->flags[1] = (uint32_t)(ptFull ? std::min(32, g_shRays * 4) : g_shRays);
+    par->flags[2] = (uint32_t)(ptFull ? std::min(32, g_aoRays * 4) : g_aoRays);
     par->flags[3] = g_reflOn ? 1u : 0u;
-    par->fx[0] = g_aoStrength; par->fx[1] = g_aoRadius; par->fx[2] = g_giStrength; par->fx[3] = g_pathTrace ? std::max(g_giRange, 100.0f) : g_giRange;
+    par->fx[0] = g_aoStrength; par->fx[1] = g_aoRadius; par->fx[2] = g_giStrength; par->fx[3] = ptFull ? std::max(g_giRange, 100.0f) : g_giRange;
     memcpy(par->pvp, d->prevVp, sizeof par->pvp);
-    par->tp[0] = useHist ? 1.0f : 0.0f; par->tp[1] = g_pathTrace ? std::max(g_taaN, 256.0f) : g_taaN; par->tp[2] = useHist ? (g_pathTrace ? std::max(g_giMulti, 0.5f) : g_giMulti) : 0.0f; par->tp[3] = g_lightMax;
+    par->tp[0] = useHist ? 1.0f : 0.0f; par->tp[1] = ptFull ? std::max(g_taaN, 256.0f) : g_taaN; par->tp[2] = useHist ? (ptFull ? std::max(g_giMulti, 0.5f) : g_giMulti) : 0.0f; par->tp[3] = g_lightMax;
     par->lt[0] = g_lightStrength; par->lt[1] = g_lightRange; par->lt[2] = g_lightThr; par->lt[3] = (flagsEff & 4u) ? g_giStrength * 0.5f : 0.0f;
     par->lm[0] = lightTile; par->lm[1] = lightTx; par->lm[2] = (uint32_t)g_lightRays; par->lm[3] = lightsOn ? (1u | (g_lightDebug ? 2u : 0u)) : 0u;
     par->fx2[0] = tanf(g_sunSize * 3.14159265f / 180.0f); par->fx2[1] = g_reflStrength; par->fx2[2] = (float)(d->paintInjected.load() % 100000) * 0.0133f; par->fx2[3] = g_glint;

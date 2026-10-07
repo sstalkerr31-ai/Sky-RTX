@@ -96,7 +96,7 @@ Everything the panel changes lives in `%LOCALAPPDATA%\SkyRT\SkyRT.cfg` (plain `k
 | `taa` · `taan` | 0/1 · 1–64 | Temporal accumulation on/off, max accumulated frames (lower = less ghosting, more noise) |
 | `dyngeo` | 0/1 | Characters / animated meshes cast ray-traced shadows |
 | `instgeo` | 0/1 | Small instanced props in the acceleration structure (experimental) |
-| `pathtrace` | 0/1 | Screenshot mode ("path tracing"): 4x rays per pixel, up to 256 frames of accumulation, deeper bounces. Stand still for a clean picture; slow while moving. Hotkey Ctrl+Backspace |
+| `pathtrace` | 0/1 | Screenshot mode ("path tracing"): 4x rays per pixel, up to 256 frames of accumulation, deeper bounces. Adaptive: full quality only while the camera stands still (after ~0.3 s), normal cost while you move, so flying has no extra stutter. Hotkey Ctrl+Backspace |
 | `grass` | 0/1 | Grass in the acceleration structure: casts shadows and takes part in AO (experimental) |
 | `gimulti` | 0–0.9 | Multi-bounce GI: light bounces more than once (every frame adds a bounce, needs `taa=1`); 0 = single bounce |
 | `light` | 0/1 | Light from fire, candles and lamps: very bright pixels of the frame become light sources that light and shadow their surroundings (new, needs testing) |
