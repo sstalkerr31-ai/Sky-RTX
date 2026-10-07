@@ -31,9 +31,9 @@ layout(set = 0, binding = 9, rgba32f) uniform image2D uHBp;    // previous frame
 layout(set = 0, binding = 10, std430) readonly buffer Lights {
     uint count;
     uint maxLum;
-    uint pad0;
+    uint alive;
     uint pad1;
-    vec4 L[];      // 2 entries per light: (position.xyz, intensity), (hue.rgb, 0)
+    vec4 L[];      // [512 + 3*s]: persistent light s = (position.xyz, intensity), [+1] = (hue.rgb, ttl)
 } lights;
 
 vec3 worldAt(ivec2 p, float z) {
@@ -262,12 +262,13 @@ void main() {
     // proportional to that contribution and only that one gets a shadow ray. The estimate is tot * visibility * hue.
     vec3 emis = vec3(0.0);
     if ((u.lm.w & 1u) != 0u) {
-        const uint nL = min(lights.count, 256u);
+        const uint nL = 64u;   // persistent light slots (empty ones have intensity 0)
         const float R = max(u.lt.y, 0.5);
         const float R2 = R * R;
         float tot = 0.0;
         for (uint i = 0u; i < nL; ++i) {
-            vec4 a = lights.L[2u * i];
+            vec4 a = lights.L[512u + 3u * i];
+            if (a.w <= 1.0e-4) continue;
             vec3 dv = a.xyz - P;
             float d2 = dot(dv, dv);
             if (d2 >= R2) continue;
@@ -282,7 +283,8 @@ void main() {
                 float acc = 0.0;
                 uint pick = nL;
                 for (uint i = 0u; i < nL; ++i) {
-                    vec4 a = lights.L[2u * i];
+                    vec4 a = lights.L[512u + 3u * i];
+                    if (a.w <= 1.0e-4) continue;
                     vec3 dv = a.xyz - P;
                     float d2 = dot(dv, dv);
                     if (d2 >= R2) continue;
@@ -292,7 +294,7 @@ void main() {
                     if (acc >= target) { pick = i; break; }
                 }
                 if (pick >= nL) continue;
-                vec3 lp = lights.L[2u * pick].xyz;
+                vec3 lp = lights.L[512u + 3u * pick].xyz;
                 vec3 toL = lp - origin;
                 float dl = length(toL);
                 float visL = 1.0;
@@ -302,13 +304,15 @@ void main() {
                     while (rayQueryProceedEXT(rl)) {}
                     if (rayQueryGetIntersectionTypeEXT(rl, true) != gl_RayQueryCommittedIntersectionNoneEXT) visL = 0.0;
                 }
-                emis += lights.L[2u * pick + 1u].rgb * (tot * visL / float(nR));
+                emis += lights.L[512u + 3u * pick + 1u].rgb * (tot * visL / float(nR));
             }
         }
         if (any(isnan(emis)) || any(isinf(emis))) emis = vec3(0.0);
         // soft ceiling: however strong the lights are set, the light added to one pixel saturates at about tp.w (no blown-out pools)
         float el = dot(emis, vec3(0.2126, 0.7152, 0.0722));
         emis *= 1.0 / (1.0 + el / max(u.tp.w, 0.05));
+        // eyes adapt: a surface that is already bright (daylight) hardly notices an extra lamp
+        emis *= 1.0 / (1.0 + 2.5 * dot(c, vec3(0.2126, 0.7152, 0.0722)));
     }
     imageStore(uGI, p, vec4(bounce * u.lt.w + emis, occ));
     imageStore(uSh, p, vec4(vis));

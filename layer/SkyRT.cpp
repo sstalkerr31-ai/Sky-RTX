@@ -34,6 +34,7 @@
 #include "rt_spv.h"    // SPIR-V of rt.comp (generated): trace pass
 #include "rtfx_spv.h"  // SPIR-V of rt_fx.comp (generated): denoise + composite pass
 #include "rtlight_spv.h"  // SPIR-V of rt_light.comp (generated): emissive light source search (step 21)
+#include "rtlmerge_spv.h"  // SPIR-V of rt_lmerge.comp (generated): persistent light list (step 23)
 
 // ============================================================ config
 static const uint32_t kStatsEveryNFrames = 300;   // ~5 sec at 60 fps
@@ -69,9 +70,9 @@ static const uint32_t kInstMaxPerDraw = 48, kInstMinIdx = 90, kPropGeomMax = 100
 static const uint64_t kPropTrisMax = 100000;
 static int g_taa = 1;             // step 20: temporal accumulation of shadows / AO / GI (cfg taa=0/1)
 static int g_lightOn = 1;          // step 21: light from fire / candles / lamps (bright pixels of the frame become point lights), cfg light=0/1
-static float g_lightStrength = 10.0f, g_lightRange = 10.0f, g_lightThr = 2.0f, g_lightMax = 0.6f;   // lightmax: soft ceiling of the light added to one pixel   // cfg lightstrength, lightrange (world units), lightthr (HDR brightness that counts as emissive)
+static float g_lightStrength = 8.0f, g_lightRange = 8.0f, g_lightThr = 2.0f, g_lightMax = 0.35f;   // lightmax: soft ceiling of the light added to one pixel   // cfg lightstrength, lightrange (world units), lightthr (HDR brightness that counts as emissive)
 static int g_lightRays = 2, g_lightDebug = 0;   // cfg lightrays (shadow rays per pixel), lightdebug (paint the emissive pixels magenta)
-static float g_giMulti = 0.6f;   // step 22: multi-bounce GI strength 0..0.9 (cfg gimulti): the previous frame's indirect light is added to what bounce rays see
+static float g_giMulti = 0.3f;   // step 22: multi-bounce GI strength 0..0.9 (cfg gimulti): the previous frame's indirect light is added to what bounce rays see
 static float g_taaN = 12.0f;      // step 20: maximum accumulated samples (cfg taan); lower = less ghosting, more noise
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
 static int g_aniso = 16;          // step 13: anisotropic filtering forced on every linear sampler (cfg: aniso=0/2/4/8/16)
@@ -515,6 +516,8 @@ struct DeviceData {
     PFN_vkBindImageMemory BindImageMemory;
     VkPipeline fxPipe = VK_NULL_HANDLE;
     VkPipeline lightPipe = VK_NULL_HANDLE;           // step 21: emissive light search
+    VkPipeline lmergePipe = VK_NULL_HANDLE;          // step 23: merges the candidates into persistent lights
+    bool lightZeroed = false;                        // the persistent part of the light buffer was cleared once
     VkBuffer lightBuf = VK_NULL_HANDLE, statBuf = VK_NULL_HANDLE;   // device-local light list / small host-visible copy of its header for the log
     VkDeviceMemory lightMem = VK_NULL_HANDLE, statMem = VK_NULL_HANDLE;
     char* statPtr = nullptr;
@@ -2203,7 +2206,7 @@ struct FxParams {
     float lt[4];     // step 21: x = light strength, y = range, z = brightness threshold, w = GI multiplier (strength * 0.5, applied in the trace pass)
     uint32_t lm[4];  // x = tile size, y = tiles in x, z = shadow rays for lights, w = bit0 lights on, bit1 debug
 };
-static const uint32_t kLightMax = 256, kLightBufBytes = 16 + 256 * 32;
+static const uint32_t kLightMax = 256, kLightBufBytes = 16 + 256 * 32 + 64 * 48;   // header, candidates (2 x vec4), 64 persistent lights (3 x vec4)
 
 static VkPipeline MakeComputePipe(DeviceData* d, const uint32_t* code, size_t bytes, const char* what) {
     VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -2259,6 +2262,8 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->fxPipe = MakeComputePipe(d, kRtFxSpv, sizeof(kRtFxSpv), "composite");
     if (!d->paintPipe || !d->fxPipe) return false;
     d->lightPipe = MakeComputePipe(d, kRtLightSpv, sizeof(kRtLightSpv), "lights");   // optional: without it the emissive light is simply off
+    d->lmergePipe = MakeComputePipe(d, kRtLMergeSpv, sizeof(kRtLMergeSpv), "light merge");
+    if (!d->lmergePipe) d->lightPipe = VK_NULL_HANDLE;
 
     VkDescriptorPoolSize ps[5] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 * 7}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16},
                                   {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16},
@@ -2890,11 +2895,11 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "glint=1.0     # 0..4 sun glitter on the water\r\n"
                   "taa=1         # 1 = temporal accumulation of shadows / AO / GI (less noise)\r\n"
                   "taan=12       # max accumulated frames (lower = less ghosting, more noise)\r\n"
-                  "gimulti=0.6   # 0..0.9 multi-bounce GI: light bounces more than once (needs taa=1); 0 = single bounce\r\n"
+                  "gimulti=0.3   # 0..0.9 multi-bounce GI: light bounces more than once (needs taa=1); 0 = single bounce\r\n"
                   "light=1       # 1 = light from fire, candles and lamps (bright pixels become light sources that cast shadows)\r\n"
-                  "lightstrength=10 # 0..200 how strong that light is (a candle flame is tiny, so this needs to be large)\r\n"
-                  "lightmax=0.6  # 0.05..5 ceiling of the light added to one pixel (lower = never blown out)\r\n"
-                  "lightrange=10 # world units, how far the light of one source reaches\r\n"
+                  "lightstrength=8 # 0..200 how strong that light is (a candle flame is tiny, so this needs to be large)\r\n"
+                  "lightmax=0.35 # 0.05..5 ceiling of the light added to one pixel (lower = never blown out)\r\n"
+                  "lightrange=8  # world units, how far the light of one source reaches\r\n"
                   "lightthr=2.0  # brightness above which a pixel counts as a light source (the log prints the brightest pixel it sees)\r\n"
                   "lightrays=2   # shadow rays per pixel for those lights 1..4\r\n"
                   "lightdebug=0  # 1 = paint the pixels that are treated as light sources magenta (to tune lightthr)\r\n"
@@ -3518,7 +3523,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     }
     par->sun[0] = sunv[0]; par->sun[1] = sunv[1]; par->sun[2] = sunv[2]; par->sun[3] = g_strength;
     par->cam[0] = cam[0]; par->cam[1] = cam[1]; par->cam[2] = cam[2]; par->cam[3] = g_flipY ? 1.0f : 0.0f;
-    const bool lightsOn = g_lightOn && d->lightPipe && d->lightBuf && g_view == 0;
+    const bool lightsOn = g_lightOn && d->lightPipe && d->lmergePipe && d->lightBuf && g_view == 0;
     uint32_t modeEff = 0, flagsEff = (g_shadows ? 1u : 0u) | (g_aoOn ? 2u : 0u) | (g_giOn ? 4u : 0u);
     switch (g_view) {
         case 1: flagsEff = 1u; break;
@@ -3621,13 +3626,19 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         bb.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;   // previous frame
         bb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
-        d->CmdFillBuffer(cb, d->lightBuf, 0, 16, 0);
+        d->CmdFillBuffer(cb, d->lightBuf, 0, d->lightZeroed ? 16 : kLightBufBytes, 0);   // header every frame; the persistent lights only once
+        d->lightZeroed = true;
         bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
         d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->lightPipe);
         d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->paintPl, 0, 1, &set, 0, nullptr);
         d->CmdDispatch(cb, lightTx, lightTy, 1);
+        bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+        d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->lmergePipe);   // step 23: candidates -> persistent lights
+        d->CmdDispatch(cb, 1, 1, 1);
         bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
         d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
@@ -3710,8 +3721,8 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     if (lightsOn && d->statPtr && (n % 600 == 7)) {   // the header of the light list from an earlier frame (read without sync: only used for the log)
         uint32_t hdr[4] = {};
         memcpy(hdr, d->statPtr, sizeof hdr);
-        Logf("rt: emissive lights: %u light sources found%s | brightest pixel %.2f, threshold lightthr=%.2f (raise it if ordinary surfaces glow, lower it if fire does not light anything)",
-             std::min<uint32_t>(hdr[0], kLightMax), hdr[0] > kLightMax ? " (more than fit - raise lightthr)" : "", hdr[1] / 1000.0, (double)g_lightThr);
+        Logf("rt: emissive lights: %u candidates this frame%s, %u persistent lights alive | brightest pixel %.2f, threshold lightthr=%.2f (raise it if ordinary surfaces glow, lower it if fire does not light anything)",
+             std::min<uint32_t>(hdr[0], kLightMax), hdr[0] > kLightMax ? " (more than fit - raise lightthr)" : "", hdr[2], hdr[1] / 1000.0, (double)g_lightThr);
     }
     if (n == 1 || n == 2000) {
         Logf("rt: %s frame: drew %zu geometries, %llu triangles (draws %llu; skipped: pipeline/format %llu, range %llu, other %llu, "

@@ -1,0 +1,97 @@
+#version 460
+// SkyRT step 23, pass 0b (merge): turns this frame's light candidates (screen tiles, unstable while the camera moves) into a
+// small list of PERSISTENT lights. Candidates close to each other are summed into one light; position, colour and intensity are
+// eased towards the new values, a new light fades in, a light that is no longer seen fades out over ~1.5 s. This removes the flicker.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 5, std140) uniform Params {
+    mat4 vp;
+    mat4 invVP;
+    vec4 sun;
+    vec4 cam;
+    uvec4 misc;
+    uvec4 flags;
+    vec4 fx;
+    vec4 fx2;
+    mat4 pvp;
+    vec4 tp;
+    vec4 lt;       // x = light strength
+    uvec4 lm;
+} u;
+layout(set = 0, binding = 10, std430) buffer Lights {
+    uint count;     // candidates this frame
+    uint maxLum;
+    uint alive;    // persistent lights alive (for the log)
+    uint pad1;
+    vec4 L[];       // [0 .. 511]: candidates, 2 entries each. [512 + 3*s ..]: persistent slot s: (pos.xyz, intensity), (hue.rgb, ttl frames), unused
+} lights;
+
+const uint BASE = 512u;
+const uint NSLOT = 64u;
+
+void main() {
+    const uint nC = min(lights.count, 256u);
+    float accI[64];
+    vec3 accP[64];
+    vec3 accH[64];
+    bool isNew[64];
+    for (uint s = 0u; s < NSLOT; ++s) { accI[s] = 0.0; accP[s] = vec3(0.0); accH[s] = vec3(0.0); isNew[s] = false; }
+
+    for (uint c = 0u; c < nC; ++c) {
+        vec4 a = lights.L[2u * c];
+        vec4 h = lights.L[2u * c + 1u];
+        if (!(a.w > 0.0)) continue;
+        int best = -1;
+        float bd = 6.25;                                   // candidates within 2.5 m belong to the same light
+        for (uint s = 0u; s < NSLOT; ++s) {
+            vec4 p0 = lights.L[BASE + 3u * s];
+            vec4 p1 = lights.L[BASE + 3u * s + 1u];
+            bool used = p1.w > 0.5 || accI[s] > 0.0;
+            if (!used) continue;
+            vec3 centre = accI[s] > 0.0 ? accP[s] / accI[s] : p0.xyz;
+            vec3 d = centre - a.xyz;
+            float d2 = dot(d, d);
+            if (d2 < bd) { bd = d2; best = int(s); }
+        }
+        if (best < 0) {
+            for (uint s = 0u; s < NSLOT; ++s) {
+                vec4 p1 = lights.L[BASE + 3u * s + 1u];
+                if (p1.w <= 0.5 && accI[s] <= 0.0) { best = int(s); isNew[s] = true; break; }
+            }
+        }
+        if (best < 0) continue;
+        accI[best] += a.w;
+        accP[best] += a.w * a.xyz;
+        accH[best] += a.w * h.rgb;
+    }
+
+    uint nAct = 0u;
+    const float cap = 0.8 * u.lt.x;                        // one merged light never gets brighter than this
+    for (uint s = 0u; s < NSLOT; ++s) {
+        vec4 p0 = lights.L[BASE + 3u * s];
+        vec4 p1 = lights.L[BASE + 3u * s + 1u];
+        if (accI[s] > 0.0) {
+            vec3 np = accP[s] / accI[s];
+            vec3 nh = accH[s] / accI[s];
+            float ni = min(accI[s], cap);
+            if (isNew[s] || p1.w <= 0.5) {
+                p0 = vec4(np, ni * 0.25);                  // fades in
+                p1 = vec4(nh, 120.0);
+            } else {
+                p0.xyz = mix(p0.xyz, np, 0.15);
+                p0.w = mix(p0.w, ni, 0.12);
+                p1.rgb = mix(p1.rgb, nh, 0.15);
+                p1.w = 120.0;
+            }
+        } else if (p1.w > 0.5) {
+            p1.w -= 1.0;
+            p0.w *= 0.96;                                  // fades out
+            if (p1.w <= 0.5 || p0.w < 1.0e-3) { p0.w = 0.0; p1.w = 0.0; }
+        }
+        if (isnan(p0.w) || isinf(p0.w) || any(isnan(p0.xyz)) || any(isinf(p0.xyz))) { p0 = vec4(0.0); p1 = vec4(0.0); }
+        lights.L[BASE + 3u * s] = p0;
+        lights.L[BASE + 3u * s + 1u] = p1;
+        if (p0.w > 0.0) nAct++;
+    }
+    lights.alive = nAct;
+}

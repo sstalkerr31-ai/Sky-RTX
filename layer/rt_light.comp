@@ -25,9 +25,9 @@ layout(set = 0, binding = 5, std140) uniform Params {
 layout(set = 0, binding = 10, std430) buffer Lights {
     uint count;     // lights written (may exceed the capacity: readers clamp it)
     uint maxLum;    // brightest non-sky pixel of the frame x 1000 (for the log)
-    uint pad0;
+    uint alive;
     uint pad1;
-    vec4 L[];       // 2 entries per light: (position.xyz, intensity), (hue.rgb, 0)
+    vec4 L[];       // candidates: 2 entries each (position.xyz, intensity), (hue.rgb, 0); persistent lights live behind them (see rt_lmerge.comp)
 } lights;
 
 vec3 worldAt(ivec2 p, float z) {
