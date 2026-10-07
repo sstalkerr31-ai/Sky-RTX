@@ -95,7 +95,8 @@ Everything the panel changes lives in `%LOCALAPPDATA%\SkyRT\SkyRT.cfg` (plain `k
 | `instgeo` | 0/1 | Small instanced props in the acceleration structure (experimental) |
 | `gimulti` | 0–0.9 | Multi-bounce GI: light bounces more than once (every frame adds a bounce, needs `taa=1`); 0 = single bounce |
 | `light` | 0/1 | Light from fire, candles and lamps: very bright pixels of the frame become light sources that light and shadow their surroundings (new, needs testing) |
-| `lightstrength` · `lightrange` | 0–200 (default 25) · 1–60 | How strong the light is, how far (world units) one source reaches |
+| `lightstrength` · `lightrange` | 0–200 (default 10) · 1–60 | How strong the light is, how far (world units) one source reaches |
+| `lightmax` | 0.05–5 | Soft ceiling of the light added to one pixel (lower = never blown out) |
 | `lightthr` · `lightrays` · `lightdebug` | 0.3–50 · 1–4 · 0/1 | Brightness above which a pixel counts as a source (the log prints the brightest pixel it saw), shadow rays per pixel, paint detected sources magenta |
 | `aniso` · `lodbias` | 0–16 · −2…1 | Anisotropic filtering, texture sharpness shift (**applied on the next game start**) |
 | `autosun` · `az` · `el` | 0/1 · 0–360° · 1–89° | Take the sun from the game, or set it manually |

@@ -69,7 +69,7 @@ static const uint32_t kInstMaxPerDraw = 48, kInstMinIdx = 90, kPropGeomMax = 100
 static const uint64_t kPropTrisMax = 100000;
 static int g_taa = 1;             // step 20: temporal accumulation of shadows / AO / GI (cfg taa=0/1)
 static int g_lightOn = 1;          // step 21: light from fire / candles / lamps (bright pixels of the frame become point lights), cfg light=0/1
-static float g_lightStrength = 25.0f, g_lightRange = 12.0f, g_lightThr = 2.0f;   // cfg lightstrength, lightrange (world units), lightthr (HDR brightness that counts as emissive)
+static float g_lightStrength = 10.0f, g_lightRange = 10.0f, g_lightThr = 2.0f, g_lightMax = 0.6f;   // lightmax: soft ceiling of the light added to one pixel   // cfg lightstrength, lightrange (world units), lightthr (HDR brightness that counts as emissive)
 static int g_lightRays = 2, g_lightDebug = 0;   // cfg lightrays (shadow rays per pixel), lightdebug (paint the emissive pixels magenta)
 static float g_giMulti = 0.6f;   // step 22: multi-bounce GI strength 0..0.9 (cfg gimulti): the previous frame's indirect light is added to what bounce rays see
 static float g_taaN = 12.0f;      // step 20: maximum accumulated samples (cfg taan); lower = less ghosting, more noise
@@ -2892,8 +2892,9 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "taan=12       # max accumulated frames (lower = less ghosting, more noise)\r\n"
                   "gimulti=0.6   # 0..0.9 multi-bounce GI: light bounces more than once (needs taa=1); 0 = single bounce\r\n"
                   "light=1       # 1 = light from fire, candles and lamps (bright pixels become light sources that cast shadows)\r\n"
-                  "lightstrength=25 # 0..200 how strong that light is (a candle flame is tiny, so this needs to be large)\r\n"
-                  "lightrange=12 # world units, how far the light of one source reaches\r\n"
+                  "lightstrength=10 # 0..200 how strong that light is (a candle flame is tiny, so this needs to be large)\r\n"
+                  "lightmax=0.6  # 0.05..5 ceiling of the light added to one pixel (lower = never blown out)\r\n"
+                  "lightrange=10 # world units, how far the light of one source reaches\r\n"
                   "lightthr=2.0  # brightness above which a pixel counts as a light source (the log prints the brightest pixel it sees)\r\n"
                   "lightrays=2   # shadow rays per pixel for those lights 1..4\r\n"
                   "lightdebug=0  # 1 = paint the pixels that are treated as light sources magenta (to tune lightthr)\r\n"
@@ -2952,6 +2953,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "taan")) g_taaN = (float)std::max(1.0, std::min(64.0, v));
         else if (!strcmp(key, "gimulti")) g_giMulti = (float)std::max(0.0, std::min(0.9, v));
         else if (!strcmp(key, "light")) g_lightOn = v != 0.0;
+        else if (!strcmp(key, "lightmax")) g_lightMax = (float)std::max(0.05, std::min(5.0, v));
         else if (!strcmp(key, "lightstrength")) g_lightStrength = (float)std::max(0.0, std::min(200.0, v));
         else if (!strcmp(key, "lightrange")) g_lightRange = (float)std::max(1.0, std::min(60.0, v));
         else if (!strcmp(key, "lightthr")) g_lightThr = (float)std::max(0.3, std::min(50.0, v));
@@ -3538,7 +3540,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     par->flags[3] = g_reflOn ? 1u : 0u;
     par->fx[0] = g_aoStrength; par->fx[1] = g_aoRadius; par->fx[2] = g_giStrength; par->fx[3] = g_giRange;
     memcpy(par->pvp, d->prevVp, sizeof par->pvp);
-    par->tp[0] = useHist ? 1.0f : 0.0f; par->tp[1] = g_taaN; par->tp[2] = useHist ? g_giMulti : 0.0f; par->tp[3] = 0.0f;
+    par->tp[0] = useHist ? 1.0f : 0.0f; par->tp[1] = g_taaN; par->tp[2] = useHist ? g_giMulti : 0.0f; par->tp[3] = g_lightMax;
     par->lt[0] = g_lightStrength; par->lt[1] = g_lightRange; par->lt[2] = g_lightThr; par->lt[3] = (flagsEff & 4u) ? g_giStrength * 0.5f : 0.0f;
     par->lm[0] = lightTile; par->lm[1] = lightTx; par->lm[2] = (uint32_t)g_lightRays; par->lm[3] = lightsOn ? (1u | (g_lightDebug ? 2u : 0u)) : 0u;
     par->fx2[0] = tanf(g_sunSize * 3.14159265f / 180.0f); par->fx2[1] = g_reflStrength; par->fx2[2] = (float)(d->paintInjected.load() % 100000) * 0.0133f; par->fx2[3] = g_glint;
