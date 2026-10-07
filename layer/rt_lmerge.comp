@@ -78,7 +78,8 @@ void main() {
                 p0 = vec4(np, ni * 0.25);                  // fades in
                 p1 = vec4(nh, 120.0);
             } else {
-                p0.xyz = mix(p0.xyz, np, 0.15);
+                float dmv = length(np - p0.xyz);               // a light that really moved (the player carries one) must keep up, small jitter stays smoothed
+                p0.xyz = mix(p0.xyz, np, 0.15 + 0.6 * smoothstep(0.15, 1.2, dmv));
                 p0.w = mix(p0.w, ni, 0.12);
                 p1.rgb = mix(p1.rgb, nh, 0.15);
                 p1.w = 120.0;

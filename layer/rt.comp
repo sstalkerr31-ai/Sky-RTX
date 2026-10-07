@@ -295,6 +295,14 @@ void main() {
                 }
                 if (pick >= nL) continue;
                 vec3 lp = lights.L[512u + 3u * pick].xyz;
+                {   // the flame is not a point: aim at a random spot inside a ~0.35 m ball, so shadow edges are soft and do not snap while the camera moves
+                    float r1 = fract(ign * 5.317 + fr * 0.7548776662 + float(k) * 0.3137);
+                    float r2 = fract(ign * 2.173 + fr * 0.5698402910 + float(k) * 0.4719);
+                    float r3 = fract(ign * 7.131 + fr * 0.3247179572 + float(k) * 0.2291);
+                    float ct = r1 * 2.0 - 1.0, ph = r2 * 6.2831853;
+                    float sn = sqrt(max(1.0 - ct * ct, 0.0));
+                    lp += vec3(sn * cos(ph), ct, sn * sin(ph)) * (0.35 * r3);
+                }
                 vec3 toL = lp - origin;
                 float dl = length(toL);
                 float visL = 1.0;
