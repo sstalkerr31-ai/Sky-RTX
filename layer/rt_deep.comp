@@ -1,0 +1,357 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_ray_tracing_position_fetch : require
+// DEEP BOUNCE VARIANT (step 26) of rt.comp: identical except the hemisphere loop, which follows every path for up to B bounces
+// (B = u.misc.w >> 16). Hit normals are exact: they come from the triangle vertices (VK_KHR_ray_tracing_position_fetch).
+// SkyRT step 8, pass 1 (trace): for every non-sky pixel shoots rays and stores raw, noisy results:
+//   uSh.r   = sun visibility (soft shadow: several rays inside the sun's cone)
+//   uGI.rgb = diffuse bounce light (cosine rays; the color of whatever a ray hits is read back from the frame itself)
+//   uGI.a   = ambient occlusion (0 = open, 1 = fully blocked within aoRadius)
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D uColor;
+layout(set = 0, binding = 1) uniform texture2D uDepth;
+layout(set = 0, binding = 2) uniform accelerationStructureEXT uTlas;
+layout(set = 0, binding = 3, rgba16f) uniform image2D uGI;
+layout(set = 0, binding = 4, r32f) uniform image2D uSh;
+layout(set = 0, binding = 5, std140) uniform Params {
+    mat4 vp;
+    mat4 invVP;
+    vec4 sun;      // xyz = direction TO the sun, w = shadow strength
+    vec4 cam;      // xyz = camera, w = flip-Y flag
+    uvec4 misc;    // x,y = size, z = mode, w = frame
+    uvec4 flags;   // x = bit0 shadows, bit1 AO, bit2 GI; y = shadow rays; z = hemisphere rays
+    vec4 fx;       // x = AO strength, y = AO radius, z = GI strength, w = GI range
+    vec4 fx2;      // x = tan(sun angular radius)
+    mat4 pvp;      // previous frame view-projection
+    vec4 tp;       // x = history valid, y = max samples, z = multi-bounce strength (step 22), w = ceiling of the light added per pixel
+    vec4 lt;       // step 21: x = light strength, y = light range, z = brightness threshold, w = GI multiplier (strength * 0.5, 0 = GI off)
+    uvec4 lm;      // x = tile size, y = tiles in x, z = shadow rays per pixel for lights, w = bit0 lights on
+} u;
+layout(set = 0, binding = 8, rgba16f) uniform image2D uHAp;    // step 22: previous frame accumulated indirect light (read only here)
+layout(set = 0, binding = 9, rgba32f) uniform image2D uHBp;    // previous frame: shadow, depth, sample count
+layout(set = 0, binding = 10, std430) readonly buffer Lights {
+    uint count;
+    uint maxLum;
+    uint alive;
+    uint pad1;
+    vec4 L[];      // [512 + 3*s]: persistent light s = (position.xyz, intensity), [+1] = (hue.rgb, ttl)
+} lights;
+
+vec3 worldAt(ivec2 p, float z) {
+    vec2 ndc = (vec2(p) + 0.5) / vec2(u.misc.xy) * 2.0 - 1.0;
+    if (u.cam.w > 0.5) ndc.y = -ndc.y;
+    vec4 w = u.invVP * vec4(ndc, z, 1.0);
+    return w.xyz / w.w;
+}
+
+// frame color at the screen position of a world point, or `fallback` when that point is off screen / hidden
+vec3 screenColor(vec3 wp, vec3 fallback, bool wantSky) {
+    vec4 clip = u.vp * vec4(wp, 1.0);
+    if (clip.w <= 1e-5) return fallback;
+    vec2 ndc = clip.xy / clip.w;
+    if (u.cam.w > 0.5) ndc.y = -ndc.y;
+    vec2 uv = ndc * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) return fallback;
+    ivec2 q = ivec2(uv * vec2(u.misc.xy));
+    float d = texelFetch(uDepth, q, 0).r;
+    if (wantSky) {
+        if (d > 0.0) return fallback;
+    } else {
+        float expected = clip.z / clip.w;
+        if (d <= 0.0 || abs(d - expected) > 0.08 * expected) return fallback;
+    }
+    return imageLoad(uColor, q).rgb;
+}
+
+// step 22 (multi bounce): the indirect light the previous frame computed for the surface at world position wp
+// (reprojected with the previous camera, rejected when the depth there disagrees). Added to what a bounce ray sees, it makes every
+// frame one more bounce deeper: light that bounced off the ground can bounce again off a wall.
+vec3 prevIndirect(vec3 wp) {
+    vec4 pc = u.pvp * vec4(wp, 1.0);
+    if (pc.w <= 1e-5) return vec3(0.0);
+    vec2 ndc = pc.xy / pc.w;
+    if (u.cam.w > 0.5) ndc.y = -ndc.y;
+    vec2 uv = ndc * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) return vec3(0.0);
+    ivec2 q = ivec2(uv * vec2(u.misc.xy));
+    float pz = pc.z / pc.w;
+    vec4 hb = imageLoad(uHBp, q);
+    if (!(hb.g > 0.0) || abs(hb.g - pz) > 0.05 * pz) return vec3(0.0);
+    vec4 ha = imageLoad(uHAp, q);
+    if (any(isnan(ha)) || any(isinf(ha))) return vec3(0.0);
+    return max(ha.rgb, vec3(0.0));
+}
+
+void basis(vec3 N, out vec3 T, out vec3 B) {
+    float sgn = N.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (sgn + N.z);
+    float b = N.x * N.y * a;
+    T = vec3(1.0 + sgn * N.x * N.x * a, sgn * b, -sgn * N.x);
+    B = vec3(b, sgn + N.y * N.y * a, -N.y);
+}
+
+bool neighbour(ivec2 q, out vec3 pos) {
+    q = clamp(q, ivec2(0), ivec2(u.misc.xy) - 1);
+    float z = texelFetch(uDepth, q, 0).r;
+    pos = vec3(0.0);
+    if (z <= 0.0) return false;
+    pos = worldAt(q, z);
+    return true;
+}
+
+vec3 tame(vec3 v) {  // fireflies: cap the radiance of a single ray, keep its hue
+    float l = dot(v, vec3(0.2126, 0.7152, 0.0722));
+    return l > 1.5 ? v * (1.5 / l) : v;
+}
+
+
+// ---- water: the only non-opaque geometry. Returns the final colour of a water pixel (or false when this pixel is not water)
+vec3 rippleNormal(vec2 q, float t) {
+    float nx = sin(q.x * 1.7 + q.y * 0.9 + t * 1.3) + 0.6 * sin(q.x * 3.1 - q.y * 2.3 - t * 1.9) + 0.3 * sin(q.y * 5.3 + q.x * 1.1 + t * 2.7);
+    float nz = sin(q.y * 1.5 - q.x * 1.1 + t * 1.1) + 0.6 * sin(q.y * 2.9 + q.x * 2.1 - t * 2.3) + 0.3 * sin(q.x * 4.9 - q.y * 1.7 + t * 2.9);
+    return normalize(vec3(nx * 0.07, 1.0, nz * 0.07));
+}
+
+bool waterPixel(vec3 P, vec3 c, out vec3 outCol) {
+    outCol = c;
+    vec3 V = P - u.cam.xyz;
+    float dist = length(V);
+    if (dist < 1e-3) return false;
+    vec3 dir = V / dist;
+    if (dir.y > -0.02) return false;
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, uTlas, gl_RayFlagsCullOpaqueEXT, 0xFF, u.cam.xyz, 0.0, dir, dist + 0.05);
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) rayQueryConfirmIntersectionEXT(rq);
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) return false;
+    float t = rayQueryGetIntersectionTEXT(rq, true);
+    vec3 W = u.cam.xyz + dir * t;
+    vec3 N = rippleNormal(W.xz, u.fx2.z);
+    vec3 R = reflect(dir, N);
+    float cosT = clamp(dot(-dir, N), 0.0, 1.0);
+    float fres = 0.04 + 0.96 * pow(1.0 - cosT, 5.0);
+    float wgt = clamp(max(fres, 0.3) * u.fx2.y * 2.0, 0.0, 1.0);
+    vec3 o = W + vec3(0.0, 0.03, 0.0);
+    vec3 col = c;
+    // mirror image of the world
+    rayQueryEXT rr;
+    rayQueryInitializeEXT(rr, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0xFF, o, 0.0, R, 200.0);
+    while (rayQueryProceedEXT(rr)) {}
+    if (rayQueryGetIntersectionTypeEXT(rr, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+        float th = rayQueryGetIntersectionTEXT(rr, true);
+        vec3 hc = screenColor(o + R * th, vec3(-1.0), false);
+        if (hc.x >= 0.0) col = mix(c, hc, wgt);
+    }
+    // sun glitter
+    vec3 L = normalize(u.sun.xyz);
+    float g = pow(max(dot(R, L), 0.0), 220.0) * 5.0 * u.fx2.w;
+    if (g > 0.02) {
+        rayQueryEXT rs;
+        rayQueryInitializeEXT(rs, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, o, 0.0, L, 2000.0);
+        while (rayQueryProceedEXT(rs)) {}
+        if (rayQueryGetIntersectionTypeEXT(rs, true) == gl_RayQueryCommittedIntersectionNoneEXT) col += vec3(1.0, 0.92, 0.75) * g;
+    }
+    outCol = col;
+    return true;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = ivec2(u.misc.xy);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+    float z = texelFetch(uDepth, p, 0).r;
+    if (z <= 0.0) return;
+
+    vec3 P = worldAt(p, z);
+    vec3 Pr, Pl, Pu, Pd;
+    bool okR = neighbour(p + ivec2(1, 0), Pr);
+    bool okL = neighbour(p - ivec2(1, 0), Pl);
+    bool okU = neighbour(p + ivec2(0, 1), Pu);
+    bool okD = neighbour(p - ivec2(0, 1), Pd);
+    vec3 dx = vec3(0.0), dy = vec3(0.0);
+    if (okR && okL) dx = (length(Pr - P) < length(P - Pl)) ? (Pr - P) : (P - Pl);
+    else if (okR) dx = Pr - P;
+    else if (okL) dx = P - Pl;
+    if (okU && okD) dy = (length(Pu - P) < length(P - Pd)) ? (Pu - P) : (P - Pd);
+    else if (okU) dy = Pu - P;
+    else if (okD) dy = P - Pd;
+    vec3 N = cross(dx, dy);
+    float nl = length(N);
+    N = nl > 1e-20 ? N / nl : vec3(0.0, 1.0, 0.0);
+    vec3 V = u.cam.xyz - P;
+    float dist = length(V);
+    if (dot(N, V) < 0.0) N = -N;
+
+    vec3 c = imageLoad(uColor, p).rgb;
+    if ((u.flags.x & 8u) != 0u && u.flags.w != 0u) {
+        vec3 wc;
+        if (waterPixel(P, c, wc)) {   // water: encode "this is water" as a negative shadow value, final colour in uGI
+            imageStore(uGI, p, vec4(wc, 0.0));
+            imageStore(uSh, p, vec4(-1.0));
+            return;
+        }
+    }
+    vec3 T, B;
+    basis(N, T, B);
+    float bias = 0.02 + 0.002 * dist;
+    vec3 origin = P + N * bias;
+    float ign = fract(52.9829189 * fract(0.06711056 * float(p.x) + 0.00583715 * float(p.y)));
+    float fr = float(u.misc.w & 1023u);
+    const int nB = int((u.misc.w >> 16) & 15u);
+
+    // ---- soft sun shadow
+    float vis = 1.0;
+    int nS = int(u.flags.y);
+    vec3 L = normalize(u.sun.xyz);
+    if ((u.flags.x & 1u) != 0u && nS > 0 && dot(N, L) > 0.02) {
+        vec3 LT, LB;
+        basis(L, LT, LB);
+        float hits = 0.0;
+        for (int i = 0; i < nS; ++i) {
+            float r1 = fract(ign + float(i) * 0.6180339887 + fr * 0.7548776662);
+            float r2 = fract(ign * 7.77 + float(i) * 0.3247179572 + fr * 0.5698402910);
+            float rad = sqrt(r2) * u.fx2.x;
+            vec3 dir = normalize(L + (LT * cos(6.2831853 * r1) + LB * sin(6.2831853 * r1)) * rad);
+            rayQueryEXT rq;
+            rayQueryInitializeEXT(rq, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 0.0, dir, 2000.0);
+            while (rayQueryProceedEXT(rq)) {}
+            if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) hits += 1.0;
+        }
+        vis = 1.0 - hits / float(nS);
+    }
+
+    // ---- hemisphere rays: occlusion + bounce light
+    vec3 bounce = vec3(0.0);
+    float occ = 0.0;
+    int nH = int(u.flags.z);
+    const bool multi = u.tp.x > 0.5 && u.tp.z > 0.0;   // history valid and multi-bounce strength > 0
+    if ((u.flags.x & 6u) != 0u && nH > 0) {
+        float aoR = u.fx.y;
+        float range = max(u.fx.w, aoR);
+        for (int i = 0; i < nH; ++i) {
+            float r1 = fract(ign + float(i) * 0.6180339887 + fr * 0.7548776662 + 0.31);
+            float r2 = fract(ign * 13.37 + float(i) * 0.5698402910 + fr * 0.5698402910);
+            float phi = 6.2831853 * r1;
+            float st = sqrt(r2);
+            vec3 dir = normalize(T * (cos(phi) * st) + B * (sin(phi) * st) + N * sqrt(1.0 - r2));
+            vec3 ro = origin;
+            vec3 thr = vec3(1.0);
+            for (int k = 0; k < nB; ++k) {
+                rayQueryEXT rq;
+                rayQueryInitializeEXT(rq, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0xFF, ro, 0.0, dir, k == 0 ? range : max(range, 60.0));
+                while (rayQueryProceedEXT(rq)) {}
+                if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                    bounce += thr * tame(screenColor(ro + dir * 5000.0, c * 0.6, true));
+                    break;
+                }
+                float t = rayQueryGetIntersectionTEXT(rq, true);
+                if (k == 0 && t < aoR) occ += 1.0 - t / aoR;
+                vec3 hp = ro + dir * t;
+                vec3 hc = screenColor(hp, c * 0.5, false);
+                bounce += thr * tame(hc);
+                if (k + 1 >= nB) break;
+                // exact normal of the triangle that was hit
+                vec3 vp3[3];
+                rayQueryGetIntersectionTriangleVertexPositionsEXT(rq, true, vp3);
+                mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+                vec3 w0 = o2w * vec4(vp3[0], 1.0), w1 = o2w * vec4(vp3[1], 1.0), w2 = o2w * vec4(vp3[2], 1.0);
+                vec3 hn = cross(w1 - w0, w2 - w0);
+                float hl2 = dot(hn, hn);
+                if (!(hl2 > 1e-14)) break;
+                hn *= inversesqrt(hl2);
+                if (dot(hn, dir) > 0.0) hn = -hn;
+                // the surface keeps part of the light: its colour (chroma, capped at 1) times 0.6
+                float hl = dot(hc, vec3(0.2126, 0.7152, 0.0722));
+                thr *= min(hc / (hl + 0.02), vec3(1.0)) * 0.6;
+                if (dot(thr, vec3(0.3333)) < 0.01) break;
+                // next direction: cosine around the hit normal
+                vec3 HT, HB;
+                basis(hn, HT, HB);
+                float q1 = fract(ign * 3.31 + float(i) * 0.7548776662 + float(k) * 0.6180339887 + fr * 0.3247179572);
+                float q2 = fract(ign * 9.17 + float(i) * 0.5698402910 + float(k) * 0.7548776662 + fr * 0.6180339887);
+                float qs = sqrt(q2);
+                dir = normalize(HT * (cos(6.2831853 * q1) * qs) + HB * (sin(6.2831853 * q1) * qs) + hn * sqrt(1.0 - q2));
+                ro = hp + hn * (0.02 + 0.002 * t);
+            }
+        }
+        bounce /= float(nH);
+        occ /= float(nH);
+    }
+    if (any(isnan(bounce)) || any(isinf(bounce))) bounce = vec3(0.0);
+    if (isnan(occ) || isinf(occ)) occ = 0.0;
+    if (isnan(vis) || isinf(vis)) vis = 1.0;
+
+    // ---- step 21: light from emissive sources (fire, candles, lamps) found by the light pass.
+    // The contribution of every light is evaluated without shadows (cheap), ONE light is picked with a probability
+    // proportional to that contribution and only that one gets a shadow ray. The estimate is tot * visibility * hue.
+    vec3 emis = vec3(0.0);
+    if ((u.lm.w & 1u) != 0u) {
+        const uint nL = 64u;   // persistent light slots (empty ones have intensity 0)
+        const float R = max(u.lt.y, 0.5);
+        const float R2 = R * R;
+        float tot = 0.0;
+        for (uint i = 0u; i < nL; ++i) {
+            vec4 a = lights.L[512u + 3u * i];
+            if (a.w <= 1.0e-4) continue;
+            vec3 dv = a.xyz - P;
+            float d2 = dot(dv, dv);
+            if (d2 >= R2) continue;
+            float cs = max(dot(N, dv * inversesqrt(max(d2, 1e-6))), 0.0);
+            float win = 1.0 - d2 / R2;
+            tot += a.w * cs * win * win / (d2 + 0.25);
+        }
+        if (tot > 1e-4) {
+            const int nR = int(max(u.lm.z, 1u));
+            for (int k = 0; k < nR; ++k) {
+                float target = fract(ign * 3.7 + float(k) * 0.7548776662 + fr * 0.5698402910) * tot;
+                float acc = 0.0;
+                uint pick = nL;
+                for (uint i = 0u; i < nL; ++i) {
+                    vec4 a = lights.L[512u + 3u * i];
+                    if (a.w <= 1.0e-4) continue;
+                    vec3 dv = a.xyz - P;
+                    float d2 = dot(dv, dv);
+                    if (d2 >= R2) continue;
+                    float cs = max(dot(N, dv * inversesqrt(max(d2, 1e-6))), 0.0);
+                    float win = 1.0 - d2 / R2;
+                    acc += a.w * cs * win * win / (d2 + 0.25);
+                    if (acc >= target) { pick = i; break; }
+                }
+                if (pick >= nL) continue;
+                vec3 lp = lights.L[512u + 3u * pick].xyz;
+                {   // the flame is not a point: aim at a random spot inside a ~0.35 m ball, so shadow edges are soft and do not snap while the camera moves
+                    float r1 = fract(ign * 5.317 + fr * 0.7548776662 + float(k) * 0.3137);
+                    float r2 = fract(ign * 2.173 + fr * 0.5698402910 + float(k) * 0.4719);
+                    float r3 = fract(ign * 7.131 + fr * 0.3247179572 + float(k) * 0.2291);
+                    float ct = r1 * 2.0 - 1.0, ph = r2 * 6.2831853;
+                    float sn = sqrt(max(1.0 - ct * ct, 0.0));
+                    lp += vec3(sn * cos(ph), ct, sn * sin(ph)) * (0.35 * r3);
+                }
+                vec3 toL = lp - origin;
+                float dl = length(toL);
+                float visL = 1.0;
+                if (dl > 0.45) {
+                    rayQueryEXT rl;
+                    rayQueryInitializeEXT(rl, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 0.0, toL / dl, dl - 0.4);
+                    while (rayQueryProceedEXT(rl)) {}
+                    if (rayQueryGetIntersectionTypeEXT(rl, true) != gl_RayQueryCommittedIntersectionNoneEXT) visL = 0.0;
+                }
+                emis += lights.L[512u + 3u * pick + 1u].rgb * (tot * visL / float(nR));
+            }
+        }
+        if (any(isnan(emis)) || any(isinf(emis))) emis = vec3(0.0);
+        // soft ceiling: however strong the lights are set, the light added to one pixel saturates at about tp.w (no blown-out pools)
+        float el = dot(emis, vec3(0.2126, 0.7152, 0.0722));
+        // the ceiling follows how bright the surface already is: a dark night meadow can take only a little extra light before it
+        // looks like a glow, a lit surface can take more. This makes the result much less sensitive to the strength setting.
+        float capL = min(u.tp.w, 0.02 + 1.5 * dot(c, vec3(0.2126, 0.7152, 0.0722)));
+        emis *= 1.0 / (1.0 + el / max(capL, 0.02));
+        // eyes adapt: a surface that is already bright (daylight) hardly notices an extra lamp
+        emis *= 1.0 / (1.0 + 2.5 * dot(c, vec3(0.2126, 0.7152, 0.0722)));
+    }
+    imageStore(uGI, p, vec4(bounce * u.lt.w + emis, occ));
+    imageStore(uSh, p, vec4(vis));
+}

@@ -96,6 +96,8 @@ Everything the panel changes lives in `%LOCALAPPDATA%\SkyRT\SkyRT.cfg` (plain `k
 | `taa` · `taan` | 0/1 · 1–64 | Temporal accumulation on/off, max accumulated frames (lower = less ghosting, more noise) |
 | `dyngeo` | 0/1 | Characters / animated meshes cast ray-traced shadows |
 | `instgeo` | 0/1 | Small instanced props in the acceleration structure (experimental) |
+| `deep` | 0/1 | **Deep bounce mode**: every ray path bounces several times, with exact surface normals of what it hits. Needs a GPU with ray tracing position fetch (RTX 30xx and newer; the log says if it is missing). Very heavy, the GPU heats up on purpose. Hotkey Ctrl+] |
+| `bounces` | 1..8 | Bounces per path in deep mode (default 3). Cost grows with it. Hotkeys Ctrl+Up / Ctrl+Down |
 | `pathtrace` | 0/1 | Screenshot mode ("path tracing"): 4x rays per pixel, up to 256 frames of accumulation, deeper bounces. Adaptive: full quality only while the camera stands still (after ~0.3 s), normal cost while you move, so flying has no extra stutter. Hotkey Ctrl+Backspace |
 | `grass` | 0/1 | Grass in the acceleration structure: casts shadows and takes part in AO (experimental) |
 | `gimulti` | 0–0.9 | Multi-bounce GI: light bounces more than once (every frame adds a bounce, needs `taa=1`); 0 = single bounce |
@@ -115,6 +117,8 @@ More rays = less noise, more GPU work. Sky is usually CPU-bound, so the GPU norm
 |---|---|
 | **Ctrl+Home** | Ray tracing on/off (compare with the original picture) |
 | **Ctrl+End** | Next view: 0 full · 1 shadows only · 2 AO only · 3 bounce light only · 4 AO map (debug) · 5 bounce map (debug) · 6 grid (debug) · 7 normals (debug) |
+| **Ctrl+]** | Deep bounce mode on/off (very heavy) |
+| **Ctrl+Up / Ctrl+Down** | Bounces +1 / -1 (1..8) in deep mode |
 | **Ctrl+Backspace** | Screenshot mode ("path tracing") on/off: 4x rays, long accumulation. Stand still for a clean picture |
 
 If the picture looks strange, press **Ctrl+End** until view 0 is back (or set `view=0`).
@@ -161,7 +165,7 @@ powershell -ExecutionPolicy Bypass -File release\package_release.ps1 -Version 0.
 Run the panel from source: `pip install PyQt5` then `python panel\skyrt_panel.py` (put `SkyRT.dll` and `VK_LAYER_SKYRT.json` next to it).
 Manual install without the panel: `layer\install.ps1` registers the layer (`-Uninstall` removes it; `-Machine` from an admin shell writes to HKLM).
 
-After editing a `.comp` shader: `glslangValidator -V --target-env vulkan1.2 layer\rt_fx.comp -o rtfx.spv`, then `python tools\spv2h.py rtfx.spv layer\rtfx_spv.h kRtFxSpv rt_fx.comp` (the trace shader is `rt.comp` → `rt_spv.h`, array `kRtSpv`; the light shaders are `rt_light.comp` → `rtlight_spv.h` (`kRtLightSpv`) and `rt_lmerge.comp` → `rtlmerge_spv.h` (`kRtLMergeSpv`)).
+After editing a `.comp` shader: `glslangValidator -V --target-env vulkan1.2 layer\rt_fx.comp -o rtfx.spv`, then `python tools\spv2h.py rtfx.spv layer\rtfx_spv.h kRtFxSpv rt_fx.comp` (the trace shader is `rt.comp` → `rt_spv.h`, array `kRtSpv`; the light shaders are `rt_light.comp` → `rtlight_spv.h` (`kRtLightSpv`) and `rt_lmerge.comp` → `rtlmerge_spv.h` (`kRtLMergeSpv`); the deep bounce variant of the trace shader is `rt_deep.comp` → `rtdeep_spv.h` (`kRtDeepSpv`)).
 
 ## 🧩 How it works
 

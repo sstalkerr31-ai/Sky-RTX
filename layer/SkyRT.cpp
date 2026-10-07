@@ -34,6 +34,7 @@
 #include "rt_spv.h"    // SPIR-V of rt.comp (generated): trace pass
 #include "rtfx_spv.h"  // SPIR-V of rt_fx.comp (generated): denoise + composite pass
 #include "rtlight_spv.h"  // SPIR-V of rt_light.comp (generated): emissive light source search (step 21)
+#include "rtdeep_spv.h"  // SPIR-V of rt_deep.comp (generated): trace pass with several bounces (step 26)
 #include "rtlmerge_spv.h"  // SPIR-V of rt_lmerge.comp (generated): persistent light list (step 23)
 
 // ============================================================ config
@@ -74,6 +75,8 @@ static float g_lightStrength = 2.0f, g_lightRange = 4.0f, g_lightThr = 2.0f, g_l
 static int g_lightRays = 2, g_lightDebug = 0;   // cfg lightrays (shadow rays per pixel), lightdebug (paint the emissive pixels magenta)
 static float g_giMulti = 0.1f;   // step 22: multi-bounce GI strength 0..0.9 (cfg gimulti): the previous frame's indirect light is added to what bounce rays see
 static float g_taaN = 12.0f;      // step 20: maximum accumulated samples (cfg taan); lower = less ghosting, more noise
+static int g_deep = 0;            // step 26: deep bounce mode (cfg deep=0/1, Ctrl+] toggle): every ray path bounces up to g_bounces times - very heavy
+static int g_bounces = 3;         // step 26: bounces per path in deep mode, 1..8 (cfg bounces, Ctrl+Up / Ctrl+Down)
 static int g_pathTrace = 0;       // step 25: 'path tracing' / screenshot mode: 4x rays per pixel, long accumulation, deeper bounces (cfg pathtrace=0/1, Ctrl+Backspace)
 static int g_grass = 1;           // step 24: grass (non-indexed triangle strips written by the CPU) in the acceleration structure (cfg grass=0/1)
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
@@ -451,6 +454,8 @@ struct DeviceData {
     VkDescriptorSetLayout paintDsl = VK_NULL_HANDLE;
     VkPipelineLayout paintPl = VK_NULL_HANDLE;
     VkPipeline paintPipe = VK_NULL_HANDLE;
+    VkPipeline deepPipe = VK_NULL_HANDLE;   // step 26: trace variant with several bounces (needs VK_KHR_ray_tracing_position_fetch)
+    bool posFetch = false;
     VkDescriptorPool paintPool = VK_NULL_HANDLE;
     VkDescriptorSet paintSets[16] = {};
     bool paintTried = false, paintOk = false;             // guarded by paintMtx
@@ -719,6 +724,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
 
     // ---- decide whether RT can be enabled
     bool wantRT = !g_logOnly;
+    bool posFetchWanted = false;
     const char* needExt[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME,
                              VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME};
     if (wantRT && props.apiVersion < kApi12) { Logf("RT skipped: device api < 1.2"); wantRT = false; }
@@ -744,6 +750,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
             inst->GetPhysicalDeviceFeatures2(phys, &f2);
             Logf("GPU RT features: accelerationStructure=%u rayQuery=%u bufferDeviceAddress=%u", asF.accelerationStructure,
                  rqF.rayQuery, bdaF.bufferDeviceAddress);
+            {   // step 26: optional - exact triangle positions at a ray hit (gives the surface normal for deep bounces)
+                bool extOk = false;
+                uint32_t n = 0;
+                inst->EnumerateDeviceExtensionProperties(phys, nullptr, &n, nullptr);
+                std::vector<VkExtensionProperties> avail(n);
+                inst->EnumerateDeviceExtensionProperties(phys, nullptr, &n, avail.data());
+                for (auto& a : avail) if (!strcmp(a.extensionName, VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME)) extOk = true;
+                if (extOk) {
+                    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR pfF{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR};
+                    VkPhysicalDeviceFeatures2 g2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                    g2.pNext = &pfF;
+                    inst->GetPhysicalDeviceFeatures2(phys, &g2);
+                    posFetchWanted = pfF.rayTracingPositionFetch != 0;
+                }
+                Logf("GPU ray tracing position fetch (deep bounce mode): %s", posFetchWanted ? "available" : "NOT available (deep mode off)");
+            }
             if (!asF.accelerationStructure || !rqF.rayQuery || !bdaF.bufferDeviceAddress) wantRT = false;
         }
     }
@@ -755,6 +777,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
     VkPhysicalDeviceBufferDeviceAddressFeatures bdaAdd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asAdd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceRayQueryFeaturesKHR rqAdd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR pfAdd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR};
     std::vector<std::pair<VkBool32*, VkBool32>> undo;  // to restore the game's structs on fallback
 
     if (wantRT) {
@@ -780,6 +803,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
             bool have = false;
             for (const char* x : exts) if (!strcmp(x, e)) { have = true; break; }
             if (!have) exts.push_back(e);
+        }
+        if (posFetchWanted) {
+            exts.push_back(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
+            pfAdd.rayTracingPositionFetch = VK_TRUE; pfAdd.pNext = (void*)ci.pNext; ci.pNext = &pfAdd;
         }
         ci.enabledExtensionCount = (uint32_t)exts.size();
         ci.ppEnabledExtensionNames = exts.data();
@@ -816,7 +843,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
         for (auto& u : undo) if (u.first) { /* keep RT toggles; only the anisotropy flag matters here */ }
         r = createDevice(phys, &ci, pAllocator, pDevice);
     }
+    if (r != VK_SUCCESS && wantRT && posFetchWanted) {
+        Logf("!!! vkCreateDevice with position fetch failed (%d) - retrying without it", (int)r);
+        posFetchWanted = false;
+        ci.pNext = pfAdd.pNext;
+        exts.pop_back();
+        ci.enabledExtensionCount = (uint32_t)exts.size();
+        r = createDevice(phys, &ci, pAllocator, pDevice);
+    }
     if (r != VK_SUCCESS && wantRT) {
+        posFetchWanted = false;
         Logf("!!! vkCreateDevice with RT failed (%d) - retrying with the game's original info (RT off)", (int)r);
         for (auto& u : undo) *u.first = u.second;
         chain->u.pLayerInfo = savedLink;
@@ -832,6 +868,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
     d->phys = phys;
     d->gdpa = gdpa;
     d->rtEnabled = wantRT;
+    d->posFetch = wantRT && posFetchWanted;
     d->setLoaderData = setLoaderData;
     d->anisoOk = anisoWanted;
     d->maxAniso = props.limits.maxSamplerAnisotropy;
@@ -2076,7 +2113,7 @@ static void BuildWorldBlasTest(DeviceData* d, const std::vector<DeviceData::Reso
     // ---- 2. build sizes
     VkAccelerationStructureBuildGeometryInfoKHR bi{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
     bi.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-    bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | (d->posFetch ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR : 0);
     bi.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
     bi.geometryCount = (uint32_t)geoms.size();
     bi.pGeometries = geoms.data();
@@ -2267,6 +2304,8 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->paintPipe = MakeComputePipe(d, kRtSpv, sizeof(kRtSpv), "trace");
     d->fxPipe = MakeComputePipe(d, kRtFxSpv, sizeof(kRtFxSpv), "composite");
     if (!d->paintPipe || !d->fxPipe) return false;
+    if (d->posFetch) d->deepPipe = MakeComputePipe(d, kRtDeepSpv, sizeof(kRtDeepSpv), "deep trace");   // optional: without it the deep bounce mode is unavailable
+    Logf("rt: deep bounce mode %s", d->deepPipe ? "available (Ctrl+] on/off, Ctrl+Up/Down = bounces)" : "unavailable (GPU/driver lacks position fetch)");
     d->lightPipe = MakeComputePipe(d, kRtLightSpv, sizeof(kRtLightSpv), "lights");   // optional: without it the emissive light is simply off
     d->lmergePipe = MakeComputePipe(d, kRtLMergeSpv, sizeof(kRtLMergeSpv), "light merge");
     if (!d->lmergePipe) d->lightPipe = VK_NULL_HANDLE;
@@ -3006,6 +3045,8 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "lightrays=2   # shadow rays per pixel for those lights 1..4\r\n"
                   "lightdebug=0  # 1 = paint the pixels that are treated as light sources magenta (to tune lightthr)\r\n"
                   "instgeo=1     # 1 = instanced props in the acceleration structure\r\n"
+                  "deep=0   # 1 = DEEP BOUNCE mode: every ray path bounces several times (see bounces). Needs a GPU with ray tracing position fetch (RTX 30xx and newer). VERY heavy: the GPU heats up. Ctrl+] toggles\r\n"
+                  "bounces=3   # 1..8 bounces per path in deep mode (cost grows with it). Ctrl+Up / Ctrl+Down change it in game\r\n"
                   "pathtrace=0   # 1 = screenshot mode ('path tracing'): while the camera stands still (after ~0.3 s) 4x rays per pixel, long accumulation, deeper bounces; normal cost while moving. Ctrl+Backspace toggles\r\n"
                   "grass=1       # 1 = grass in the acceleration structure (casts shadows, takes part in AO); 0 = off\r\n"
                   "dyngeo=1      # 1 = characters / animated meshes get their own acceleration structure rebuilt every frame (smooth shadows of moving objects)\r\n"
@@ -3062,6 +3103,8 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "taa")) g_taa = v != 0.0;
         else if (!strcmp(key, "taan")) g_taaN = (float)std::max(1.0, std::min(256.0, v));
         else if (!strcmp(key, "pathtrace")) g_pathTrace = v != 0.0;
+        else if (!strcmp(key, "deep")) g_deep = v != 0.0;
+        else if (!strcmp(key, "bounces")) g_bounces = std::max(1, std::min(8, (int)v));
         else if (!strcmp(key, "gimulti")) g_giMulti = (float)std::max(0.0, std::min(0.9, v));
         else if (!strcmp(key, "light")) g_lightOn = v != 0.0;
         else if (!strcmp(key, "lightmax")) g_lightMax = (float)std::max(0.05, std::min(5.0, v));
@@ -3123,6 +3166,16 @@ static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = next v
         const bool bs = ctrl && (GetAsyncKeyState(VK_BACK) & 0x8000) != 0;
         if (bs && !bsWas) { g_pathTrace = !g_pathTrace; Logf("rt: KEY Ctrl+Backspace -> screenshot mode (path tracing) %s", g_pathTrace ? "ON: 4x rays, long accumulation, stand still" : "off"); }
         bsWas = bs;
+    }
+    {   // step 26: deep bounce mode: Ctrl+] = on/off, Ctrl+Up / Ctrl+Down = bounces +1 / -1 (1..8)
+        static bool dWas = false, uWas = false, dnWas = false;
+        const bool dk = ctrl && (GetAsyncKeyState(0xDD /*VK_OEM_6*/) & 0x8000) != 0;
+        const bool uk = ctrl && (GetAsyncKeyState(VK_UP) & 0x8000) != 0;
+        const bool nk = ctrl && (GetAsyncKeyState(VK_DOWN) & 0x8000) != 0;
+        if (dk && !dWas) { g_deep = !g_deep; Logf("rt: KEY Ctrl+] -> deep bounce mode %s (%d bounces)", g_deep ? "ON: heavy GPU load" : "off", g_bounces); }
+        if (uk && !uWas) { g_bounces = std::min(8, g_bounces + 1); Logf("rt: KEY Ctrl+Up -> bounces %d%s", g_bounces, g_deep ? "" : " (deep mode is off, Ctrl+] turns it on)"); }
+        if (nk && !dnWas) { g_bounces = std::max(1, g_bounces - 1); Logf("rt: KEY Ctrl+Down -> bounces %d%s", g_bounces, g_deep ? "" : " (deep mode is off, Ctrl+] turns it on)"); }
+        dWas = dk; uWas = uk; dnWas = nk;
     }
     static bool delWas = false;
     const bool del = ctrl && (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
@@ -3410,7 +3463,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         slot = &d->rtSlots[idx];
         VkAccelerationStructureBuildGeometryInfoKHR bi{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
         bi.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | (d->posFetch ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR : 0);
         bi.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         bi.geometryCount = (uint32_t)geoms.size();
         bi.pGeometries = geoms.data();
@@ -3512,7 +3565,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             }
             VkAccelerationStructureBuildGeometryInfoKHR bi{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
             bi.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-            bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+            bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR | (d->posFetch ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR : 0);
             bi.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
             bi.geometryCount = (uint32_t)fg.dynGeoms.size();
             bi.pGeometries = fg.dynGeoms.data();
@@ -3655,10 +3708,11 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         d->stillFrames = (d->histValid && mvd < 5.0e-5f) ? std::min<uint32_t>(d->stillFrames + 1, 100000u) : 0u;
         ptFull = d->stillFrames >= 20;
     }
+    const bool deepOn = g_deep && d->deepPipe;
     uint32_t lightTile = 48;
     while (((m.w + lightTile - 1) / lightTile) * ((m.h + lightTile - 1) / lightTile) > 4096u) lightTile += 16;
     const uint32_t lightTx = (m.w + lightTile - 1) / lightTile, lightTy = (m.h + lightTile - 1) / lightTile;
-    par->misc[0] = m.w; par->misc[1] = m.h; par->misc[2] = modeEff; par->misc[3] = (uint32_t)d->paintInjected.load();
+    par->misc[0] = m.w; par->misc[1] = m.h; par->misc[2] = modeEff; par->misc[3] = ((uint32_t)d->paintInjected.load() & 1023u) | (deepOn ? ((uint32_t)g_bounces << 16) : 0u);
     par->flags[0] = flagsEff;
     par->flags[1] = (uint32_t)(ptFull ? std::min(32, g_shRays * 4) : g_shRays);
     par->flags[2] = (uint32_t)(ptFull ? std::min(32, g_aoRays * 4) : g_aoRays);
@@ -3766,7 +3820,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     }
 
     // ---- pass 1: trace
-    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->paintPipe);  // original function: not our graphics hook
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, deepOn ? d->deepPipe : d->paintPipe);  // original function: not our graphics hook
     d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->paintPl, 0, 1, &set, 0, nullptr);
     d->CmdDispatch(cb, (m.w + 7) / 8, (m.h + 7) / 8, 1);
 
