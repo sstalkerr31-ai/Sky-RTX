@@ -94,7 +94,7 @@ Everything the panel changes lives in `%LOCALAPPDATA%\SkyRT\SkyRT.cfg` (plain `k
 | `dyngeo` | 0/1 | Characters / animated meshes cast ray-traced shadows |
 | `instgeo` | 0/1 | Small instanced props in the acceleration structure (experimental) |
 | `light` | 0/1 | Light from fire, candles and lamps: very bright pixels of the frame become light sources that light and shadow their surroundings (new, needs testing) |
-| `lightstrength` · `lightrange` | 0–10 · 1–60 | How strong the light is, how far (world units) one source reaches |
+| `lightstrength` · `lightrange` | 0–200 (default 25) · 1–60 | How strong the light is, how far (world units) one source reaches |
 | `lightthr` · `lightrays` · `lightdebug` | 0.3–50 · 1–4 · 0/1 | Brightness above which a pixel counts as a source (the log prints the brightest pixel it saw), shadow rays per pixel, paint detected sources magenta |
 | `aniso` · `lodbias` | 0–16 · −2…1 | Anisotropic filtering, texture sharpness shift (**applied on the next game start**) |
 | `autosun` · `az` · `el` | 0/1 · 0–360° · 1–89° | Take the sun from the game, or set it manually |

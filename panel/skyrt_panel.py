@@ -103,7 +103,7 @@ SETTINGS = {
     "gi": (1, 0, 1, "b"), "gistrength": (0.35, 0.0, 2.0, "f"), "girange": (30.0, 1.0, 200.0, "f"),
     "taa": (1, 0, 1, "b"), "taan": (12.0, 1.0, 64.0, "f"),
     "dyngeo": (1, 0, 1, "b"), "instgeo": (1, 0, 1, "b"),
-    "light": (1, 0, 1, "b"), "lightstrength": (1.0, 0.0, 10.0, "f"), "lightrange": (12.0, 1.0, 60.0, "f"), "lightthr": (2.0, 0.3, 50.0, "f"),
+    "light": (1, 0, 1, "b"), "lightstrength": (25.0, 0.0, 200.0, "f"), "lightrange": (12.0, 1.0, 60.0, "f"), "lightthr": (2.0, 0.3, 50.0, "f"),
     "lightrays": (2, 1, 4, "i"), "lightdebug": (0, 0, 1, "b"),
     "aniso": (16, 0, 16, "i"), "lodbias": (0.0, -2.0, 1.0, "f"),
     "autosun": (1, 0, 1, "b"), "az": (30.0, 0.0, 360.0, "f"), "el": (50.0, 1.0, 89.0, "f"),

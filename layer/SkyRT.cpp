@@ -69,7 +69,7 @@ static const uint32_t kInstMaxPerDraw = 48, kInstMinIdx = 90, kPropGeomMax = 100
 static const uint64_t kPropTrisMax = 100000;
 static int g_taa = 1;             // step 20: temporal accumulation of shadows / AO / GI (cfg taa=0/1)
 static int g_lightOn = 1;          // step 21: light from fire / candles / lamps (bright pixels of the frame become point lights), cfg light=0/1
-static float g_lightStrength = 1.0f, g_lightRange = 12.0f, g_lightThr = 2.0f;   // cfg lightstrength, lightrange (world units), lightthr (HDR brightness that counts as emissive)
+static float g_lightStrength = 25.0f, g_lightRange = 12.0f, g_lightThr = 2.0f;   // cfg lightstrength, lightrange (world units), lightthr (HDR brightness that counts as emissive)
 static int g_lightRays = 2, g_lightDebug = 0;   // cfg lightrays (shadow rays per pixel), lightdebug (paint the emissive pixels magenta)
 static float g_taaN = 12.0f;      // step 20: maximum accumulated samples (cfg taan); lower = less ghosting, more noise
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
@@ -2890,7 +2890,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "taa=1         # 1 = temporal accumulation of shadows / AO / GI (less noise)\r\n"
                   "taan=12       # max accumulated frames (lower = less ghosting, more noise)\r\n"
                   "light=1       # 1 = light from fire, candles and lamps (bright pixels become light sources that cast shadows)\r\n"
-                  "lightstrength=1.0 # 0..10 how strong that light is\r\n"
+                  "lightstrength=25 # 0..200 how strong that light is (a candle flame is tiny, so this needs to be large)\r\n"
                   "lightrange=12 # world units, how far the light of one source reaches\r\n"
                   "lightthr=2.0  # brightness above which a pixel counts as a light source (the log prints the brightest pixel it sees)\r\n"
                   "lightrays=2   # shadow rays per pixel for those lights 1..4\r\n"
@@ -2949,7 +2949,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "taa")) g_taa = v != 0.0;
         else if (!strcmp(key, "taan")) g_taaN = (float)std::max(1.0, std::min(64.0, v));
         else if (!strcmp(key, "light")) g_lightOn = v != 0.0;
-        else if (!strcmp(key, "lightstrength")) g_lightStrength = (float)std::max(0.0, std::min(10.0, v));
+        else if (!strcmp(key, "lightstrength")) g_lightStrength = (float)std::max(0.0, std::min(200.0, v));
         else if (!strcmp(key, "lightrange")) g_lightRange = (float)std::max(1.0, std::min(60.0, v));
         else if (!strcmp(key, "lightthr")) g_lightThr = (float)std::max(0.3, std::min(50.0, v));
         else if (!strcmp(key, "lightrays")) g_lightRays = (int)std::max(1.0, std::min(4.0, v));
