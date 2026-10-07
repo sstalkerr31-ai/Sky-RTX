@@ -38,7 +38,8 @@ SkyRT is an **implicit Vulkan layer** that adds real hardware ray tracing to *Sk
 | A few instanced props in the acceleration structure | 🧪 experimental, small effect |
 | Water / reflections | ❌ not yet (the water surface has not been located) |
 | Grass and foliage in the acceleration structure | ❌ not yet |
-| Light from fires / emissive objects, multi-bounce GI | ❌ not yet |
+| Light from fires, candles and lamps with ray-traced shadows | ✅ (new, being tuned) |
+| Multi-bounce GI | ✅ (new, being tuned) |
 
 ## 🥇 Why SkyRT is different
 
@@ -174,7 +175,7 @@ After editing a `.comp` shader: `glslangValidator -V --target-env vulkan1.2 laye
 - [x] One-click installer + control panel
 - [ ] Find and ray-trace the water surface (reflections / refractions)
 - [ ] Vegetation in the acceleration structure
-- [ ] Multi-bounce GI, light from fires and emissive objects
+- [x] Multi-bounce GI, light from fires and emissive objects (first version, being tuned)
 
 Known limitations: static geometry is assumed not to move; GPU-animated objects (wind, waves) are not reflected in shadows; hit surfaces have no material, so bounce light is taken from what is visible on screen.
 
