@@ -1,0 +1,103 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+// SkyRT step 21, pass 0 (lights): finds emissive light sources (fire, candles, lamps, glowing things) in the rendered frame.
+// One workgroup per screen tile. A pixel counts as emissive when its HDR luminance is above a threshold; the bright pixels
+// of a tile are merged into ONE light: position = brightness weighted centre (world space), colour = their hue,
+// intensity = sum of (excess brightness x world area of the pixel). The trace pass lights the scene from this list.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D uColor;
+layout(set = 0, binding = 1) uniform texture2D uDepth;
+layout(set = 0, binding = 5, std140) uniform Params {
+    mat4 vp;
+    mat4 invVP;
+    vec4 sun;
+    vec4 cam;
+    uvec4 misc;    // x,y = size
+    uvec4 flags;
+    vec4 fx;
+    vec4 fx2;
+    mat4 pvp;
+    vec4 tp;
+    vec4 lt;       // x = light strength, y = range, z = brightness threshold, w = GI multiplier
+    uvec4 lm;      // x = tile size, y = tiles in x, z = shadow rays per pixel for lights, w = bit0 lights on, bit1 debug
+} u;
+layout(set = 0, binding = 10, std430) buffer Lights {
+    uint count;     // lights written (may exceed the capacity: readers clamp it)
+    uint maxLum;    // brightest non-sky pixel of the frame x 1000 (for the log)
+    uint pad0;
+    uint pad1;
+    vec4 L[];       // 2 entries per light: (position.xyz, intensity), (hue.rgb, 0)
+} lights;
+
+vec3 worldAt(ivec2 p, float z) {
+    vec2 ndc = (vec2(p) + 0.5) / vec2(u.misc.xy) * 2.0 - 1.0;
+    if (u.cam.w > 0.5) ndc.y = -ndc.y;
+    vec4 w = u.invVP * vec4(ndc, z, 1.0);
+    return w.xyz / w.w;
+}
+
+shared float sW[256];
+shared float sPow[256];
+shared float sMax[256];
+shared vec3 sWP[256];
+shared vec3 sWC[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const int T = int(u.lm.x);
+    const ivec2 org = ivec2(gl_WorkGroupID.xy) * T;
+    const ivec2 sz = ivec2(u.misc.xy);
+    const float thr = u.lt.z;
+
+    float W = 0.0, Pw = 0.0, mx = 0.0;
+    vec3 WP = vec3(0.0), WC = vec3(0.0);
+    for (int y = int(gl_LocalInvocationID.y); y < T; y += 16) {
+        for (int x = int(gl_LocalInvocationID.x); x < T; x += 16) {
+            ivec2 p = org + ivec2(x, y);
+            if (p.x >= sz.x || p.y >= sz.y) continue;
+            float z = texelFetch(uDepth, p, 0).r;
+            if (z <= 0.0) continue;                         // sky
+            vec3 c = imageLoad(uColor, p).rgb;
+            if (any(isnan(c)) || any(isinf(c))) continue;
+            float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+            mx = max(mx, lum);
+            if (lum <= thr) continue;
+            float ww = min(lum, 64.0) - thr;                // excess brightness (capped so one blown-out pixel cannot dominate)
+            vec3 P = worldAt(p, z);
+            float st = length(worldAt(p + ivec2(1, 0), z) - P);   // world size of one pixel at this depth
+            W += ww;
+            WP += ww * P;
+            WC += ww * (c / lum);
+            Pw += ww * st * st;
+        }
+    }
+    sW[tid] = W; sWP[tid] = WP; sWC[tid] = WC; sPow[tid] = Pw; sMax[tid] = mx;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            sW[tid] += sW[tid + s];
+            sWP[tid] += sWP[tid + s];
+            sWC[tid] += sWC[tid + s];
+            sPow[tid] += sPow[tid + s];
+            sMax[tid] = max(sMax[tid], sMax[tid + s]);
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        atomicMax(lights.maxLum, uint(min(sMax[0], 1.0e6) * 1000.0));
+        if (sW[0] > 0.0 && sPow[0] > 0.0) {
+            vec3 pos = sWP[0] / sW[0];
+            vec3 hue = sWC[0] / sW[0];
+            float inten = sPow[0] * u.lt.x;
+            if (!(any(isnan(pos)) || any(isinf(pos)) || isnan(inten) || isinf(inten))) {
+                uint idx = atomicAdd(lights.count, 1u);
+                if (idx < 256u) {
+                    // the depth buffer holds the surface BEHIND a flame, so lift the light a little towards open air
+                    lights.L[2u * idx] = vec4(pos + vec3(0.0, 0.4, 0.0), inten);
+                    lights.L[2u * idx + 1u] = vec4(hue, 0.0);
+                }
+            }
+        }
+    }
+}

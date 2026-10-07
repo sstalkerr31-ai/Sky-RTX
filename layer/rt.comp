@@ -21,7 +21,18 @@ layout(set = 0, binding = 5, std140) uniform Params {
     uvec4 flags;   // x = bit0 shadows, bit1 AO, bit2 GI; y = shadow rays; z = hemisphere rays
     vec4 fx;       // x = AO strength, y = AO radius, z = GI strength, w = GI range
     vec4 fx2;      // x = tan(sun angular radius)
+    mat4 pvp;      // (composite only)
+    vec4 tp;       // (composite only)
+    vec4 lt;       // step 21: x = light strength, y = light range, z = brightness threshold, w = GI multiplier (strength * 0.5, 0 = GI off)
+    uvec4 lm;      // x = tile size, y = tiles in x, z = shadow rays per pixel for lights, w = bit0 lights on
 } u;
+layout(set = 0, binding = 10, std430) readonly buffer Lights {
+    uint count;
+    uint maxLum;
+    uint pad0;
+    uint pad1;
+    vec4 L[];      // 2 entries per light: (position.xyz, intensity), (hue.rgb, 0)
+} lights;
 
 vec3 worldAt(ivec2 p, float z) {
     vec2 ndc = (vec2(p) + 0.5) / vec2(u.misc.xy) * 2.0 - 1.0;
@@ -217,6 +228,57 @@ void main() {
     if (any(isnan(bounce)) || any(isinf(bounce))) bounce = vec3(0.0);
     if (isnan(occ) || isinf(occ)) occ = 0.0;
     if (isnan(vis) || isinf(vis)) vis = 1.0;
-    imageStore(uGI, p, vec4(bounce, occ));
+
+    // ---- step 21: light from emissive sources (fire, candles, lamps) found by the light pass.
+    // The contribution of every light is evaluated without shadows (cheap), ONE light is picked with a probability
+    // proportional to that contribution and only that one gets a shadow ray. The estimate is tot * visibility * hue.
+    vec3 emis = vec3(0.0);
+    if ((u.lm.w & 1u) != 0u) {
+        const uint nL = min(lights.count, 256u);
+        const float R = max(u.lt.y, 0.5);
+        const float R2 = R * R;
+        float tot = 0.0;
+        for (uint i = 0u; i < nL; ++i) {
+            vec4 a = lights.L[2u * i];
+            vec3 dv = a.xyz - P;
+            float d2 = dot(dv, dv);
+            if (d2 >= R2) continue;
+            float cs = max(dot(N, dv * inversesqrt(max(d2, 1e-6))), 0.0);
+            float win = 1.0 - d2 / R2;
+            tot += a.w * cs * win * win / (d2 + 0.25);
+        }
+        if (tot > 1e-4) {
+            const int nR = int(max(u.lm.z, 1u));
+            for (int k = 0; k < nR; ++k) {
+                float target = fract(ign * 3.7 + float(k) * 0.7548776662 + fr * 0.5698402910) * tot;
+                float acc = 0.0;
+                uint pick = nL;
+                for (uint i = 0u; i < nL; ++i) {
+                    vec4 a = lights.L[2u * i];
+                    vec3 dv = a.xyz - P;
+                    float d2 = dot(dv, dv);
+                    if (d2 >= R2) continue;
+                    float cs = max(dot(N, dv * inversesqrt(max(d2, 1e-6))), 0.0);
+                    float win = 1.0 - d2 / R2;
+                    acc += a.w * cs * win * win / (d2 + 0.25);
+                    if (acc >= target) { pick = i; break; }
+                }
+                if (pick >= nL) continue;
+                vec3 lp = lights.L[2u * pick].xyz;
+                vec3 toL = lp - origin;
+                float dl = length(toL);
+                float visL = 1.0;
+                if (dl > 0.45) {
+                    rayQueryEXT rl;
+                    rayQueryInitializeEXT(rl, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 0.0, toL / dl, dl - 0.4);
+                    while (rayQueryProceedEXT(rl)) {}
+                    if (rayQueryGetIntersectionTypeEXT(rl, true) != gl_RayQueryCommittedIntersectionNoneEXT) visL = 0.0;
+                }
+                emis += lights.L[2u * pick + 1u].rgb * (tot * visL / float(nR));
+            }
+        }
+        if (any(isnan(emis)) || any(isinf(emis))) emis = vec3(0.0);
+    }
+    imageStore(uGI, p, vec4(bounce * u.lt.w + emis, occ));
     imageStore(uSh, p, vec4(vis));
 }

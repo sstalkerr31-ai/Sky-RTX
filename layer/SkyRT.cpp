@@ -33,6 +33,7 @@
 
 #include "rt_spv.h"    // SPIR-V of rt.comp (generated): trace pass
 #include "rtfx_spv.h"  // SPIR-V of rt_fx.comp (generated): denoise + composite pass
+#include "rtlight_spv.h"  // SPIR-V of rt_light.comp (generated): emissive light source search (step 21)
 
 // ============================================================ config
 static const uint32_t kStatsEveryNFrames = 300;   // ~5 sec at 60 fps
@@ -67,6 +68,9 @@ static const uint32_t kXfCap = 2048;
 static const uint32_t kInstMaxPerDraw = 48, kInstMinIdx = 90, kPropGeomMax = 1000;
 static const uint64_t kPropTrisMax = 100000;
 static int g_taa = 1;             // step 20: temporal accumulation of shadows / AO / GI (cfg taa=0/1)
+static int g_lightOn = 1;          // step 21: light from fire / candles / lamps (bright pixels of the frame become point lights), cfg light=0/1
+static float g_lightStrength = 1.0f, g_lightRange = 12.0f, g_lightThr = 2.0f;   // cfg lightstrength, lightrange (world units), lightthr (HDR brightness that counts as emissive)
+static int g_lightRays = 2, g_lightDebug = 0;   // cfg lightrays (shadow rays per pixel), lightdebug (paint the emissive pixels magenta)
 static float g_taaN = 12.0f;      // step 20: maximum accumulated samples (cfg taan); lower = less ghosting, more noise
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
 static int g_aniso = 16;          // step 13: anisotropic filtering forced on every linear sampler (cfg: aniso=0/2/4/8/16)
@@ -431,6 +435,8 @@ struct DeviceData {
     PFN_vkCmdPushConstants CmdPushConstants;
     PFN_vkCmdDispatch CmdDispatch;
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
+    PFN_vkCmdFillBuffer CmdFillBuffer;
+    PFN_vkCmdCopyBuffer CmdCopyBuffer;
     PFN_vkDestroyImageView DestroyImageView;
     PFN_vkDestroyImage DestroyImage;
     struct MainCb { VkImage color, depth; uint32_t w, h; };
@@ -507,6 +513,10 @@ struct DeviceData {
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
     PFN_vkBindImageMemory BindImageMemory;
     VkPipeline fxPipe = VK_NULL_HANDLE;
+    VkPipeline lightPipe = VK_NULL_HANDLE;           // step 21: emissive light search
+    VkBuffer lightBuf = VK_NULL_HANDLE, statBuf = VK_NULL_HANDLE;   // device-local light list / small host-visible copy of its header for the log
+    VkDeviceMemory lightMem = VK_NULL_HANDLE, statMem = VK_NULL_HANDLE;
+    char* statPtr = nullptr;
     VkImage giImg = VK_NULL_HANDLE, shImg = VK_NULL_HANDLE;
     VkDeviceMemory giMem = VK_NULL_HANDLE, shMem = VK_NULL_HANDLE;
     VkImageView giView = VK_NULL_HANDLE, shView = VK_NULL_HANDLE;
@@ -879,6 +889,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
     LOADD(CmdPushConstants);
     LOADD(CmdDispatch);
     LOADD(CmdPipelineBarrier);
+    LOADD(CmdFillBuffer);
+    LOADD(CmdCopyBuffer);
     LOADD(DestroyImageView);
     LOADD(DestroyImage);
     LOADD(GetAccelerationStructureDeviceAddressKHR);
@@ -2187,7 +2199,10 @@ struct FxParams {
     float fx2[4];
     float pvp[16];   // step 20: previous frame view-projection
     float tp[4];     // x = history valid, y = max samples
+    float lt[4];     // step 21: x = light strength, y = range, z = brightness threshold, w = GI multiplier (strength * 0.5, applied in the trace pass)
+    uint32_t lm[4];  // x = tile size, y = tiles in x, z = shadow rays for lights, w = bit0 lights on, bit1 debug
 };
+static const uint32_t kLightMax = 256, kLightBufBytes = 16 + 256 * 32;
 
 static VkPipeline MakeComputePipe(DeviceData* d, const uint32_t* code, size_t bytes, const char* what) {
     VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -2215,19 +2230,20 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->paintTried = true;
     g_stage = "EnsurePaintResources";
 
-    VkDescriptorSetLayoutBinding b[10] = {};
-    const VkDescriptorType types[10] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+    VkDescriptorSetLayoutBinding b[11] = {};
+    const VkDescriptorType types[11] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                                        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
-    for (uint32_t i = 0; i < 10; ++i) {
+                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    for (uint32_t i = 0; i < 11; ++i) {
         b[i].binding = i;
         b[i].descriptorType = types[i];
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.bindingCount = 10;
+    dl.bindingCount = 11;
     dl.pBindings = b;
     VkResult r = d->CreateDescriptorSetLayout(d->device, &dl, nullptr, &d->paintDsl);
     if (r != VK_SUCCESS) { Logf("!!! rt: descriptor set layout failed (%d)", (int)r); return false; }
@@ -2241,12 +2257,14 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->paintPipe = MakeComputePipe(d, kRtSpv, sizeof(kRtSpv), "trace");
     d->fxPipe = MakeComputePipe(d, kRtFxSpv, sizeof(kRtFxSpv), "composite");
     if (!d->paintPipe || !d->fxPipe) return false;
+    d->lightPipe = MakeComputePipe(d, kRtLightSpv, sizeof(kRtLightSpv), "lights");   // optional: without it the emissive light is simply off
 
-    VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 * 7}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16},
-                                  {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16}};
+    VkDescriptorPoolSize ps[5] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 * 7}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16},
+                                  {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16},
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 16;
-    pi.poolSizeCount = 4;
+    pi.poolSizeCount = 5;
     pi.pPoolSizes = ps;
     r = d->CreateDescriptorPool(d->device, &pi, nullptr, &d->paintPool);
     if (r != VK_SUCCESS) { Logf("!!! rt: descriptor pool failed (%d)", (int)r); return false; }
@@ -2259,6 +2277,17 @@ static bool EnsurePaintResources(DeviceData* d) {
     r = d->AllocateDescriptorSets(d->device, &ai, d->paintSets);
     if (r != VK_SUCCESS) { Logf("!!! rt: descriptor sets failed (%d)", (int)r); return false; }
 
+    {   // step 21: the light list (device local) and a tiny host-visible buffer the header is copied to for the log
+        VkDeviceAddress da = 0;
+        if (!d->lightPipe || !MakeBufEx(d, kLightBufBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, d->lightBuf, d->lightMem, da)) {
+            Logf("!!! rt: light list buffer / pipeline not available - emissive light disabled");
+            d->lightBuf = VK_NULL_HANDLE;
+        } else if (MakeBufEx(d, 64, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->statBuf, d->statMem, da)) {
+            void* sp = nullptr;
+            if (d->MapMemory(d->device, d->statMem, 0, VK_WHOLE_SIZE, 0, &sp) == VK_SUCCESS && sp) { d->statPtr = (char*)sp; memset(sp, 0, 64); }
+        }
+    }
     // one small host-visible parameter buffer per descriptor set, bound once
     for (int i = 0; i < 16; ++i) {
         VkDeviceAddress dummy = 0;
@@ -2276,10 +2305,20 @@ static bool EnsurePaintResources(DeviceData* d) {
         w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         w.pBufferInfo = &bi;
         d->UpdateDescriptorSets(d->device, 1, &w, 0, nullptr);
+        if (d->lightBuf) {   // binding 10: the light list
+            VkDescriptorBufferInfo lbi{d->lightBuf, 0, kLightBufBytes};
+            VkWriteDescriptorSet lw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            lw.dstSet = d->paintSets[i];
+            lw.dstBinding = 10;
+            lw.descriptorCount = 1;
+            lw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            lw.pBufferInfo = &lbi;
+            d->UpdateDescriptorSets(d->device, 1, &lw, 0, nullptr);
+        }
     }
 
     d->paintOk = true;
-    Logf("rt: trace + composite pipelines ready (16 descriptor sets in a ring, params %zu bytes)", sizeof(FxParams));
+    Logf("rt: trace + composite%s pipelines ready (16 descriptor sets in a ring, params %zu bytes)", d->lightBuf ? " + lights" : "", sizeof(FxParams));
     return true;
 }
 
@@ -2850,6 +2889,12 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "glint=1.0     # 0..4 sun glitter on the water\r\n"
                   "taa=1         # 1 = temporal accumulation of shadows / AO / GI (less noise)\r\n"
                   "taan=12       # max accumulated frames (lower = less ghosting, more noise)\r\n"
+                  "light=1       # 1 = light from fire, candles and lamps (bright pixels become light sources that cast shadows)\r\n"
+                  "lightstrength=1.0 # 0..10 how strong that light is\r\n"
+                  "lightrange=12 # world units, how far the light of one source reaches\r\n"
+                  "lightthr=2.0  # brightness above which a pixel counts as a light source (the log prints the brightest pixel it sees)\r\n"
+                  "lightrays=2   # shadow rays per pixel for those lights 1..4\r\n"
+                  "lightdebug=0  # 1 = paint the pixels that are treated as light sources magenta (to tune lightthr)\r\n"
                   "instgeo=1     # 1 = instanced props in the acceleration structure\r\n"
                   "dyngeo=1      # 1 = characters / animated meshes get their own acceleration structure rebuilt every frame (smooth shadows of moving objects)\r\n"
                   "aniso=16      # anisotropic filtering forced on all textures: 0 = leave the game alone, 2/4/8/16 (applies on next game start)\r\n"
@@ -2903,6 +2948,12 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "dyngeo")) g_dynGeo = v != 0.0;
         else if (!strcmp(key, "taa")) g_taa = v != 0.0;
         else if (!strcmp(key, "taan")) g_taaN = (float)std::max(1.0, std::min(64.0, v));
+        else if (!strcmp(key, "light")) g_lightOn = v != 0.0;
+        else if (!strcmp(key, "lightstrength")) g_lightStrength = (float)std::max(0.0, std::min(10.0, v));
+        else if (!strcmp(key, "lightrange")) g_lightRange = (float)std::max(1.0, std::min(60.0, v));
+        else if (!strcmp(key, "lightthr")) g_lightThr = (float)std::max(0.3, std::min(50.0, v));
+        else if (!strcmp(key, "lightrays")) g_lightRays = (int)std::max(1.0, std::min(4.0, v));
+        else if (!strcmp(key, "lightdebug")) g_lightDebug = v != 0.0;
         else if (!strcmp(key, "instgeo")) g_instGeo = v != 0.0;
         else if (!strcmp(key, "instscale")) g_instScale = (float)v;
         else if (!strcmp(key, "aniso")) g_aniso = (int)std::max(0.0, std::min(16.0, v));
@@ -2912,6 +2963,8 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         Logf("rt: settings (SkyRT.cfg): enabled=%d view=%u (%s) | shadows=%d (strength %.2f, sun %.1f deg, %d rays) ao=%d (strength %.2f radius %.2f) gi=%d (strength %.2f range %.0f) hemisphere rays %d | autosun=%d az=%.1f el=%.1f",
              g_enabled ? 1 : 0, g_view, kViewNames[g_view % 8], g_shadows ? 1 : 0, (double)g_strength, (double)g_sunSize, g_shRays, g_aoOn ? 1 : 0,
              (double)g_aoStrength, (double)g_aoRadius, g_giOn ? 1 : 0, (double)g_giStrength, (double)g_giRange, g_aoRays, g_autoSun ? 1 : 0, g_sunAz, g_sunEl);
+    if (logIt)
+        Logf("rt: emissive light: light=%d strength %.2f range %.1f threshold %.2f rays %d debug %d", g_lightOn ? 1 : 0, (double)g_lightStrength, (double)g_lightRange, (double)g_lightThr, g_lightRays, g_lightDebug ? 1 : 0);
 }
 
 static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = next view; SkyRT.cfg is re-read when it changes
@@ -3460,6 +3513,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     }
     par->sun[0] = sunv[0]; par->sun[1] = sunv[1]; par->sun[2] = sunv[2]; par->sun[3] = g_strength;
     par->cam[0] = cam[0]; par->cam[1] = cam[1]; par->cam[2] = cam[2]; par->cam[3] = g_flipY ? 1.0f : 0.0f;
+    const bool lightsOn = g_lightOn && d->lightPipe && d->lightBuf && g_view == 0;
     uint32_t modeEff = 0, flagsEff = (g_shadows ? 1u : 0u) | (g_aoOn ? 2u : 0u) | (g_giOn ? 4u : 0u);
     switch (g_view) {
         case 1: flagsEff = 1u; break;
@@ -3469,8 +3523,11 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         case 5: modeEff = 5u; flagsEff = 4u; break;
         case 6: modeEff = 1u; break;
         case 7: modeEff = 2u; break;
-        default: flagsEff |= 8u; break;
+        default: flagsEff |= 8u; if (lightsOn) flagsEff |= 16u; break;
     }
+    uint32_t lightTile = 48;
+    while (((m.w + lightTile - 1) / lightTile) * ((m.h + lightTile - 1) / lightTile) > 4096u) lightTile += 16;
+    const uint32_t lightTx = (m.w + lightTile - 1) / lightTile, lightTy = (m.h + lightTile - 1) / lightTile;
     par->misc[0] = m.w; par->misc[1] = m.h; par->misc[2] = modeEff; par->misc[3] = (uint32_t)d->paintInjected.load();
     par->flags[0] = flagsEff;
     par->flags[1] = (uint32_t)g_shRays;
@@ -3479,6 +3536,8 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     par->fx[0] = g_aoStrength; par->fx[1] = g_aoRadius; par->fx[2] = g_giStrength; par->fx[3] = g_giRange;
     memcpy(par->pvp, d->prevVp, sizeof par->pvp);
     par->tp[0] = useHist ? 1.0f : 0.0f; par->tp[1] = g_taaN; par->tp[2] = 0.0f; par->tp[3] = 0.0f;
+    par->lt[0] = g_lightStrength; par->lt[1] = g_lightRange; par->lt[2] = g_lightThr; par->lt[3] = (flagsEff & 4u) ? g_giStrength * 0.5f : 0.0f;
+    par->lm[0] = lightTile; par->lm[1] = lightTx; par->lm[2] = (uint32_t)g_lightRays; par->lm[3] = lightsOn ? (1u | (g_lightDebug ? 2u : 0u)) : 0u;
     par->fx2[0] = tanf(g_sunSize * 3.14159265f / 180.0f); par->fx2[1] = g_reflStrength; par->fx2[2] = (float)(d->paintInjected.load() % 100000) * 0.0133f; par->fx2[3] = g_glint;
 
     {
@@ -3542,6 +3601,30 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 4, pre);
+
+    // ---- pass 0 (step 21): find emissive light sources. The list is cleared, filled tile by tile and then read by the trace pass
+    if (lightsOn) {
+        VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.buffer = d->lightBuf;
+        bb.offset = 0;
+        bb.size = VK_WHOLE_SIZE;
+        bb.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;   // previous frame
+        bb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+        d->CmdFillBuffer(cb, d->lightBuf, 0, 16, 0);
+        bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+        d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->lightPipe);
+        d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->paintPl, 0, 1, &set, 0, nullptr);
+        d->CmdDispatch(cb, lightTx, lightTy, 1);
+        bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+        if (d->statBuf) { VkBufferCopy rg{0, 0, 16}; d->CmdCopyBuffer(cb, d->lightBuf, d->statBuf, 1, &rg); }
+    }
 
     // ---- pass 1: trace
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->paintPipe);  // original function: not our graphics hook
@@ -3616,6 +3699,12 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     if (rebuild) d->rtLastAsKB = sz.accelerationStructureSize >> 10;
     const uint64_t n = ++d->paintInjected;
     d->rtBuilt++;
+    if (lightsOn && d->statPtr && (n % 600 == 7)) {   // the header of the light list from an earlier frame (read without sync: only used for the log)
+        uint32_t hdr[4] = {};
+        memcpy(hdr, d->statPtr, sizeof hdr);
+        Logf("rt: emissive lights: %u light sources found%s | brightest pixel %.2f, threshold lightthr=%.2f (raise it if ordinary surfaces glow, lower it if fire does not light anything)",
+             std::min<uint32_t>(hdr[0], kLightMax), hdr[0] > kLightMax ? " (more than fit - raise lightthr)" : "", hdr[1] / 1000.0, (double)g_lightThr);
+    }
     if (n == 1 || n == 2000) {
         Logf("rt: %s frame: drew %zu geometries, %llu triangles (draws %llu; skipped: pipeline/format %llu, range %llu, other %llu, "
              "unreadable %llu) | cache holds %llu triangles",

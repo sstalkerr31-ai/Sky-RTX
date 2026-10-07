@@ -1,3 +1,6 @@
+0.21.0 (in development)
+- Light from fire, candles and lamps: bright pixels of the frame become light sources with ray-traced shadows (cfg: light, lightstrength, lightrange, lightthr, lightrays, lightdebug)
+
 0.20.0
 - Ray-traced sun shadows, characters, AO, one-bounce GI
 - Temporal accumulation + bilateral denoise

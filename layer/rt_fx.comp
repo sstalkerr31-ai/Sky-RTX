@@ -22,6 +22,8 @@ layout(set = 0, binding = 5, std140) uniform Params {
     vec4 fx2;
     mat4 pvp;      // previous frame view-projection
     vec4 tp;       // x = history valid, y = max accumulated samples
+    vec4 lt;       // step 21: x = light strength, y = light range, z = brightness threshold, w = GI multiplier (already applied in the trace pass)
+    uvec4 lm;      // x = tile size, y = tiles in x, z = rays for lights, w = bit0 lights on, bit1 debug (marks the pixels counted as emissive)
 } u;
 
 vec3 worldAt(ivec2 p, float z) {
@@ -106,7 +108,7 @@ void main() {
             float sq = imageLoad(uSh, q).r;
             if (any(isnan(g)) || any(isinf(g)) || isnan(sq) || isinf(sq) || sq < -0.5) continue;   // water pixels are not part of the land blur
             float gl = dot(g.rgb, vec3(0.2126, 0.7152, 0.0722));
-            if (gl > 1.0) g.rgb *= 1.0 / gl;   // firefly guard
+            if (gl > 4.0) g.rgb *= 4.0 / gl;   // firefly guard (values are premultiplied by the GI / light strengths since step 21)
             gi += g * w;
             gi2 += g * g * w;
             sh += sq * w;
@@ -161,11 +163,12 @@ void main() {
     vec3 rgb = c.rgb;
     if ((u.flags.x & 1u) != 0u) rgb *= (1.0 - u.sun.w * (1.0 - sh));
     if ((u.flags.x & 2u) != 0u) rgb *= (1.0 - u.fx.x * fade * gi.a);
-    if ((u.flags.x & 4u) != 0u) {
+    if ((u.flags.x & 20u) != 0u) {   // bit 2 = GI, bit 4 = emissive lights; strengths are already inside gi.rgb (trace pass)
         float lum = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
         vec3 chroma = min(c.rgb / (lum + 0.02), vec3(2.5));  // surface tint without its brightness
-        rgb += u.fx.z * 0.5 * chroma * gi.rgb * fade;
+        rgb += chroma * gi.rgb * fade;
     }
+    if ((u.lm.w & 2u) != 0u && dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)) > u.lt.z) rgb = mix(rgb, vec3(1.0, 0.0, 1.0), 0.6);   // debug: pixels the light pass treats as emissive
     if (any(isnan(rgb)) || any(isinf(rgb))) rgb = c.rgb;
     imageStore(uColor, p, vec4(rgb, c.a));
 }

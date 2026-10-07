@@ -93,6 +93,9 @@ Everything the panel changes lives in `%LOCALAPPDATA%\SkyRT\SkyRT.cfg` (plain `k
 | `taa` · `taan` | 0/1 · 1–64 | Temporal accumulation on/off, max accumulated frames (lower = less ghosting, more noise) |
 | `dyngeo` | 0/1 | Characters / animated meshes cast ray-traced shadows |
 | `instgeo` | 0/1 | Small instanced props in the acceleration structure (experimental) |
+| `light` | 0/1 | Light from fire, candles and lamps: very bright pixels of the frame become light sources that light and shadow their surroundings (new, needs testing) |
+| `lightstrength` · `lightrange` | 0–10 · 1–60 | How strong the light is, how far (world units) one source reaches |
+| `lightthr` · `lightrays` · `lightdebug` | 0.3–50 · 1–4 · 0/1 | Brightness above which a pixel counts as a source (the log prints the brightest pixel it saw), shadow rays per pixel, paint detected sources magenta |
 | `aniso` · `lodbias` | 0–16 · −2…1 | Anisotropic filtering, texture sharpness shift (**applied on the next game start**) |
 | `autosun` · `az` · `el` | 0/1 · 0–360° · 1–89° | Take the sun from the game, or set it manually |
 | `view` | 0–7 | Debug views (see hotkeys) |
@@ -121,6 +124,8 @@ Check the panel: *Vulkan layer* must say *installed*, and the game must be start
 
 **Ghost trails behind characters / fast camera.** Lower `taan` (try 6).
 
+**Fire light is missing, or ordinary surfaces glow.** Set `lightdebug=1`: pixels treated as light sources turn magenta. If nothing is magenta at a fire, lower `lightthr`; if sunlit ground is magenta, raise it. `SkyRT_*.log` prints the brightest pixel value every few seconds (`rt: emissive lights: ...`).
+
 **Shadows jump when the scene changes.** The sun direction is smoothed; a real scene change takes about a second to blend.
 
 **Crash or freeze.** Please open an issue with the newest `SkyRT_*.log` (Log tab → *Open folder*). A missing "clean shutdown" line at the end of the log means the game crashed.
@@ -148,13 +153,13 @@ powershell -ExecutionPolicy Bypass -File release\package_release.ps1 -Version 0.
 Run the panel from source: `pip install PyQt5` then `python panel\skyrt_panel.py` (put `SkyRT.dll` and `VK_LAYER_SKYRT.json` next to it).
 Manual install without the panel: `layer\install.ps1` registers the layer (`-Uninstall` removes it; `-Machine` from an admin shell writes to HKLM).
 
-After editing a `.comp` shader: `glslangValidator -V --target-env vulkan1.2 layer\rt_fx.comp -o rtfx.spv`, then `python tools\spv2h.py rtfx.spv layer\rtfx_spv.h kRtFxSpv rt_fx.comp` (the trace shader is `rt.comp` → `rt_spv.h`, array `kRtSpv`).
+After editing a `.comp` shader: `glslangValidator -V --target-env vulkan1.2 layer\rt_fx.comp -o rtfx.spv`, then `python tools\spv2h.py rtfx.spv layer\rtfx_spv.h kRtFxSpv rt_fx.comp` (the trace shader is `rt.comp` → `rt_spv.h`, array `kRtSpv`; the light search shader is `rt_light.comp` → `rtlight_spv.h`, array `kRtLightSpv`).
 
 ## 🧩 How it works
 
 - The layer enables `VK_KHR_acceleration_structure`, `VK_KHR_ray_query`, `VK_KHR_deferred_host_operations` and buffer device address on the game's device.
 - Draw calls of the main pass are recorded (vertex/index buffers, pipeline, indirect arguments). Static geometry is cached in a ring of BLAS slots; geometry in CPU-written vertex buffers (skinned characters) and a few instanced props are rebuilt every frame into a dynamic BLAS. Both go into one TLAS.
-- After the main render pass two compute passes run: `rt.comp` (shadow, AO and bounce rays through `ray_query`) and `rt_fx.comp` (bilateral blur, temporal accumulation, composite into the colour image).
+- After the main render pass three compute passes run: `rt_light.comp` (finds bright, emissive pixels and merges them per screen tile into a list of light sources), `rt.comp` (shadow, AO and bounce rays through `ray_query`) and `rt_fx.comp` (bilateral blur, temporal accumulation, composite into the colour image).
 - Game facts the layer relies on: reverse-Z depth, y-up, a 1584-byte frame UBO (view-projection, camera, light direction).
 
 ## 🚧 Roadmap & limitations
