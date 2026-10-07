@@ -4129,6 +4129,60 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDraw(VkCommandBuffer cb, uint32_t ver
             if (ShouldHide(d, cb)) return;
         }
     }
+    {   // step 24 diagnostic (grass): non-indexed draws are not in the acceleration structure yet. Print layout, draw arguments and the first vertices
+        // of every opaque non-indexed pipeline a few times, so the grass can be decoded.
+        static std::mutex nm;
+        static std::unordered_map<uint64_t, int> perVs;
+        static int total = 0;
+        if (total < 24 && d->mainCount.load(std::memory_order_relaxed) > 0 && vertexCount >= 3) {
+            bool inMain;
+            { std::lock_guard<std::mutex> lk(d->paintMtx); inMain = d->mainCb.count(cb) != 0; }
+            if (inMain) {
+                DeviceData::CmdState st{};
+                bool have = false;
+                { std::lock_guard<std::mutex> lk(d->cmdMtx); auto it = d->cmdState.find(cb); if (it != d->cmdState.end()) { st = it->second; have = true; } }
+                DeviceData::PipeInfo pi;
+                bool have2 = false;
+                if (have) { std::lock_guard<std::mutex> lk(d->regMtx); auto pit = d->pipes.find(st.pipe); if (pit != d->pipes.end()) { pi = pit->second; have2 = true; } }
+                if (have2 && pi.opaque) {
+                    std::lock_guard<std::mutex> lk(nm);
+                    int& cnt = perVs[pi.vsHash];
+                    if (cnt < 3 && total < 24) {
+                        ++cnt; ++total;
+                        std::string line;
+                        for (const DeviceData::PipeInfo::Bind& b : pi.binds) { char t[64]; snprintf(t, sizeof t, " bind%u(stride %u,%s)", b.binding, b.stride, b.rate ? "INSTANCE" : "vertex"); line += t; }
+                        line += " |";
+                        for (const DeviceData::PipeInfo::Attr& at : pi.attrs) { char t[96]; snprintf(t, sizeof t, " loc%u:b%u:%s@%u", at.loc, at.binding, FormatName(at.format), at.offset); line += t; }
+                        Logf("rt: NONINDEXED vs %016llx fs %016llx | vertexCount %u instanceCount %u firstVertex %u firstInstance %u |%s",
+                             (unsigned long long)pi.vsHash, (unsigned long long)pi.fsHash, vertexCount, instanceCount, firstVertex, firstInstance, line.c_str());
+                        for (const DeviceData::PipeInfo::Bind& b : pi.binds) {
+                            if (b.binding >= 8 || !st.vb[b.binding] || b.stride == 0 || b.stride > 128) continue;
+                            DeviceData::BufInfo bi{};
+                            bool okb = BufInfoOf(d, st.vb[b.binding], bi);
+                            Logf("rt:   binding %u buffer %p offset %llu size %llu usage 0x%x", b.binding, (void*)st.vb[b.binding],
+                                 (unsigned long long)st.vbOff[b.binding], (unsigned long long)(okb ? bi.size : 0), (unsigned)(okb ? bi.usage : 0));
+                            for (uint32_t k = 0; k < 3; ++k) {
+                                uint8_t raw[128] = {};
+                                if (!ReadBufHost(d, st.vb[b.binding], st.vbOff[b.binding] + (VkDeviceSize)(firstVertex + k) * b.stride, raw, b.stride)) {
+                                    Logf("rt:   vertex %u: buffer is not readable by the CPU (GPU-written or device-local)", k);
+                                    break;
+                                }
+                                std::string vl;
+                                for (uint32_t w = 0; w + 4 <= b.stride; w += 4) {
+                                    uint32_t u; float f;
+                                    memcpy(&u, raw + w, 4); memcpy(&f, raw + w, 4);
+                                    char t[48];
+                                    snprintf(t, sizeof t, " @%u:%08x(%.3g)", w, u, std::isfinite(f) ? f : 0.0f);
+                                    vl += t;
+                                }
+                                Logf("rt:   vertex %u:%s", k, vl.c_str());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     d->CmdDraw(cb, vertexCount, instanceCount, firstVertex, firstInstance);
 }
 
