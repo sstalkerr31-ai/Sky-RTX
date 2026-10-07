@@ -90,7 +90,7 @@ void main() {
             float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
             mx = max(mx, lum);
             if (lum <= thrEff) continue;
-            float ww = min(lum, 64.0) - thrEff;                // excess brightness (capped so one blown-out pixel cannot dominate)
+            float ww = min(min(lum, 64.0) - thrEff, 2.0);      // excess brightness, capped hard: a pixel of 150 is not worth 40 pixels of 4 (a candle must count as much as a glowing cube)
             vec3 P = worldAt(p, z);
             float st = length(worldAt(p + ivec2(1, 0), z) - P);   // world size of one pixel at this depth
             W += ww;
@@ -116,7 +116,8 @@ void main() {
         if (sW[0] > 0.0 && sPow[0] > 0.0) {
             vec3 pos = sWP[0] / sW[0];
             vec3 hue = sWC[0] / sW[0];
-            float inten = min(sPow[0], 0.25) * u.lt.x;   // one source can never be brighter than a big bonfire
+            // power grows with the square root of the emitting area (a candle flame is tiny but lights its surroundings visibly; a big glowing object is not a hundred candles)
+            float inten = clamp(sqrt(sPow[0]) * 2.0, 0.0, 0.5) * u.lt.x;
             if (!(any(isnan(pos)) || any(isinf(pos)) || isnan(inten) || isinf(inten))) {
                 uint idx = atomicAdd(lights.count, 1u);
                 if (idx < 256u) {

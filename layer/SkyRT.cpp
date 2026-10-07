@@ -70,7 +70,7 @@ static const uint32_t kInstMaxPerDraw = 48, kInstMinIdx = 90, kPropGeomMax = 100
 static const uint64_t kPropTrisMax = 100000;
 static int g_taa = 1;             // step 20: temporal accumulation of shadows / AO / GI (cfg taa=0/1)
 static int g_lightOn = 1;          // step 21: light from fire / candles / lamps (bright pixels of the frame become point lights), cfg light=0/1
-static float g_lightStrength = 8.0f, g_lightRange = 8.0f, g_lightThr = 2.0f, g_lightMax = 0.35f;   // lightmax: soft ceiling of the light added to one pixel   // cfg lightstrength, lightrange (world units), lightthr (HDR brightness that counts as emissive)
+static float g_lightStrength = 8.0f, g_lightRange = 8.0f, g_lightThr = 2.0f, g_lightMax = 0.25f;   // lightmax: soft ceiling of the light added to one pixel   // cfg lightstrength, lightrange (world units), lightthr (HDR brightness that counts as emissive)
 static int g_lightRays = 2, g_lightDebug = 0;   // cfg lightrays (shadow rays per pixel), lightdebug (paint the emissive pixels magenta)
 static float g_giMulti = 0.3f;   // step 22: multi-bounce GI strength 0..0.9 (cfg gimulti): the previous frame's indirect light is added to what bounce rays see
 static float g_taaN = 12.0f;      // step 20: maximum accumulated samples (cfg taan); lower = less ghosting, more noise
@@ -2898,7 +2898,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "gimulti=0.3   # 0..0.9 multi-bounce GI: light bounces more than once (needs taa=1); 0 = single bounce\r\n"
                   "light=1       # 1 = light from fire, candles and lamps (bright pixels become light sources that cast shadows)\r\n"
                   "lightstrength=8 # 0..200 how strong that light is (a candle flame is tiny, so this needs to be large)\r\n"
-                  "lightmax=0.35 # 0.05..5 ceiling of the light added to one pixel (lower = never blown out)\r\n"
+                  "lightmax=0.25 # 0.05..5 ceiling of the light added to one pixel (lower = never blown out)\r\n"
                   "lightrange=8  # world units, how far the light of one source reaches\r\n"
                   "lightthr=2.0  # brightness above which a pixel counts as a light source (the log prints the brightest pixel it sees)\r\n"
                   "lightrays=2   # shadow rays per pixel for those lights 1..4\r\n"
