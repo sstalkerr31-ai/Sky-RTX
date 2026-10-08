@@ -3099,7 +3099,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "deep=0   # 1 = DEEP BOUNCE mode: every ray path bounces several times (see bounces). Needs a GPU with ray tracing position fetch (RTX 30xx and newer). VERY heavy: the GPU heats up. Ctrl+] toggles\r\n"
                   "bounces=3   # 1..8 bounces per path in deep mode (cost grows with it). Ctrl+Up / Ctrl+Down change it in game\r\n"
                   "ptadapt=0   # 1 = screenshot mode runs at full quality only while the camera stands still; 0 = always full (hot GPU, can stutter in flight)\r\n"
-                  "pathtrace=0   # 1 = screenshot mode ('path tracing'): while the camera stands still (after ~0.3 s) 4x rays per pixel, long accumulation, deeper bounces; normal cost while moving. Ctrl+Backspace toggles\r\n"
+                  "pathtrace=0   # 1 = screenshot mode ('path tracing'): 4x rays per pixel and long accumulation (always, unless ptadapt=1). Very heavy. Ctrl+Backspace toggles\r\n"
                   "grass=1       # 1 = grass in the acceleration structure (casts shadows, takes part in AO); 0 = off\r\n"
                   "dyngeo=1      # 1 = characters / animated meshes get their own acceleration structure rebuilt every frame (smooth shadows of moving objects)\r\n"
                   "aniso=16      # anisotropic filtering forced on all textures: 0 = leave the game alone, 2/4/8/16 (applies on next game start)\r\n"
