@@ -77,6 +77,7 @@ static float g_giMulti = 0.1f;   // step 22: multi-bounce GI strength 0..0.9 (cf
 static float g_taaN = 12.0f;      // step 20: maximum accumulated samples (cfg taan); lower = less ghosting, more noise
 static int g_deep = 0;            // step 26: deep bounce mode (cfg deep=0/1, Ctrl+] toggle): every ray path bounces up to g_bounces times - very heavy
 static int g_bounces = 3;         // step 26: bounces per path in deep mode, 1..8 (cfg bounces, Ctrl+Up / Ctrl+Down)
+static int g_ptAdapt = 0;         // cfg ptadapt=1: screenshot mode runs at full quality only while the camera stands still (default 0 = always full)
 static int g_pathTrace = 0;       // step 25: 'path tracing' / screenshot mode: 4x rays per pixel, long accumulation, deeper bounces (cfg pathtrace=0/1, Ctrl+Backspace)
 static int g_grass = 1;           // step 24: grass (non-indexed triangle strips written by the CPU) in the acceleration structure (cfg grass=0/1)
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
@@ -3047,6 +3048,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "instgeo=1     # 1 = instanced props in the acceleration structure\r\n"
                   "deep=0   # 1 = DEEP BOUNCE mode: every ray path bounces several times (see bounces). Needs a GPU with ray tracing position fetch (RTX 30xx and newer). VERY heavy: the GPU heats up. Ctrl+] toggles\r\n"
                   "bounces=3   # 1..8 bounces per path in deep mode (cost grows with it). Ctrl+Up / Ctrl+Down change it in game\r\n"
+                  "ptadapt=0   # 1 = screenshot mode runs at full quality only while the camera stands still; 0 = always full (hot GPU, can stutter in flight)\r\n"
                   "pathtrace=0   # 1 = screenshot mode ('path tracing'): while the camera stands still (after ~0.3 s) 4x rays per pixel, long accumulation, deeper bounces; normal cost while moving. Ctrl+Backspace toggles\r\n"
                   "grass=1       # 1 = grass in the acceleration structure (casts shadows, takes part in AO); 0 = off\r\n"
                   "dyngeo=1      # 1 = characters / animated meshes get their own acceleration structure rebuilt every frame (smooth shadows of moving objects)\r\n"
@@ -3103,6 +3105,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "taa")) g_taa = v != 0.0;
         else if (!strcmp(key, "taan")) g_taaN = (float)std::max(1.0, std::min(256.0, v));
         else if (!strcmp(key, "pathtrace")) g_pathTrace = v != 0.0;
+        else if (!strcmp(key, "ptadapt")) g_ptAdapt = v != 0.0;
         else if (!strcmp(key, "deep")) g_deep = v != 0.0;
         else if (!strcmp(key, "bounces")) g_bounces = std::max(1, std::min(8, (int)v));
         else if (!strcmp(key, "gimulti")) g_giMulti = (float)std::max(0.0, std::min(0.9, v));
@@ -3706,7 +3709,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         float mvd = 0.0f;
         for (int i = 0; i < 16; ++i) mvd = std::max(mvd, fabsf(vp[i] - d->prevVp[i]));
         d->stillFrames = (d->histValid && mvd < 5.0e-5f) ? std::min<uint32_t>(d->stillFrames + 1, 100000u) : 0u;
-        ptFull = d->stillFrames >= 20;
+        ptFull = g_ptAdapt ? d->stillFrames >= 20 : true;
     }
     const bool deepOn = g_deep && d->deepPipe;
     {
