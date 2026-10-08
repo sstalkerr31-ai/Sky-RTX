@@ -2649,7 +2649,25 @@ static uint32_t RebuildGap(uint64_t cacheTris, uint64_t lastTris) {
     return (uint32_t)gap;
 }
 // shader fingerprints of the water pipeline (found with the probe). 17a63a0f.. / 22efde0f.. = first blended pipeline of the probe list; the other candidate was 0bbf0e40.. / cdceac11.. (SkyRT.cfg: watervs= / waterfs=)
-static uint64_t kWaterVs = 0x17a63a0f3447fc7cull, kWaterFs = 0x22efde0f73a797a4ull;
+// step 27: the real water shaders, found by name in the game's shader folder (PC uses the 13f/13h variants; both have the same hash).
+// The earlier guess (17a63a0f.. / 22efde0f..) turned out to be RockFaceSh (rocks), cfg watervs / waterfs are ignored now.
+static const uint64_t kWaterPairs[][2] = {
+    {0xabbf9ba69ecd066bull, 0x4ba669f3561fb23dull},   // Ocean
+    {0xabbf9ba69ecd066bull, 0x4b610aaf3d6ca2dbull},   // OceanCinema
+    {0x7137779884d80c61ull, 0x222f64117b25b1afull},   // OceanDark
+    {0x8ec3284c3c7ae801ull, 0x93d851887edfc848ull},   // OceanDarkMesh
+    {0xda18ef7698e1ab59ull, 0x3ccb6734e7927fe1ull},   // OceanDarkMeshWet
+    {0xd9f15ec70814ddbbull, 0xd9bd933eaff125c1ull},   // OceanMesh
+    {0xd9f15ec70814ddbbull, 0x563e2b61f1b1b052ull},   // OceanMeshCinema
+    {0xc9c918ff2ca82a4dull, 0xdd535503b1eeead7ull},   // OceanMeshWet
+    {0xea3b35532a171fa7ull, 0x22bd2893320e865eull},   // OceanNearSurfacePatch
+    {0x0f588e812739387bull, 0xc90098c3fe75c46cull},   // OceanOrbit
+    {0x6daf7e1a3656f565ull, 0x3b9d766d7bcbb0a6ull},   // MeshIceRefraction (ice)
+};
+static bool IsWaterPair(uint64_t vs, uint64_t fs) {
+    for (const auto& p : kWaterPairs) if (p[0] == vs && p[1] == fs) return true;
+    return false;
+}
 // ---- step 27: pipeline census (hotkey Ctrl+End): counts every draw of the main pass per shader pair, to find the water / ice / puddle shaders by their hashes
 struct CensusRow { uint64_t draws = 0, items = 0; bool indexed = false, opaque = false, blend = false; uint32_t topo = 0, stride = 0; };
 static std::atomic<int> g_census{0};
@@ -2788,7 +2806,7 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
     {
         std::lock_guard<std::mutex> lk(d->regMtx);
         auto pit = d->pipes.find(st.pipe);
-        isWater = pit != d->pipes.end() && pit->second.vsHash == kWaterVs && pit->second.fsHash == kWaterFs;
+        isWater = pit != d->pipes.end() && IsWaterPair(pit->second.vsHash, pit->second.fsHash);
         if (pit != d->pipes.end() && g_instGeo && g_dynGeo && pit->second.opaque && pit->second.instanced) {   // step 18: decoded instanced shaders only
             for (uint64_t kv : kInstVs) if (kv == pit->second.vsHash) isProp = true;
             if (isProp) for (const DeviceData::PipeInfo::Bind& bd : pit->second.binds) if (bd.rate) { propIb = bd.binding; propIstride = bd.stride; }
@@ -3064,9 +3082,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
                   "aorays=4      # rays per pixel 1..8 for AO and bounce light (more = less noise, slower)\r\n"
                   "gistrength=0.3 # 0..2\r\n"
                   "girange=30    # world units, how far bounce rays look\r\n"
-                  "watervs=17a63a0f3447fc7c  # shader fingerprints of the water pipeline (hex)\r\n"
-                  "waterfs=22efde0f73a797a4\r\n"
-                  "waterfx=0     # EXPERIMENTAL ray traced water (do not enable: the real water pipeline is not found yet): reflections of the world and sun glints\r\n"
+                  "waterfx=0     # EXPERIMENTAL ray traced water and ice: reflections of the world and sun glints (the sea / ice shaders are now recognised by name)\r\n"
                   "waterrefl=0.5 # 0..1 how strongly the world is mirrored in water\r\n"
                   "glint=1.0     # 0..4 sun glitter on the water\r\n"
                   "taa=1         # 1 = temporal accumulation of shadows / AO / GI (less noise)\r\n"
@@ -3128,8 +3144,6 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "girange")) g_giRange = (float)std::max(1.0, std::min(200.0, v));
         else if (!strcmp(key, "sunsize")) g_sunSize = (float)std::max(0.0, std::min(10.0, v));
         else if (!strcmp(key, "shrays")) g_shRays = (int)std::max(1.0, std::min(32.0, v));
-        else if (!strcmp(key, "watervs")) kWaterVs = strtoull(sv, nullptr, 16);
-        else if (!strcmp(key, "waterfs")) kWaterFs = strtoull(sv, nullptr, 16);
         else if (!strcmp(key, "waterfx")) g_reflOn = v != 0.0;
         else if (!strcmp(key, "waterrefl")) g_reflStrength = (float)std::max(0.0, std::min(1.0, v));
         else if (!strcmp(key, "glint")) g_glint = (float)std::max(0.0, std::min(4.0, v));

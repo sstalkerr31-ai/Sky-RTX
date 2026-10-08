@@ -51,13 +51,13 @@ TXT = {
         "err": "Ошибка", "no_game": "Сначала укажи путь к Sky.exe.", "no_layer": "Сначала установи лучи.",
         "preset": "Пресет", "p_low": "Низкий", "p_mid": "Средний", "p_high": "Высокий", "p_ultra": "Ультра", "p_custom": "Свой",
         "g_main": "Общее", "g_sh": "Тени", "g_ao": "Затенение в щелях (AO)", "g_gi": "Отражённый свет (GI)",
-        "g_dn": "Шумоподавление", "g_obj": "Объекты", "g_tex": "Текстуры", "g_sun": "Солнце", "g_light": "Свет от огня и ламп",
+        "g_dn": "Шумоподавление", "g_obj": "Объекты", "g_water": "Вода и лёд", "g_tex": "Текстуры", "g_sun": "Солнце", "g_light": "Свет от огня и ламп",
         "rt_on": "Лучи включены", "shadows": "Тени", "ao": "AO", "gi": "GI",
         "strength": "Сила", "sunsize": "Размер солнца (мягкость), °", "rays": "Лучей на пиксель", "radius": "Радиус", "range": "Дальность",
         "taa": "Накопление по кадрам (TAA)", "taan": "Накоплено кадров (макс.)",
         "gimulti": "Многократные отскоки света",
         "light": "Огонь, свечи и лампы освещают всё вокруг", "lightstrength": "Яркость света", "lightmax": "Потолок яркости (против пересвета)", "lightrange": "Дальность света", "lightthr": "Порог яркости источника", "lightrays": "Теневых лучей на пиксель", "lightdebug": "Показать найденные источники (розовым)",
-        "dyngeo": "Персонажи отбрасывают лучевые тени", "instgeo": "Мелкие инстансные объекты (эксперимент)", "grass": "Трава в лучах (тени и AO, эксперимент)", "pathtrace": "Режим скриншота (в 4 раза больше лучей, долгое накопление)", "deep": "Глубокие отскоки (ОЧЕНЬ тяжело, нужна RTX 30+)", "bounces": "Отскоков на луч (1–8)",
+        "dyngeo": "Персонажи отбрасывают лучевые тени", "instgeo": "Мелкие инстансные объекты (эксперимент)", "grass": "Трава в лучах (тени и AO, эксперимент)", "pathtrace": "Режим скриншота (в 4 раза больше лучей, долгое накопление)", "deep": "Глубокие отскоки (ОЧЕНЬ тяжело, нужна RTX 30+)", "waterfx": "Лучевые отражения на воде и льду (эксперимент)", "waterrefl": "Сила отражений", "glint": "Солнечные блики", "bounces": "Отскоков на луч (1–8)",
         "aniso": "Анизотропия", "lodbias": "Резкость текстур (LOD bias)", "restart": "применяется при следующем запуске игры",
         "autosun": "Брать направление солнца из игры", "az": "Азимут, °", "el": "Высота, °",
         "applied": "Сохранено в SkyRT.cfg - игра подхватит изменения за секунду.",
@@ -80,13 +80,13 @@ TXT = {
         "err": "Error", "no_game": "Set the path to Sky.exe first.", "no_layer": "Install ray tracing first.",
         "preset": "Preset", "p_low": "Low", "p_mid": "Medium", "p_high": "High", "p_ultra": "Ultra", "p_custom": "Custom",
         "g_main": "General", "g_sh": "Shadows", "g_ao": "Ambient occlusion (AO)", "g_gi": "Bounce light (GI)",
-        "g_dn": "Denoising", "g_obj": "Objects", "g_tex": "Textures", "g_sun": "Sun", "g_light": "Light from fire and lamps",
+        "g_dn": "Denoising", "g_obj": "Objects", "g_water": "Water and ice", "g_tex": "Textures", "g_sun": "Sun", "g_light": "Light from fire and lamps",
         "rt_on": "Ray tracing enabled", "shadows": "Shadows", "ao": "AO", "gi": "GI",
         "strength": "Strength", "sunsize": "Sun size (softness), deg", "rays": "Rays per pixel", "radius": "Radius", "range": "Range",
         "taa": "Temporal accumulation (TAA)", "taan": "Accumulated frames (max)",
         "gimulti": "Multi-bounce light",
         "light": "Fire, candles and lamps light their surroundings", "lightstrength": "Light strength", "lightmax": "Brightness ceiling (no blow-out)", "lightrange": "Light range", "lightthr": "Source brightness threshold", "lightrays": "Shadow rays per pixel", "lightdebug": "Show detected sources (magenta)",
-        "dyngeo": "Characters cast ray-traced shadows", "instgeo": "Small instanced props (experimental)", "grass": "Grass in the rays (shadows and AO, experimental)", "pathtrace": "Screenshot mode (4x rays, long accumulation)", "deep": "Deep bounces (VERY heavy, needs RTX 30+)", "bounces": "Bounces per ray (1-8)",
+        "dyngeo": "Characters cast ray-traced shadows", "instgeo": "Small instanced props (experimental)", "grass": "Grass in the rays (shadows and AO, experimental)", "pathtrace": "Screenshot mode (4x rays, long accumulation)", "deep": "Deep bounces (VERY heavy, needs RTX 30+)", "waterfx": "Ray traced reflections on water and ice (experimental)", "waterrefl": "Reflection strength", "glint": "Sun glints", "bounces": "Bounces per ray (1-8)",
         "aniso": "Anisotropic filtering", "lodbias": "Texture sharpness (LOD bias)", "restart": "applies on the next game start",
         "autosun": "Take the sun direction from the game", "az": "Azimuth, deg", "el": "Elevation, deg",
         "applied": "Saved to SkyRT.cfg - the game picks it up within a second.",
@@ -104,7 +104,7 @@ SETTINGS = {
     "ao": (1, 0, 1, "b"), "aostrength": (0.7, 0.0, 1.0, "f"), "aoradius": (1.5, 0.05, 20.0, "f"), "aorays": (4, 1, 8, "i"),
     "gi": (1, 0, 1, "b"), "gistrength": (0.3, 0.0, 2.0, "f"), "girange": (30.0, 1.0, 200.0, "f"),
     "taa": (1, 0, 1, "b"), "taan": (12.0, 1.0, 64.0, "f"),
-    "dyngeo": (1, 0, 1, "b"), "instgeo": (1, 0, 1, "b"), "grass": (1, 0, 1, "b"), "pathtrace": (0, 0, 1, "b"), "deep": (0, 0, 1, "b"), "bounces": (3, 1, 8, "i"),
+    "dyngeo": (1, 0, 1, "b"), "instgeo": (1, 0, 1, "b"), "grass": (1, 0, 1, "b"), "pathtrace": (0, 0, 1, "b"), "deep": (0, 0, 1, "b"), "waterfx": (0, 0, 1, "b"), "waterrefl": (0.5, 0.0, 1.0, "f"), "glint": (1.0, 0.0, 4.0, "f"), "bounces": (3, 1, 8, "i"),
     "gimulti": (0.1, 0.0, 0.9, "f"),
     "light": (1, 0, 1, "b"), "lightstrength": (2.0, 0.0, 200.0, "f"), "lightmax": (0.3, 0.05, 5.0, "f"), "lightrange": (4.0, 1.0, 60.0, "f"), "lightthr": (2.0, 0.3, 50.0, "f"),
     "lightrays": (2, 1, 4, "i"), "lightdebug": (0, 0, 1, "b"),
@@ -417,6 +417,7 @@ class Panel(QMainWindow):
         fl = group("g_light"); add_bool(fl, "light", "light"); add_slider(fl, "lightstrength", "lightstrength"); add_slider(fl, "lightmax", "lightmax"); add_slider(fl, "lightrange", "lightrange")
         add_slider(fl, "lightthr", "lightthr"); add_slider(fl, "lightrays", "lightrays"); add_bool(fl, "lightdebug", "lightdebug")
         fl = group("g_dn"); add_bool(fl, "taa", "taa"); add_slider(fl, "taan", "taan")
+        fl = group("g_water"); add_bool(fl, "waterfx", "waterfx"); add_slider(fl, "waterrefl", "waterrefl"); add_slider(fl, "glint", "glint")
         fl = group("g_obj"); add_bool(fl, "dyngeo", "dyngeo"); add_bool(fl, "instgeo", "instgeo"); add_bool(fl, "grass", "grass"); add_bool(fl, "pathtrace", "pathtrace"); add_bool(fl, "deep", "deep"); add_slider(fl, "bounces", "bounces")
         fl = group("g_tex"); add_slider(fl, "aniso", "aniso"); add_slider(fl, "lodbias", "lodbias")
         self.restart_lbl = QLabel(); self.restart_lbl.setStyleSheet("color:#8a8f98")
