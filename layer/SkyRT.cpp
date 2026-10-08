@@ -3123,7 +3123,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
              g_enabled ? 1 : 0, g_view, kViewNames[g_view % 8], g_shadows ? 1 : 0, (double)g_strength, (double)g_sunSize, g_shRays, g_aoOn ? 1 : 0,
              (double)g_aoStrength, (double)g_aoRadius, g_giOn ? 1 : 0, (double)g_giStrength, (double)g_giRange, g_aoRays, g_autoSun ? 1 : 0, g_sunAz, g_sunEl);
     if (logIt)
-        Logf("rt: emissive light: light=%d strength %.2f range %.1f threshold %.2f rays %d debug %d | multi-bounce gimulti=%.2f", g_lightOn ? 1 : 0, (double)g_lightStrength, (double)g_lightRange, (double)g_lightThr, g_lightRays, g_lightDebug ? 1 : 0, (double)g_giMulti);
+        Logf("rt: emissive light: light=%d strength %.2f range %.1f threshold %.2f rays %d debug %d | multi-bounce gimulti=%.2f | deep=%d bounces=%d pathtrace=%d", g_lightOn ? 1 : 0, (double)g_lightStrength, (double)g_lightRange, (double)g_lightThr, g_lightRays, g_lightDebug ? 1 : 0, (double)g_giMulti, g_deep ? 1 : 0, g_bounces, g_pathTrace ? 1 : 0);
 }
 
 static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = next view; SkyRT.cfg is re-read when it changes
@@ -3709,6 +3709,11 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         ptFull = d->stillFrames >= 20;
     }
     const bool deepOn = g_deep && d->deepPipe;
+    {
+        static int lastDeep = -1;
+        const int cur = deepOn ? g_bounces : 0;
+        if (cur != lastDeep) { lastDeep = cur; Logf("rt: trace shader now: %s", deepOn ? "DEEP (bounces per path above)" : "normal"); if (deepOn) Logf("rt: deep bounces = %d", g_bounces); }
+    }
     uint32_t lightTile = 48;
     while (((m.w + lightTile - 1) / lightTile) * ((m.h + lightTile - 1) / lightTile) > 4096u) lightTile += 16;
     const uint32_t lightTx = (m.w + lightTile - 1) / lightTile, lightTy = (m.h + lightTile - 1) / lightTile;
