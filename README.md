@@ -119,6 +119,7 @@ More rays = less noise, more GPU work. Sky is usually CPU-bound, so the GPU norm
 | **Ctrl+End** | Next view: 0 full · 1 shadows only · 2 AO only · 3 bounce light only · 4 AO map (debug) · 5 bounce map (debug) · 6 grid (debug) · 7 normals (debug) |
 | **Ctrl+]** | Deep bounce mode on/off (very heavy) |
 | **Ctrl+Up / Ctrl+Down** | Bounces +1 / -1 (1..8) in deep mode |
+| **Ctrl+\** | Debug: shader census. Press once to start recording the main pass, press again to print every shader pair with draw counts to the log (used to find the water / ice shaders) |
 | **Ctrl+Backspace** | Screenshot mode ("path tracing") on/off: 4x rays, long accumulation. Stand still for a clean picture |
 
 If the picture looks strange, press **Ctrl+End** until view 0 is back (or set `view=0`).

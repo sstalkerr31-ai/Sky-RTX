@@ -17,6 +17,7 @@
 #include <vulkan/vk_layer.h>
 
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -2649,6 +2650,38 @@ static uint32_t RebuildGap(uint64_t cacheTris, uint64_t lastTris) {
 }
 // shader fingerprints of the water pipeline (found with the probe). 17a63a0f.. / 22efde0f.. = first blended pipeline of the probe list; the other candidate was 0bbf0e40.. / cdceac11.. (SkyRT.cfg: watervs= / waterfs=)
 static uint64_t kWaterVs = 0x17a63a0f3447fc7cull, kWaterFs = 0x22efde0f73a797a4ull;
+// ---- step 27: pipeline census (hotkey Ctrl+\): counts every draw of the main pass per shader pair, to find the water / ice / puddle shaders by their hashes
+struct CensusRow { uint64_t draws = 0, items = 0; bool indexed = false, opaque = false, blend = false; uint32_t topo = 0, stride = 0; };
+static std::atomic<int> g_census{0};
+static std::mutex g_censusMtx;
+static std::map<std::pair<uint64_t, uint64_t>, CensusRow> g_censusMap;
+static void CensusAdd(DeviceData* d, const DeviceData::CmdState& st, bool indexed, uint64_t items) {
+    if (!g_census.load(std::memory_order_relaxed)) return;
+    DeviceData::PipeInfo pi;
+    { std::lock_guard<std::mutex> lk(d->regMtx); auto pit = d->pipes.find(st.pipe); if (pit == d->pipes.end()) return; pi = pit->second; }
+    std::lock_guard<std::mutex> lk(g_censusMtx);
+    CensusRow& r = g_censusMap[{pi.vsHash, pi.fsHash}];
+    r.draws++; r.items += items; r.indexed = indexed; r.opaque = pi.opaque; r.blend = pi.blend; r.topo = pi.topology;
+    r.stride = pi.binds.empty() ? 0 : pi.binds[0].stride;
+}
+static void CensusToggle() {
+    if (!g_census.load()) {
+        { std::lock_guard<std::mutex> lk(g_censusMtx); g_censusMap.clear(); }
+        g_census = 1;
+        Logf("rt: KEY Ctrl+\\ -> census RECORDING (stand where the water / ice is, press Ctrl+\\ again after a few seconds)");
+        return;
+    }
+    g_census = 0;
+    std::vector<std::pair<std::pair<uint64_t, uint64_t>, CensusRow>> rows;
+    { std::lock_guard<std::mutex> lk(g_censusMtx); rows.assign(g_censusMap.begin(), g_censusMap.end()); }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
+    Logf("rt: CENSUS done: %zu distinct shader pairs in the main pass", rows.size());
+    for (const auto& r : rows)
+        Logf("rt: CENSUS vs %016llx fs %016llx | draws %llu items %llu | %s %s topo %u stride %u", (unsigned long long)r.first.first, (unsigned long long)r.first.second,
+             (unsigned long long)r.second.draws, (unsigned long long)r.second.items, r.second.indexed ? "indexed" : "non-indexed",
+             r.second.opaque ? "opaque" : (r.second.blend ? "blended" : "other"), r.second.topo, r.second.stride);
+}
+
 static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer indBuf, VkDeviceSize indOff, uint32_t drawCount,
                      uint32_t stride, const VkDrawIndexedIndirectCommand* direct) {
     {
@@ -2672,6 +2705,7 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
     } else {
         cmds.push_back(*direct);
     }
+    CensusAdd(d, st, true, cmds.size());
 
     ProbeBlended(d, st, cmds);
     {   // step 15: print the full vertex layout of every pipeline the first time the main pass uses it (skinned characters have joint indices / weights / instance data)
@@ -3169,6 +3203,12 @@ static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = next v
         const bool bs = ctrl && (GetAsyncKeyState(VK_BACK) & 0x8000) != 0;
         if (bs && !bsWas) { g_pathTrace = !g_pathTrace; Logf("rt: KEY Ctrl+Backspace -> screenshot mode (path tracing) %s", g_pathTrace ? "ON: 4x rays, long accumulation, stand still" : "off"); }
         bsWas = bs;
+    }
+    {   // step 27: Ctrl+\ = start / stop (and print) the shader census
+        static bool cWas = false;
+        const bool ck = ctrl && (GetAsyncKeyState(0xDC /*VK_OEM_5*/) & 0x8000) != 0;
+        if (ck && !cWas) CensusToggle();
+        cWas = ck;
     }
     {   // step 26: deep bounce mode: Ctrl+] = on/off, Ctrl+Up / Ctrl+Down = bounces +1 / -1 (1..8)
         static bool dWas = false, uWas = false, dnWas = false;
@@ -4308,6 +4348,16 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDraw(VkCommandBuffer cb, uint32_t ver
                 ProbeBlended(d, st, one, true);
             }
             if (ShouldHide(d, cb)) return;
+        }
+    }
+    if (g_census.load(std::memory_order_relaxed) && d->mainCount.load(std::memory_order_relaxed) > 0) {
+        bool inMain;
+        { std::lock_guard<std::mutex> lk(d->paintMtx); inMain = d->mainCb.count(cb) != 0; }
+        if (inMain) {
+            DeviceData::CmdState st{};
+            bool have = false;
+            { std::lock_guard<std::mutex> lk(d->cmdMtx); auto it = d->cmdState.find(cb); if (it != d->cmdState.end()) { st = it->second; have = true; } }
+            if (have) CensusAdd(d, st, false, vertexCount);
         }
     }
     if (instanceCount == 1) MainDrawNonIndexed(d, cb, vertexCount, firstVertex);
