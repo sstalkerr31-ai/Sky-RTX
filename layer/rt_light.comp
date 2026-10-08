@@ -95,6 +95,16 @@ void main() {
             float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
             mx = max(mx, lum);
             if (lum <= thrEff) continue;
+            if (lum > 300.0) continue;                      // sun glints on sand / snow / water reach thousands: that is a mirror sparkle, not a flame
+            // a flame or lamp covers several neighbouring pixels: a lone sparkle has dark neighbours
+            int nbr = 0;
+            const ivec2 offs[4] = ivec2[4](ivec2(3, 0), ivec2(-3, 0), ivec2(0, 3), ivec2(0, -3));
+            for (int k = 0; k < 4; k++) {
+                ivec2 q = clamp(p + offs[k], ivec2(0), sz - 1);
+                vec3 cq = imageLoad(uColor, q).rgb;
+                if (!(any(isnan(cq)) || any(isinf(cq))) && dot(cq, vec3(0.2126, 0.7152, 0.0722)) > 0.5 * thrEff) nbr++;
+            }
+            if (nbr < 3) continue;
             float ww = min(min(lum, 64.0) - thrEff, 2.0);      // excess brightness, capped hard: a pixel of 150 is not worth 40 pixels of 4 (a candle must count as much as a glowing cube)
             vec3 P = worldAt(p, z);
             float st = length(worldAt(p + ivec2(1, 0), z) - P);   // world size of one pixel at this depth
