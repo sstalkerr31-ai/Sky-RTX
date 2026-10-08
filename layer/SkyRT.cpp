@@ -2664,10 +2664,12 @@ static const uint64_t kWaterPairs[][2] = {
     {0x0f588e812739387bull, 0xc90098c3fe75c46cull},   // OceanOrbit
     {0x6daf7e1a3656f565ull, 0x3b9d766d7bcbb0a6ull},   // MeshIceRefraction (ice)
 };
-static bool IsWaterPair(uint64_t vs, uint64_t fs) {
-    for (const auto& p : kWaterPairs) if (p[0] == vs && p[1] == fs) return true;
-    return false;
+static const char* const kWaterNames[] = {"Ocean", "OceanCinema", "OceanDark", "OceanDarkMesh", "OceanDarkMeshWet", "OceanMesh", "OceanMeshCinema", "OceanMeshWet", "OceanNearSurfacePatch", "OceanOrbit", "MeshIceRefraction"};
+static int WaterIndex(uint64_t vs, uint64_t fs) {
+    for (int i = 0; i < (int)(sizeof kWaterPairs / sizeof kWaterPairs[0]); ++i) if (kWaterPairs[i][0] == vs && kWaterPairs[i][1] == fs) return i;
+    return -1;
 }
+static bool IsWaterPair(uint64_t vs, uint64_t fs) { return WaterIndex(vs, fs) >= 0; }
 // ---- step 27: pipeline census (hotkey Ctrl+End): counts every draw of the main pass per shader pair, to find the water / ice / puddle shaders by their hashes
 struct CensusRow { uint64_t draws = 0, items = 0; bool indexed = false, opaque = false, blend = false; uint32_t topo = 0, stride = 0; };
 static std::atomic<int> g_census{0};
@@ -2858,7 +2860,7 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         const uint64_t avail = (vbi.size - vbase) / vstride;
         VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
         g.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-        if (isWater) { static std::atomic<uint64_t> wn{0}; const uint64_t k = ++wn; if (k == 1 || k == 5000) Logf("rt: water geometry recognised by shader fingerprint (draw #%llu, %u indices, vertex stride %u)", (unsigned long long)k, c.indexCount, vstride); }
+        if (isWater) { int wi = -1; { std::lock_guard<std::mutex> lk(d->regMtx); auto pit2 = d->pipes.find(st.pipe); if (pit2 != d->pipes.end()) wi = WaterIndex(pit2->second.vsHash, pit2->second.fsHash); } static std::atomic<uint64_t> wn{0}; const uint64_t k = ++wn; if (k == 1 || k == 5000) Logf("rt: water geometry recognised: %s (draw #%llu, %u indices, vertex stride %u)", (wi >= 0 ? kWaterNames[wi] : "?"), (unsigned long long)k, c.indexCount, vstride); }
         g.flags = isWater ? 0 : VK_GEOMETRY_OPAQUE_BIT_KHR;   // water = the only non-opaque geometry: main rays cull it, the water ray looks only at it
         g.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
         g.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;

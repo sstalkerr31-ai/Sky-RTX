@@ -11,6 +11,13 @@ layout(set = 0, binding = 6, rgba16f) uniform image2D uHA;     // step 20: tempo
 layout(set = 0, binding = 7, rgba32f) uniform image2D uHB;     // shadow, depth, sample count
 layout(set = 0, binding = 8, rgba16f) uniform image2D uHAp;    // previous frame (read)
 layout(set = 0, binding = 9, rgba32f) uniform image2D uHBp;
+layout(set = 0, binding = 10, std430) readonly buffer Lights {
+    uint count;
+    uint maxLum;
+    uint alive;
+    uint pad1;
+    vec4 L[];      // [512 + 3*s]: persistent light s = (position.xyz, intensity), [+1] = (hue.rgb, ttl)
+} lights;
 layout(set = 0, binding = 5, std140) uniform Params {
     mat4 vp;
     mat4 invVP;
@@ -168,7 +175,20 @@ void main() {
         vec3 chroma = min(c.rgb / (lum + 0.02), vec3(2.5));  // surface tint without its brightness
         rgb += chroma * gi.rgb * fade;
     }
-    if ((u.lm.w & 2u) != 0u && dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)) > u.lt.z) rgb = mix(rgb, vec3(1.0, 0.0, 1.0), 0.6);   // debug: pixels the light pass treats as emissive
+    if ((u.lm.w & 2u) != 0u) {   // debug: every persistent light the trace pass really uses is drawn as a magenta disc (bigger = stronger) with a bright core
+        for (uint i = 0u; i < 64u; ++i) {
+            vec4 a = lights.L[512u + 3u * i];
+            if (a.w <= 1.0e-4) continue;
+            vec4 clip = u.vp * vec4(a.xyz, 1.0);
+            if (clip.w <= 1e-5) continue;
+            vec2 ndc = clip.xy / clip.w;
+            if (u.cam.w > 0.5) ndc.y = -ndc.y;
+            vec2 sp = (ndc * 0.5 + 0.5) * vec2(u.misc.xy);
+            float d = length(vec2(p) + 0.5 - sp);
+            float rad = 8.0 + 40.0 * clamp(a.w, 0.0, 1.0);
+            if (d < rad) rgb = mix(rgb, vec3(1.0, 0.0, 1.0), d < 3.0 ? 1.0 : 0.35);
+        }
+    }
     if (any(isnan(rgb)) || any(isinf(rgb))) rgb = c.rgb;
     imageStore(uColor, p, vec4(rgb, c.a));
 }
