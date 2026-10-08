@@ -116,13 +116,12 @@ More rays = less noise, more GPU work. Sky is usually CPU-bound, so the GPU norm
 | Keys | Action |
 |---|---|
 | **Ctrl+Home** | Ray tracing on/off (compare with the original picture) |
-| **Ctrl+End** | Next view: 0 full · 1 shadows only · 2 AO only · 3 bounce light only · 4 AO map (debug) · 5 bounce map (debug) · 6 grid (debug) · 7 normals (debug) |
+| **Ctrl+End** | Debug: shader census. Press once to start recording the main pass, press again to print every shader pair with draw counts to the log (used to find the water / ice shaders). The old debug views are selected with `view=N` in the cfg |
 | **Ctrl+]** | Deep bounce mode on/off (very heavy) |
 | **Ctrl+Up / Ctrl+Down** | Bounces +1 / -1 (1..8) in deep mode |
-| **Ctrl+\** | Debug: shader census. Press once to start recording the main pass, press again to print every shader pair with draw counts to the log (used to find the water / ice shaders) |
 | **Ctrl+Backspace** | Screenshot mode ("path tracing") on/off: 4x rays, long accumulation. Stand still for a clean picture |
 
-If the picture looks strange, press **Ctrl+End** until view 0 is back (or set `view=0`).
+If the picture looks strange, set `view=0`.
 
 ## 🧯 Troubleshooting & FAQ
 
@@ -131,7 +130,7 @@ Check the panel: *Vulkan layer* must say *installed*, and the game must be start
 
 **The game does not start from the panel.** The panel starts `Sky.exe` directly. If your setup needs Steam/another launcher, start the game there with `SKYRT_ENABLE=1` set in the environment.
 
-**Weird colours / black world.** Press Ctrl+End until view 0, or set `view=0`. If it persists, set `enabled=0` and send the log.
+**Weird colours / black world.** Set `view=0`. If it persists, set `enabled=0` and send the log.
 
 **Low FPS.** Use the *Low* preset, or lower `shrays` / `aorays`; try `taa=1`. Disable `instgeo` and `dyngeo` to test.
 

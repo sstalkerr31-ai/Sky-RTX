@@ -49,7 +49,7 @@ static bool g_logOnly = false;                    // SKYRT_LOGONLY=1: change not
 static double g_sunAz = 30.0, g_sunEl = 50.0;    // sun direction (degrees), adjustable with RightCtrl + arrows
 static float g_strength = 0.5f;                  // how much a shadow ray darkens the pixel
 static bool g_enabled = true;                    // Ctrl+Home: ray tracing on / off (original game picture)
-static uint32_t g_view = 0;                      // Ctrl+End: cycles through the views below
+static uint32_t g_view = 0;                      // cfg view=N selects one of the views below (debug)
 static const char* const kViewNames[8] = {"full (shadows + AO + bounce light)", "shadows only", "AO only", "bounce light only",
                                           "DEBUG: AO map", "DEBUG: bounce light map", "DEBUG: world grid", "DEBUG: normals"};
 static uint32_t g_mode = 0;                      // 0 shadows, 1 world grid, 2 normals, 3 off
@@ -2650,7 +2650,7 @@ static uint32_t RebuildGap(uint64_t cacheTris, uint64_t lastTris) {
 }
 // shader fingerprints of the water pipeline (found with the probe). 17a63a0f.. / 22efde0f.. = first blended pipeline of the probe list; the other candidate was 0bbf0e40.. / cdceac11.. (SkyRT.cfg: watervs= / waterfs=)
 static uint64_t kWaterVs = 0x17a63a0f3447fc7cull, kWaterFs = 0x22efde0f73a797a4ull;
-// ---- step 27: pipeline census (hotkey Ctrl+\): counts every draw of the main pass per shader pair, to find the water / ice / puddle shaders by their hashes
+// ---- step 27: pipeline census (hotkey Ctrl+End): counts every draw of the main pass per shader pair, to find the water / ice / puddle shaders by their hashes
 struct CensusRow { uint64_t draws = 0, items = 0; bool indexed = false, opaque = false, blend = false; uint32_t topo = 0, stride = 0; };
 static std::atomic<int> g_census{0};
 static std::mutex g_censusMtx;
@@ -2668,7 +2668,7 @@ static void CensusToggle() {
     if (!g_census.load()) {
         { std::lock_guard<std::mutex> lk(g_censusMtx); g_censusMap.clear(); }
         g_census = 1;
-        Logf("rt: KEY Ctrl+\\ -> census RECORDING (stand where the water / ice is, press Ctrl+\\ again after a few seconds)");
+        Logf("rt: KEY Ctrl+End -> census RECORDING (stand where the water / ice is, press Ctrl+End again after a few seconds)");
         return;
     }
     g_census = 0;
@@ -3050,7 +3050,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         if (f) {
             fputs("# SkyRT live settings. Edit and save while the game is running - applied within about a second.\r\n"
                   "# The defaults below were chosen by the developer for his own taste and screen; change them to whatever looks good to you.\r\n"
-                  "# In game: Ctrl+Home = ray tracing on/off (original picture vs ours), Ctrl+End = next view, Ctrl+PageDown = probe water/ice draws (log only).\r\n"
+                  "# In game: Ctrl+Home = ray tracing on/off (original picture vs ours), Ctrl+End = shader census (debug, log only), Ctrl+PageDown = probe water/ice draws (log only).\r\n"
                   "enabled=1     # 1 = ray tracing on, 0 = the original game picture\r\n"
                   "view=0        # 0 full, 1 shadows only, 2 AO only, 3 bounce light only, 4 DEBUG AO map, 5 DEBUG bounce map, 6 DEBUG grid, 7 DEBUG normals\r\n"
                   "shadows=1     # sun shadows by rays (used by view 0)\r\n"
@@ -3163,7 +3163,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         Logf("rt: emissive light: light=%d strength %.2f range %.1f threshold %.2f rays %d debug %d | multi-bounce gimulti=%.2f | deep=%d bounces=%d pathtrace=%d", g_lightOn ? 1 : 0, (double)g_lightStrength, (double)g_lightRange, (double)g_lightThr, g_lightRays, g_lightDebug ? 1 : 0, (double)g_giMulti, g_deep ? 1 : 0, g_bounces, g_pathTrace ? 1 : 0);
 }
 
-static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = next view; SkyRT.cfg is re-read when it changes
+static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = shader census; SkyRT.cfg is re-read when it changes
     if (frame % 60 == 1) {
         static FILETIME lastWrite = {};
         char path[MAX_PATH];
@@ -3181,16 +3181,12 @@ static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = next v
     static bool homeWas = false, endWas = false;
     const bool home = ctrl && (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
     const bool end = ctrl && (GetAsyncKeyState(VK_END) & 0x8000) != 0;
-    if (ctrl && !alive) { alive = true; Logf("rt: keyboard polling works (Ctrl seen). Ctrl+Home = ray tracing on/off, Ctrl+End = next view"); }
+    if (ctrl && !alive) { alive = true; Logf("rt: keyboard polling works (Ctrl seen). Ctrl+Home = ray tracing on/off, Ctrl+End = shader census (debug)"); }
     if (home && !homeWas) {
         g_enabled = !g_enabled;
         Logf("rt: KEY Ctrl+Home -> ray tracing %s", g_enabled ? "ON (our render)" : "OFF (original game picture)");
     }
-    if (end && !endWas) {
-        g_view = (g_view + 1) % 8u;
-        if (!g_enabled) g_enabled = true;
-        Logf("rt: KEY Ctrl+End -> view %u: %s", g_view, kViewNames[g_view]);
-    }
+    if (end && !endWas) CensusToggle();   // Ctrl+End = shader census (the old debug views are no longer cycled; cfg view=N still works)
     static bool pdWas = false;
     const bool pd = ctrl && (GetAsyncKeyState(VK_NEXT) & 0x8000) != 0;
     static bool puWas = false;
@@ -3203,12 +3199,6 @@ static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = next v
         const bool bs = ctrl && (GetAsyncKeyState(VK_BACK) & 0x8000) != 0;
         if (bs && !bsWas) { g_pathTrace = !g_pathTrace; Logf("rt: KEY Ctrl+Backspace -> screenshot mode (path tracing) %s", g_pathTrace ? "ON: 4x rays, long accumulation, stand still" : "off"); }
         bsWas = bs;
-    }
-    {   // step 27: Ctrl+\ = start / stop (and print) the shader census
-        static bool cWas = false;
-        const bool ck = ctrl && (GetAsyncKeyState(0xDC /*VK_OEM_5*/) & 0x8000) != 0;
-        if (ck && !cWas) CensusToggle();
-        cWas = ck;
     }
     {   // step 26: deep bounce mode: Ctrl+] = on/off, Ctrl+Up / Ctrl+Down = bounces +1 / -1 (1..8)
         static bool dWas = false, uWas = false, dnWas = false;
@@ -3956,7 +3946,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
              cam[1], cam[2], (void*)ubo.buf, (unsigned long long)ubo.off, haveUboBound ? "bound in the main pass" : "fallback cand 0",
              g_sunAz, g_sunEl, (double)g_strength, g_view, g_flipY ? 1 : 0);
         DumpUnitVectors(d, ubo);
-        Logf("rt: controls: Ctrl+Home = ray tracing on/off, Ctrl+End = next view; everything else in SkyRT.cfg next to the DLL (applied live)");
+        Logf("rt: controls: Ctrl+Home = ray tracing on/off, Ctrl+End = shader census (debug); everything else in SkyRT.cfg next to the DLL (applied live)");
     }
 }
 
