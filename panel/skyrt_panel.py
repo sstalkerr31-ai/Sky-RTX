@@ -167,18 +167,24 @@ def registered_dirs():
 
 
 def active_dir():
-    """The folder whose SkyRT.cfg the game reads: the registered layer folder (the one the panel installed, else a developer folder)."""
+    """The folder whose SkyRT.cfg is shown: among the registered layer folders the one with the newest SkyRT.dll (a stale copy in
+    %LOCALAPPDATA% must not win over the freshly built one)."""
     regs = registered_dirs()
-    inst = os.path.normcase(os.path.normpath(install_dir()))
-    for d in regs:
-        if os.path.normcase(os.path.normpath(d)) == inst:
-            return d
     if regs:
-        return regs[0]
+        return max(regs, key=lambda d: os.path.getmtime(os.path.join(d, DLL)))
     d = install_dir()
     if not os.path.isdir(d):
         d = find_source_files() or d
     return d
+
+
+def all_cfg_dirs():
+    """Every folder the game might load the layer from: the settings are saved to all of them (which copy wins is up to the Vulkan loader)."""
+    out = list(registered_dirs())
+    a = active_dir()
+    if a not in out:
+        out.append(a)
+    return out
 
 
 def installed_manifest():
@@ -590,9 +596,12 @@ class Panel(QMainWindow):
 
     def save_cfg(self):
         try:
-            os.makedirs(os.path.dirname(self.cfg_path()), exist_ok=True)
-            write_cfg(self.cfg_path(), self.current_values())
-            self.say(self.t("applied") + "  [" + self.cfg_path() + "]")
+            vals = self.current_values()
+            dirs = all_cfg_dirs()
+            for d in dirs:
+                os.makedirs(d, exist_ok=True)
+                write_cfg(os.path.join(d, "SkyRT.cfg"), vals)
+            self.say(self.t("applied") + "  [" + "  +  ".join(os.path.join(d, "SkyRT.cfg") for d in dirs) + "]")
         except Exception as e:  # noqa
             self.say(str(e), True)
 
