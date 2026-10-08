@@ -143,6 +143,44 @@ def find_source_files():
     return None
 
 
+def registered_dirs():
+    """Folders of every SkyRT layer manifest registered for the Vulkan loader (the game really loads the layer from one of them)."""
+    out = []
+    if winreg is None:
+        return out
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_READ) as k:
+            i = 0
+            while True:
+                try:
+                    name, _, _ = winreg.EnumValue(k, i)
+                except OSError:
+                    break
+                i += 1
+                if os.path.basename(name).lower() == MANIFEST.lower():
+                    d = os.path.dirname(name)
+                    if os.path.isfile(os.path.join(d, DLL)) and d not in out:
+                        out.append(d)
+    except OSError:
+        pass
+    return out
+
+
+def active_dir():
+    """The folder whose SkyRT.cfg the game reads: the registered layer folder (the one the panel installed, else a developer folder)."""
+    regs = registered_dirs()
+    inst = os.path.normcase(os.path.normpath(install_dir()))
+    for d in regs:
+        if os.path.normcase(os.path.normpath(d)) == inst:
+            return d
+    if regs:
+        return regs[0]
+    d = install_dir()
+    if not os.path.isdir(d):
+        d = find_source_files() or d
+    return d
+
+
 def installed_manifest():
     return os.path.join(install_dir(), MANIFEST)
 
@@ -514,11 +552,7 @@ class Panel(QMainWindow):
 
     # ------------------------------------------------------------ cfg
     def cfg_path(self):
-        d = install_dir()
-        if not os.path.isdir(d):
-            s = find_source_files()
-            d = s or d
-        return os.path.join(d, "SkyRT.cfg")
+        return os.path.join(active_dir(), "SkyRT.cfg")
 
     def load_cfg(self):
         vals, _ = read_cfg(self.cfg_path())
@@ -558,7 +592,7 @@ class Panel(QMainWindow):
         try:
             os.makedirs(os.path.dirname(self.cfg_path()), exist_ok=True)
             write_cfg(self.cfg_path(), self.current_values())
-            self.say(self.t("applied"))
+            self.say(self.t("applied") + "  [" + self.cfg_path() + "]")
         except Exception as e:  # noqa
             self.say(str(e), True)
 
