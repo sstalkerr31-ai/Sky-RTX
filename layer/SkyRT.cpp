@@ -3720,7 +3720,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     par->misc[0] = m.w; par->misc[1] = m.h; par->misc[2] = modeEff; par->misc[3] = ((uint32_t)d->paintInjected.load() & 1023u) | (deepOn ? ((uint32_t)g_bounces << 16) : 0u);
     par->flags[0] = flagsEff;
     par->flags[1] = (uint32_t)(ptFull ? std::min(32, g_shRays * 4) : g_shRays);
-    par->flags[2] = (uint32_t)(ptFull ? std::min(32, g_aoRays * 4) : g_aoRays);
+    par->flags[2] = (uint32_t)(ptFull ? std::min(32, g_aoRays * 4) : (deepOn ? std::min(32, g_aoRays * 2) : g_aoRays));   // deep mode: twice the paths
     par->flags[3] = g_reflOn ? 1u : 0u;
     par->fx[0] = g_aoStrength; par->fx[1] = g_aoRadius; par->fx[2] = g_giStrength; par->fx[3] = ptFull ? std::max(g_giRange, 100.0f) : g_giRange;
     memcpy(par->pvp, d->prevVp, sizeof par->pvp);
