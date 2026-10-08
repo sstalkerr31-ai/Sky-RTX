@@ -171,7 +171,9 @@ def active_dir():
     %LOCALAPPDATA% must not win over the freshly built one)."""
     regs = registered_dirs()
     if regs:
-        return max(regs, key=lambda d: os.path.getmtime(os.path.join(d, DLL)))
+        src = find_source_files()
+        cand = regs + ([src] if src else [])
+        return max(cand, key=lambda d: os.path.getmtime(os.path.join(d, DLL)))
     d = install_dir()
     if not os.path.isdir(d):
         d = find_source_files() or d
@@ -181,9 +183,9 @@ def active_dir():
 def all_cfg_dirs():
     """Every folder the game might load the layer from: the settings are saved to all of them (which copy wins is up to the Vulkan loader)."""
     out = list(registered_dirs())
-    a = active_dir()
-    if a not in out:
-        out.append(a)
+    for d in (active_dir(), find_source_files(), install_dir() if os.path.isfile(os.path.join(install_dir(), DLL)) else None):
+        if d and not any(os.path.normcase(os.path.normpath(d)) == os.path.normcase(os.path.normpath(x)) for x in out):
+            out.append(d)
     return out
 
 
