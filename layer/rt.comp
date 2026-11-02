@@ -1,6 +1,8 @@
 #version 460
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 #ifdef POSFETCH
 #extension GL_EXT_ray_tracing_position_fetch : require
 #endif
@@ -28,10 +30,14 @@ layout(set = 0, binding = 5, std140) uniform Params {
     vec4 tp;       // x = history valid, y = max samples, z = multi-bounce strength (step 22), w = ceiling of the light added per pixel
     vec4 lt;       // step 21: x = light strength, y = light range, z = brightness threshold, w = GI multiplier (strength * 0.5, 0 = GI off)
     uvec4 lm;      // x = tile size, y = tiles in x, z = shadow rays per pixel for lights, w = bit0 lights on
-    uvec4 mat;     // x = bit0 materials on, bit1 debug view, bit2 red test; y = AS slot of this frame; z = gain * 256
+    uvec4 mat;     // x = bit0 materials on, bit1 debug view, bit2 red test, bit3 baked light view; y = AS slot of this frame; z = gain * 256; w = vertex table usable
     vec4 sunCol;   // the game's sun colour (frame UBO +912), w = 1 when it could be read
     vec4 ambCol;   // the game's shade colour (frame UBO +944)
+    vec4 skyCol;   // the game's global ambient (frame UBO +1184)
 } u;
+struct GeoV { uint stride; uint off3; uvec2 idx; uvec2 attr; };   // stride 0 = no vertex data; addresses are low, high
+layout(set = 0, binding = 13, std430) readonly buffer GeoVerts { GeoV geoV[]; };   // same index as geoMat
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U32 { uint v; };
 layout(set = 0, binding = 11, std430) readonly buffer GeoMat { uint geoMat[]; };   // material of every geometry of the static BLAS: [slot * 30000 + geometry index]
 struct MatColor { vec4 c; vec4 pad[15]; };   // 256 bytes: rt_mat.comp writes through a descriptor offset
 layout(set = 0, binding = 12, std430) readonly buffer MatColors { MatColor matColor[]; };
@@ -50,6 +56,38 @@ vec4 hitMaterial(uint inst, uint geom) {
     if (inst != 0u || geom >= 30000u) return vec4(0.0);
     uint id = geoMat[u.mat.y * 30000u + geom];
     return id != 0u ? matColor[id].c : vec4(0.0);
+}
+
+uint read32(uvec2 a, uint off) {
+    uint carry;
+    uint lo = uaddCarry(a.x, off, carry);
+    return U32(uvec2(lo, a.y + carry)).v;
+}
+
+uint read16(uvec2 a, uint off) {
+    uint carry;
+    uint lo = uaddCarry(a.x, off, carry);
+    return (U32(uvec2(lo & ~3u, a.y + carry)).v >> ((lo & 2u) * 8u)) & 0xFFFFu;
+}
+
+// the light the game baked into the vertices of a hit triangle: what the rock vertex shader passes on as ambient
+bool bakedLight(uint inst, uint geom, uint prim, vec2 bary, out vec3 E) {
+    E = vec3(0.0);
+    if (u.mat.w == 0u || inst != 0u || geom >= 30000u) return false;
+    uint ti = u.mat.y * 30000u + geom;
+    uint s = geoV[ti].stride;
+    if (s == 0u) return false;
+    uvec2 idx = geoV[ti].idx, attr = geoV[ti].attr;
+    uint o3 = geoV[ti].off3;
+    float bw[3] = float[3](1.0 - bary.x - bary.y, bary.x, bary.y);
+    for (uint k = 0u; k < 3u; ++k) {
+        uint vi = read16(idx, (prim * 3u + k) * 2u);
+        vec4 c2 = unpackUnorm4x8(read32(attr, vi * s));
+        vec4 c3 = unpackUnorm4x8(read32(attr, vi * s + o3));
+        vec3 l = c2.rgb * c2.rgb / max(c2.a, 1.0 / 255.0) * mix(u.ambCol.rgb, u.sunCol.rgb, c3.x);
+        E += (l + u.skyCol.rgb * (c3.w * exp2(255.0 * c3.z - 128.0))) * bw[k];
+    }
+    return true;
 }
 
 vec3 worldAt(ivec2 p, float z) {
@@ -190,6 +228,11 @@ void main() {
         {
             vec4 vm = hitMaterial(rayQueryGetIntersectionInstanceIdEXT(rm, true), rayQueryGetIntersectionGeometryIndexEXT(rm, true));
             if (vm.w > 0.5) mc = vm.rgb + vec3(0.02, 0.0, 0.02);   // the violet tint tells a dark material from no material
+            if ((u.mat.x & 8u) != 0u) {   // view=10: the baked light of this surface, black = no vertex data
+                vec3 be;
+                bakedLight(rayQueryGetIntersectionInstanceIdEXT(rm, true), rayQueryGetIntersectionGeometryIndexEXT(rm, true), rayQueryGetIntersectionPrimitiveIndexEXT(rm, true), rayQueryGetIntersectionBarycentricsEXT(rm, true), be);
+                mc = be;
+            }
         }
         imageStore(uGI, p, vec4(mc, 0.0));
         imageStore(uSh, p, vec4(1.0));
@@ -297,7 +340,9 @@ void main() {
                             while (rayQueryProceedEXT(rh)) {}
                             hv = rayQueryGetIntersectionTypeEXT(rh, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
                         }
-                        hc = hm.rgb * (u.sunCol.rgb * ndl * hv + u.ambCol.rgb) * (float(u.mat.z) / 256.0);
+                        vec3 he;
+                        if (!bakedLight(rayQueryGetIntersectionInstanceIdEXT(rq, true), rayQueryGetIntersectionGeometryIndexEXT(rq, true), rayQueryGetIntersectionPrimitiveIndexEXT(rq, true), rayQueryGetIntersectionBarycentricsEXT(rq, true), he)) he = u.ambCol.rgb;
+                        hc = hm.rgb * (u.sunCol.rgb * ndl * hv + he) * (float(u.mat.z) / 256.0);
                         if ((u.mat.x & 4u) != 0u) hc = vec3(1.0, 0.0, 0.0);   // view=9: every ray that really uses a material turns red
                     }
                 }

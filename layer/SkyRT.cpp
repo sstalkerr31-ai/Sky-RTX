@@ -89,6 +89,8 @@ static int g_aniso = 16;          // step 13: anisotropic filtering forced on ev
 static std::atomic<bool> g_texProbe{false};  // cfg texprobe=1: log which textures every pipeline samples (log only)
 static std::atomic<bool> g_matAlbedo{false}; // cfg matalbedo=1: off-screen ray hits use the average colour of their material (Ctrl+F9 on/off)
 static bool g_matTrack = false;              // descriptor tracking for materials, decided at start: set before the game creates its textures
+static bool g_matBaked = true;               // cfg matbaked=0: the trace shader reads no vertices, ambient at the hit stays one shade colour
+static const uint64_t kMatBakeVs = 0x80d5b0d5e9f45e34ull;   // RockFaceShMesh: baked light in attributes loc2, loc3
 static float g_matGain = 1.0f;               // cfg matgain: brightness of the material-tinted fallback (1 = same brightness as the old c * 0.5)
 static float g_lodBias = 0.0f;    // cfg: lodbias (negative = sharper textures, e.g. -0.5)
 static float g_giStrength = 0.3f, g_giRange = 30.0f, g_sunSize = 2.5f;  // sun size in degrees (soft shadow penumbra)
@@ -294,12 +296,19 @@ struct GeoKeyHash {
         return (size_t)h;
     }
 };
+struct GeoV {                // where the trace shader finds the vertices of a geometry (std430 in rt.comp); stride 0 = not available
+    uint32_t stride, off3;   // attribute stream stride, offset from attribute loc2 to loc3
+    uint64_t idx, attr;      // device addresses: first index of the draw, loc2 of vertex 0
+};
 struct GeoEnt {
     VkAccelerationStructureGeometryKHR g;
     VkAccelerationStructureBuildRangeInfoKHR r;
     uint64_t lastSeen;
     VkDeviceMemory vm, im;  // memory blocks behind the vertex / index buffers
     uint32_t mat;           // material id, 0 = none
+    GeoV v;
+    VkBuffer ab;            // attribute stream the shader reads: kept alive like vb / ib
+    VkDeviceMemory am;
 };
 static const uint64_t kMaxCacheTris = 700000;
 static const uint64_t kDynTrisMax = 200000;   // step 16: more than this in CPU-written buffers is not 'characters' any more
@@ -489,6 +498,8 @@ struct DeviceData {
         std::vector<GeoKey> keys;
         std::vector<std::pair<VkDeviceMemory, VkDeviceMemory>> mems;
         std::vector<uint32_t> mats;     // material id of every entry of `keys`
+        struct Verts { GeoV v; VkBuffer ab; VkDeviceMemory am; };
+        std::vector<Verts> verts;       // vertex access of every entry of `keys`
         uint64_t tris = 0, draws = 0, skipPipe = 0, skipRange = 0, skipOther = 0, unreadable = 0;
         std::vector<VkAccelerationStructureGeometryKHR> dynGeoms;       // step 16: CPU-written vertex buffers (characters)
         std::vector<VkAccelerationStructureBuildRangeInfoKHR> dynRanges;
@@ -560,6 +571,11 @@ struct DeviceData {
     VkDeviceMemory geoMatMem = VK_NULL_HANDLE, matColMem = VK_NULL_HANDLE;
     uint32_t* geoMatPtr = nullptr;
     char* matColPtr = nullptr;
+    VkBuffer geoVBuf = VK_NULL_HANDLE;                  // vertex access table, same layout as geoMat
+    VkDeviceMemory geoVMem = VK_NULL_HANDLE;
+    GeoV* geoVPtr = nullptr;
+    bool geoVOk[8] = {};                                // cacheMtx: this slot's table points only at living buffers
+    uint64_t geoVGen = 0;                               // cacheMtx: counts removed buffers
     VkPipeline matPipe = VK_NULL_HANDLE;
     VkPipelineLayout matPl = VK_NULL_HANDLE;
     VkDescriptorSetLayout matDsl = VK_NULL_HANDLE;
@@ -1266,13 +1282,15 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_FreeMemory(VkDevice device, VkDeviceMemo
         std::lock_guard<std::mutex> lk(d->cacheMtx);
         if (d->buildMems.erase(memory)) {
             for (auto it = d->geoCache.begin(); it != d->geoCache.end();) {
-                if (it->second.vm == memory || it->second.im == memory) {
+                if (it->second.vm == memory || it->second.im == memory || it->second.am == memory) {
                     d->cacheTris -= std::min<uint64_t>(d->cacheTris, it->second.r.primitiveCount);
                     it = d->geoCache.erase(it);
                     d->rtEvicted++;
                 } else ++it;
             }
             d->cacheDirty = true;
+            memset(d->geoVOk, 0, sizeof d->geoVOk);   // the tables may point here: no vertex reads until the next rebuild
+            d->geoVGen++;
             d->deferred.push_back({VK_NULL_HANDLE, memory, d->frames.load()});
             d->rtDeferred++;
             return;
@@ -1293,13 +1311,15 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_DestroyBuffer(VkDevice device, VkBuffer 
         std::lock_guard<std::mutex> lk(d->cacheMtx);
         if (d->cachedBufs.erase(buffer)) {
             for (auto it = d->geoCache.begin(); it != d->geoCache.end();) {
-                if (it->first.vb == buffer || it->first.ib == buffer) {
+                if (it->first.vb == buffer || it->first.ib == buffer || it->second.ab == buffer) {
                     d->cacheTris -= std::min<uint64_t>(d->cacheTris, it->second.r.primitiveCount);
                     it = d->geoCache.erase(it);
                     d->rtEvicted++;
                 } else ++it;
             }
             d->cacheDirty = true;
+            memset(d->geoVOk, 0, sizeof d->geoVOk);   // the tables may point here: no vertex reads until the next rebuild
+            d->geoVGen++;
             d->deferred.push_back({buffer, VK_NULL_HANDLE, d->frames.load()});
             d->rtDeferred++;
             return;
@@ -2532,6 +2552,7 @@ struct FxParams {
     uint32_t mat[4]; // x = bit0 materials on, bit1 debug view, bit2 red test; y = AS slot of this frame; z = gain * 256
     float sunCol[4]; // the game's sun colour (frame UBO +912), w = 1 when it could be read
     float ambCol[4]; // the game's shade colour (frame UBO +944)
+    float skyCol[4]; // the game's global ambient (frame UBO +1184)
 };
 static const uint32_t kLightMax = 256, kLightBufBytes = 16 + 256 * 32 + 64 * 48;   // header, candidates (2 x vec4), 64 persistent lights (3 x vec4)
 
@@ -2561,20 +2582,20 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->paintTried = true;
     g_stage = "EnsurePaintResources";
 
-    VkDescriptorSetLayoutBinding b[13] = {};
-    const VkDescriptorType types[13] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+    VkDescriptorSetLayoutBinding b[14] = {};
+    const VkDescriptorType types[14] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                                        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-    for (uint32_t i = 0; i < 13; ++i) {
+                                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    for (uint32_t i = 0; i < 14; ++i) {
         b[i].binding = i;
         b[i].descriptorType = types[i];
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.bindingCount = 13;
+    dl.bindingCount = 14;
     dl.pBindings = b;
     VkResult r = d->CreateDescriptorSetLayout(d->device, &dl, nullptr, &d->paintDsl);
     if (r != VK_SUCCESS) { Logf("!!! rt: descriptor set layout failed (%d)", (int)r); return false; }
@@ -2596,7 +2617,7 @@ static bool EnsurePaintResources(DeviceData* d) {
 
     VkDescriptorPoolSize ps[5] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 * 7}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16},
                                   {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16},
-                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 3}};
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 4}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 16;
     pi.poolSizeCount = 5;
@@ -2627,6 +2648,11 @@ static bool EnsurePaintResources(DeviceData* d) {
         VkDeviceAddress da = 0;
         void* gp = nullptr;
         void* cp = nullptr;
+        void* vp = nullptr;
+        if (!MakeBufEx(d, (VkDeviceSize)8 * kMaxCacheGeoms * sizeof(GeoV), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->geoVBuf, d->geoVMem, da) ||
+            d->MapMemory(d->device, d->geoVMem, 0, VK_WHOLE_SIZE, 0, &vp) != VK_SUCCESS || !vp) { Logf("!!! rt: vertex table failed"); return false; }
+        d->geoVPtr = (GeoV*)vp;
+        memset(vp, 0, (size_t)8 * kMaxCacheGeoms * sizeof(GeoV));
         if (!MakeBufEx(d, (VkDeviceSize)8 * kMaxCacheGeoms * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->geoMatBuf, d->geoMatMem, da) ||
             !MakeBufEx(d, (VkDeviceSize)kMatMax * kMatStride, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->matColBuf, d->matColMem, da) ||
             d->MapMemory(d->device, d->geoMatMem, 0, VK_WHOLE_SIZE, 0, &gp) != VK_SUCCESS || !gp ||
@@ -2696,9 +2722,9 @@ static bool EnsurePaintResources(DeviceData* d) {
             lw.pBufferInfo = &lbi;
             d->UpdateDescriptorSets(d->device, 1, &lw, 0, nullptr);
         }
-        VkDescriptorBufferInfo mbi[2] = {{d->geoMatBuf, 0, VK_WHOLE_SIZE}, {d->matColBuf, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet mw[2] = {};
-        for (uint32_t k = 0; k < 2; ++k) {
+        VkDescriptorBufferInfo mbi[3] = {{d->geoMatBuf, 0, VK_WHOLE_SIZE}, {d->matColBuf, 0, VK_WHOLE_SIZE}, {d->geoVBuf, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet mw[3] = {};
+        for (uint32_t k = 0; k < 3; ++k) {
             mw[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             mw[k].dstSet = d->paintSets[i];
             mw[k].dstBinding = 11 + k;
@@ -2706,7 +2732,7 @@ static bool EnsurePaintResources(DeviceData* d) {
             mw[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             mw[k].pBufferInfo = &mbi[k];
         }
-        d->UpdateDescriptorSets(d->device, 2, mw, 0, nullptr);
+        d->UpdateDescriptorSets(d->device, 3, mw, 0, nullptr);
     }
 
     d->paintOk = true;
@@ -3145,11 +3171,23 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
     bool fmtOk = false, isWater = false, isProp = false;
     uint32_t binding = 0, vstride = 0, voff = 0, propIb = 0, propIstride = 0;
     uint64_t vsHash = 0, fsHash = 0;
+    uint32_t bakeB = 8, bakeStride = 0, bake2 = 0, bake3 = 0;   // the stream holding the baked light of the rock shader (loc2, loc3)
     {
         std::lock_guard<std::mutex> lk(d->regMtx);
         auto pit = d->pipes.find(st.pipe);
         isWater = pit != d->pipes.end() && IsWaterPair(pit->second.vsHash, pit->second.fsHash);
         if (pit != d->pipes.end()) { vsHash = pit->second.vsHash; fsHash = pit->second.fsHash; }
+        if (pit != d->pipes.end() && g_matTrack && vsHash == kMatBakeVs) {
+            bool have2 = false, have3 = false;
+            uint32_t b3 = 8;
+            for (const DeviceData::PipeInfo::Attr& a : pit->second.attrs) {
+                if (a.format != (uint32_t)VK_FORMAT_R8G8B8A8_UNORM) continue;
+                if (a.loc == 2) { bakeB = a.binding; bake2 = a.offset; have2 = true; }
+                if (a.loc == 3) { b3 = a.binding; bake3 = a.offset; have3 = true; }
+            }
+            if (have2 && have3 && b3 == bakeB)
+                for (const DeviceData::PipeInfo::Bind& b : pit->second.binds) if (b.binding == bakeB && b.rate == 0) bakeStride = b.stride;
+        }
         if (pit != d->pipes.end() && g_instGeo && g_dynGeo && pit->second.opaque && pit->second.instanced) {   // step 18: decoded instanced shaders only
             for (uint64_t kv : kInstVs) if (kv == pit->second.vsHash) isProp = true;
             if (isProp) for (const DeviceData::PipeInfo::Bind& bd : pit->second.binds) if (bd.rate) { propIb = bd.binding; propIstride = bd.stride; }
@@ -3188,6 +3226,13 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         }
     }
     const uint32_t matId = bufsOk ? MatForDraw(d, cb, vsHash, fsHash) : 0;
+    DeviceData::BufInfo abi{};
+    VkDeviceAddress aa = 0;
+    if (bufsOk && bakeStride && bakeB < 8 && st.vb[bakeB] && BufInfoOf(d, st.vb[bakeB], abi)) {
+        VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        ai.buffer = st.vb[bakeB];
+        aa = d->GetBufferDeviceAddress(d->device, &ai);
+    }
     std::lock_guard<std::mutex> lk(d->geoMtx);
     DeviceData::FrameGeo& fg = d->frameGeo[cb];
     fg.draws += indirect ? 1 : 1;
@@ -3257,6 +3302,14 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         fg.keys.push_back(GeoKey{st.vb[binding], st.ib, vbase, ibase, c.indexCount, vstride});
         fg.mems.emplace_back(vbi.mem, ibi.mem);
         fg.mats.push_back(matId);
+        DeviceData::FrameGeo::Verts fv{};
+        const uint64_t abase = st.vbOff[bakeB < 8 ? bakeB : 0] + bake2 + (uint64_t)c.vertexOffset * bakeStride;
+        if (aa && abase + bakeStride <= abi.size && (abase & 3) == 0 && bake3 >= bake2 && ((bake3 - bake2) & 3) == 0) {
+            fv.v = GeoV{bakeStride, bake3 - bake2, ia + ibase, aa + abase};
+            fv.ab = st.vb[bakeB];
+            fv.am = abi.mem;
+        }
+        fg.verts.push_back(fv);
         fg.tris += rg.primitiveCount;
     }
 }
@@ -3473,7 +3526,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         char key[32] = {};
         strncpy(key, k, sizeof key - 1);
         for (int i = (int)strlen(key) - 1; i >= 0 && (key[i] == ' ' || key[i] == '\t'); --i) key[i] = 0;
-        if (!strcmp(key, "view")) g_view = (uint32_t)v % 10u;
+        if (!strcmp(key, "view")) g_view = (uint32_t)v % 11u;
         else if (!strcmp(key, "enabled")) g_enabled = v != 0.0;
         else if (!strcmp(key, "autosun")) g_autoSun = v != 0.0;
         else if (!strcmp(key, "az")) g_sunAz = v;
@@ -3514,6 +3567,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "aniso")) g_aniso = (int)std::max(0.0, std::min(16.0, v));
         else if (!strcmp(key, "texprobe")) g_texProbe = v != 0.0;
         else if (!strcmp(key, "matalbedo")) g_matAlbedo = v != 0.0;
+        else if (!strcmp(key, "matbaked")) g_matBaked = v != 0.0;
         else if (!strcmp(key, "matgain")) g_matGain = (float)std::max(0.0, std::min(8.0, (double)v));
         else if (!strcmp(key, "lodbias")) g_lodBias = (float)std::max(-2.0, std::min(1.0, v));
     }
@@ -3728,7 +3782,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         for (size_t i = 0; i < fg.dynGeoms.size(); ++i) {
             if (i < fg.dynProp.size() && fg.dynProp[i]) continue;   // props have no meaning without their transform
             fg.geoms.push_back(fg.dynGeoms[i]); fg.ranges.push_back(fg.dynRanges[i]);
-            fg.keys.push_back(fg.dynKeys[i]); fg.mems.push_back(fg.dynMems[i]); fg.mats.push_back(0);
+            fg.keys.push_back(fg.dynKeys[i]); fg.mems.push_back(fg.dynMems[i]); fg.mats.push_back(0); fg.verts.push_back(DeviceData::FrameGeo::Verts{});
             fg.tris += fg.dynRanges[i].primitiveCount;
         }
         fg.dynGeoms.clear(); fg.dynRanges.clear(); fg.dynKeys.clear(); fg.dynMems.clear(); fg.dynXf.clear(); fg.dynProp.clear(); fg.dynTris = 0; fg.propTris = 0; fg.propGeoms = 0;
@@ -3751,6 +3805,8 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     std::vector<VkAccelerationStructureGeometryKHR> geoms;
     std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
     std::vector<uint32_t> geoMats;   // material of every entry of `geoms`
+    std::vector<GeoV> geoVs;         // vertex access of every entry of `geoms`
+    uint64_t geoVGenNow = 0;
     uint64_t cacheTrisNow = 0;
     bool rebuild = false;
     int curSlot = -1;
@@ -3760,11 +3816,13 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         for (size_t i = 0; i < fg.keys.size(); ++i) {
             auto it = d->geoCache.find(fg.keys[i]);
             if (it == d->geoCache.end()) {
-                d->geoCache.emplace(fg.keys[i], GeoEnt{fg.geoms[i], fg.ranges[i], fr, fg.mems[i].first, fg.mems[i].second, fg.mats[i]});
+                const DeviceData::FrameGeo::Verts& fv = fg.verts[i];
+                d->geoCache.emplace(fg.keys[i], GeoEnt{fg.geoms[i], fg.ranges[i], fr, fg.mems[i].first, fg.mems[i].second, fg.mats[i], fv.v, fv.ab, fv.am});
                 d->buildMems.insert(fg.mems[i].first);
                 d->buildMems.insert(fg.mems[i].second);
                 d->cachedBufs.insert(fg.keys[i].vb);
                 d->cachedBufs.insert(fg.keys[i].ib);
+                if (fv.ab) { d->cachedBufs.insert(fv.ab); d->buildMems.insert(fv.am); }
                 d->cacheTris += fg.ranges[i].primitiveCount;
                 d->cacheDirty = true;
             } else {
@@ -3810,7 +3868,9 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             geoms.reserve(d->geoCache.size());
             ranges.reserve(d->geoCache.size());
             geoMats.reserve(d->geoCache.size());
-            for (auto& kv : d->geoCache) { geoms.push_back(kv.second.g); ranges.push_back(kv.second.r); geoMats.push_back(kv.second.mat); }
+            geoVs.reserve(d->geoCache.size());
+            for (auto& kv : d->geoCache) { geoms.push_back(kv.second.g); ranges.push_back(kv.second.r); geoMats.push_back(kv.second.mat); geoVs.push_back(kv.second.v); }
+            geoVGenNow = d->geoVGen;
         }
     }
     if (!g_enabled) {  // original picture: keep the cache up to date but do no GPU work
@@ -3884,6 +3944,11 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         }
 
         if (d->geoMatPtr) memcpy(d->geoMatPtr + (size_t)idx * kMaxCacheGeoms, geoMats.data(), std::min(geoMats.size(), kMaxCacheGeoms) * sizeof(uint32_t));   // this slot is not in flight (see above)
+        if (d->geoVPtr) {
+            memcpy(d->geoVPtr + (size_t)idx * kMaxCacheGeoms, geoVs.data(), std::min(geoVs.size(), kMaxCacheGeoms) * sizeof(GeoV));
+            std::lock_guard<std::mutex> lk(d->cacheMtx);
+            d->geoVOk[idx] = d->geoVGen == geoVGenNow;   // a buffer that went away after the copy above keeps this table off
+        }
 
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
@@ -4120,20 +4185,26 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         case 7: modeEff = 2u; break;
         case 8: modeEff = 5u; flagsEff = 4u; break;   // material colour of every pixel, see rt.comp
         case 9: modeEff = 5u; flagsEff = 4u; break;   // bounce light, rays that use a material are red
+        case 10: modeEff = 5u; flagsEff = 4u; break;  // baked light read from the vertices of every pixel (black = no vertex data)
         default: flagsEff |= 8u; if (lightsOn) flagsEff |= 16u; break;
     }
     const bool matOn = g_matTrack && d->matPipe;
-    par->mat[0] = (matOn && g_matAlbedo.load(std::memory_order_relaxed) ? 1u : 0u) | (matOn && g_view == 8 ? 2u : 0u) | (matOn && g_view == 9 ? 4u : 0u);
+    par->mat[0] = (matOn && g_matAlbedo.load(std::memory_order_relaxed) ? 1u : 0u) | (matOn && (g_view == 8 || g_view == 10) ? 2u : 0u) | (matOn && g_view == 9 ? 4u : 0u) | (matOn && g_view == 10 ? 8u : 0u);
     par->mat[1] = (uint32_t)(slot - d->rtSlots);
     par->mat[2] = (uint32_t)(g_matGain * 256.0f);
-    par->mat[3] = 0;
     {
-        float sc[3] = {}, ac[3] = {};
-        const bool ok = ReadBufHost(d, ubo.buf, ubo.off + 912, sc, sizeof sc) && ReadBufHost(d, ubo.buf, ubo.off + 944, ac, sizeof ac) && FiniteMat(sc, 3) && FiniteMat(ac, 3);
+        std::lock_guard<std::mutex> lk(d->cacheMtx);
+        par->mat[3] = g_matBaked && d->geoVOk[par->mat[1]] ? 1u : 0u;
+    }
+    {
+        float sc[3] = {}, ac[3] = {}, kc[3] = {};
+        const bool ok = ReadBufHost(d, ubo.buf, ubo.off + 912, sc, sizeof sc) && ReadBufHost(d, ubo.buf, ubo.off + 944, ac, sizeof ac) && ReadBufHost(d, ubo.buf, ubo.off + 1184, kc, sizeof kc) &&
+                        FiniteMat(sc, 3) && FiniteMat(ac, 3) && FiniteMat(kc, 3);
         par->sunCol[0] = sc[0]; par->sunCol[1] = sc[1]; par->sunCol[2] = sc[2]; par->sunCol[3] = ok ? 1.0f : 0.0f;
         par->ambCol[0] = ac[0]; par->ambCol[1] = ac[1]; par->ambCol[2] = ac[2]; par->ambCol[3] = 0.0f;
+        par->skyCol[0] = kc[0]; par->skyCol[1] = kc[1]; par->skyCol[2] = kc[2]; par->skyCol[3] = 0.0f;
         static std::atomic<uint64_t> cn{0};
-        if (matOn && cn.fetch_add(1) % 1800 == 0) Logf("rt: hit lighting: sun colour %.3f %.3f %.3f, shade %.3f %.3f %.3f (%s)", (double)sc[0], (double)sc[1], (double)sc[2], (double)ac[0], (double)ac[1], (double)ac[2], ok ? "read" : "NOT readable");
+        if (matOn && cn.fetch_add(1) % 1800 == 0) Logf("rt: hit lighting: sun colour %.3f %.3f %.3f, shade %.3f %.3f %.3f, sky %.3f %.3f %.3f (%s), vertex reads %s", (double)sc[0], (double)sc[1], (double)sc[2], (double)ac[0], (double)ac[1], (double)ac[2], (double)kc[0], (double)kc[1], (double)kc[2], ok ? "read" : "NOT readable", par->mat[3] ? "on" : "off");
     }
     // step 25: screenshot mode is adaptive - full quality only while the camera stands still (a short moment after it stopped), normal cost while moving
     bool ptFull = false;

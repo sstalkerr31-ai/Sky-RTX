@@ -113,11 +113,12 @@ Everything the panel changes lives in `%LOCALAPPDATA%\SkyRT\SkyRT.cfg` (plain `k
 | `lightthr` · `lightrays` · `lightdebug` | 0.3–50 · 1–4 · 0/1 | Brightness above which a pixel counts as a source (the log prints the brightest pixel it saw), shadow rays per pixel, paint detected sources magenta |
 | `matalbedo` | 0/1 | **Materials and lighting at the ray hit.** Must be 1 in the file **before the game starts** (textures are tracked from the first frame); after that Ctrl+F9 toggles it live. No panel control yet |
 | `matgain` | 0–8 | Brightness of light from a hit surface (default 1) |
+| `matbaked` | 0/1 | Read baked light from vertices at the ray hit (default 1, works only with materials on). Set 0 if the game crashes with `DEVICE_LOST` while materials are on |
 | `texprobe` | 0/1 | Log only: which textures every shader pair samples. Set before the game starts |
 | `waterfx` · `waterrefl` · `glint` | 0/1 · strength · 0/1 | Experimental water and ice: reflections on/off, reflection strength, sun glints |
 | `aniso` · `lodbias` | 0–16 · −2…1 | Anisotropic filtering, texture sharpness shift (**applied on the next game start**) |
 | `autosun` · `az` · `el` | 0/1 · 0–360° · 1–89° | Take the sun from the game, or set it manually |
-| `view` | 0–9 | Debug views. 0 = normal, 5 = bounce light only, 8 = material colour of every pixel (black = no material), 9 = bounce light with every ray that uses a material painted red |
+| `view` | 0–10 | Debug views. 0 = normal, 5 = bounce light only, 8 = material colour of every pixel (black = no material), 9 = bounce light with every ray that uses a material painted red, 10 = baked light read from the vertices (black = no vertex data) |
 
 More rays = less noise, more GPU work. Sky is usually CPU-bound, so the GPU normally has plenty of headroom.
 
@@ -202,12 +203,12 @@ SkyRT does not replace the game's renderer. It traces rays against the real scen
 | Hit on screen: colour read from the frame | ✅ |
 | Hit off screen: the surface's real colour | 🧪 one average colour per material or draw, no UV lookup |
 | Light at the hit: sun, N·L, shadow ray | 🧪 one bounce, in `rt.comp` |
-| Light at the hit: ambient | 🧪 simplified to one shade colour, the game uses a cubemap |
+| Light at the hit: ambient | 🧪 baked vertex light for `RockFaceShMesh`, one shade colour for everything else |
 | Materials in the deep bounce mode | ❌ `rt_deep.comp` still uses the old fallback |
 | Characters and animated meshes as bounce surfaces | ❌ no material yet |
 | Replacing the game's own lighting | ❌ not planned yet |
 
-With materials on, the first measured result: ground next to blue rock reads about 25% bluer, and the walls lose some false light. About 55–60% of cached triangles had a material in the tested scenes.
+With materials on, ground next to blue rock clearly picks up its colour: about 1.25× bluer in the first measurement, and 1.6–2.3× in a brighter scene at `gistrength=1`, which is too strong. The default `gistrength=0.3` looks natural. About 55–60% of cached triangles had a material in the tested scenes.
 
 ## 🧩 Architecture
 
@@ -219,7 +220,9 @@ With materials on, the first measured result: ground next to blue rock reads abo
   - *Texture materials* (`MeshSh`, `MeshShSl`, `MeshSlDarkvine`, table `kMatFs`): colour = texture `s1.b8` × `s1.b9`. `rt_mat.comp` averages the pair once, in the frame that drew it, so the image views are alive.
   - *Per-draw colour* (`RockFace*`, `GrassSh`, `SandSh`, table `kMatVs`): these shaders have no colour texture. The colour is a `vec3` in the per-draw block (set 0, binding 0), read from mapped memory at record time. Rock and grass are confirmed from the decompiled vertex shaders; the two sand offsets are not traced to the final colour yet.
 - **Geometry → material table:** an SSBO with one section per AS slot, indexed by `slot × 30000 + geometry index`. It is written when a slot is rebuilt, and that slot is not in flight. Colours live in a second SSBO with a 256-byte stride.
-- **Lighting at the hit** (`rt.comp`): on-screen hits keep the frame colour. An off-screen hit with a material gets `albedo × (sun colour × N·L × shadow ray + shade) × matgain`, using the game's own frame UBO values (sun colour at +912, shade at +944). The rock shader's own formula has the same shape, so the scale matches the frame.
+- **Vertex access at the hit:** the trace shader reads the game's index and attribute buffers directly through buffer device addresses (`GL_EXT_buffer_reference`, table `GeoV` at binding 13). It finds the hit triangle, reads its three vertices and interpolates them by the barycentrics. Attribute buffers are kept alive like the BLAS inputs; when any cached buffer goes away, vertex reads stay off until the next rebuild. Only `RockFaceShMesh` is decoded so far. `matbaked=0` turns this off.
+- **Ambient at the hit:** the game's real ambient is baked into vertices (`loc2`, `loc3`) plus a global term (frame UBO +1184). The cubemap only adds per-pixel detail, so it is not used here.
+- **Lighting at the hit** (`rt.comp`): on-screen hits keep the frame colour. An off-screen hit with a material gets `albedo × (sun colour × N·L × shadow ray + ambient) × matgain`, using the game's own frame UBO values (sun colour at +912, shade at +944). Ambient is the baked vertex light where it can be read, otherwise the shade colour. The rock shader's own formula has the same shape, so the scale matches the frame.
 - **Without a material** the old fallback stays: half of the current pixel's colour.
 - **Composite** (`rt_fx.comp`): `colour += surface tint × bounce`, before the game's tone mapping and bloom.
 - Game facts the layer relies on: reverse-Z depth, y-up, a 1584-byte frame UBO (view-projection, camera, light direction, sun colour). Shaders are identified by FNV-1a hashes of their SPIR-V, so a game update can silently drop them from the tables.
@@ -235,7 +238,8 @@ With materials on, the first measured result: ground next to blue rock reads abo
 - [x] Grass in the acceleration structure (experimental)
 - [x] Link geometry to materials, light off-screen hits (first version)
 - [ ] Confirm water and ice reflections on real water
-- [ ] Real ambient at the hit (the game's cubemap)
+- [x] Read vertices at the ray hit, baked ambient for `RockFaceShMesh`
+- [ ] Baked ambient for the other shaders
 - [ ] UV lookup at the hit instead of one colour per material
 - [ ] More shaders in the material tables, per-draw tint for `MeshShSl` / `MeshSlDarkvine`
 - [ ] Materials in the deep bounce mode
