@@ -17,6 +17,7 @@
 #include <vulkan/vk_layer.h>
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <atomic>
 #include <cmath>
@@ -37,6 +38,8 @@
 #include "rtlight_spv.h"  // SPIR-V of rt_light.comp (generated): emissive light source search (step 21)
 #include "rtdeep_spv.h"  // SPIR-V of rt_deep.comp (generated): trace pass with several bounces (step 26)
 #include "rtlmerge_spv.h"  // SPIR-V of rt_lmerge.comp (generated): persistent light list (step 23)
+#include "rtmat_spv.h"  // SPIR-V of rt_mat.comp (generated): average colour of a material
+#include "rtpf_spv.h"   // SPIR-V of rt.comp with -DPOSFETCH (generated): trace pass for GPUs with position fetch
 
 // ============================================================ config
 static const uint32_t kStatsEveryNFrames = 300;   // ~5 sec at 60 fps
@@ -83,6 +86,10 @@ static int g_pathTrace = 0;       // step 25: 'path tracing' / screenshot mode: 
 static int g_grass = 1;           // step 24: grass (non-indexed triangle strips written by the CPU) in the acceleration structure (cfg grass=0/1)
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
 static int g_aniso = 16;          // step 13: anisotropic filtering forced on every linear sampler (cfg: aniso=0/2/4/8/16)
+static std::atomic<bool> g_texProbe{false};  // cfg texprobe=1: log which textures every pipeline samples (log only)
+static std::atomic<bool> g_matAlbedo{false}; // cfg matalbedo=1: off-screen ray hits use the average colour of their material (Ctrl+F9 on/off)
+static bool g_matTrack = false;              // descriptor tracking for materials, decided at start: set before the game creates its textures
+static float g_matGain = 1.0f;               // cfg matgain: brightness of the material-tinted fallback (1 = same brightness as the old c * 0.5)
 static float g_lodBias = 0.0f;    // cfg: lodbias (negative = sharper textures, e.g. -0.5)
 static float g_giStrength = 0.3f, g_giRange = 30.0f, g_sunSize = 2.5f;  // sun size in degrees (soft shadow penumbra)
 static int g_shRays = 2;
@@ -292,6 +299,7 @@ struct GeoEnt {
     VkAccelerationStructureBuildRangeInfoKHR r;
     uint64_t lastSeen;
     VkDeviceMemory vm, im;  // memory blocks behind the vertex / index buffers
+    uint32_t mat;           // material id, 0 = none
 };
 static const uint64_t kMaxCacheTris = 700000;
 static const uint64_t kDynTrisMax = 200000;   // step 16: more than this in CPU-written buffers is not 'characters' any more
@@ -480,6 +488,7 @@ struct DeviceData {
         std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
         std::vector<GeoKey> keys;
         std::vector<std::pair<VkDeviceMemory, VkDeviceMemory>> mems;
+        std::vector<uint32_t> mats;     // material id of every entry of `keys`
         uint64_t tris = 0, draws = 0, skipPipe = 0, skipRange = 0, skipOther = 0, unreadable = 0;
         std::vector<VkAccelerationStructureGeometryKHR> dynGeoms;       // step 16: CPU-written vertex buffers (characters)
         std::vector<VkAccelerationStructureBuildRangeInfoKHR> dynRanges;
@@ -546,6 +555,17 @@ struct DeviceData {
     VkBuffer parBuf[16] = {};
     VkDeviceMemory parMem[16] = {};
     char* parPtr[16] = {};
+    // material step: geometry -> material table (one section per AS slot) and average colours
+    VkBuffer geoMatBuf = VK_NULL_HANDLE, matColBuf = VK_NULL_HANDLE;
+    VkDeviceMemory geoMatMem = VK_NULL_HANDLE, matColMem = VK_NULL_HANDLE;
+    uint32_t* geoMatPtr = nullptr;
+    char* matColPtr = nullptr;
+    VkPipeline matPipe = VK_NULL_HANDLE;
+    VkPipelineLayout matPl = VK_NULL_HANDLE;
+    VkDescriptorSetLayout matDsl = VK_NULL_HANDLE;
+    VkDescriptorPool matPool = VK_NULL_HANDLE;
+    VkDescriptorSet matSets[64] = {};
+    std::atomic<uint32_t> matRing{0};
     std::mutex cacheMtx;
     std::unordered_map<GeoKey, GeoEnt, GeoKeyHash> geoCache;          // cacheMtx
     std::unordered_set<VkBuffer> cachedBufs;                          // cacheMtx
@@ -684,9 +704,26 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_DestroyInstance(VkInstance instance, con
 }
 
 // ============================================================ device
+static void TpEarlyCfg() {  // LoadCfg first runs after frame 1, but texprobe has to record the textures created before that
+    char path[MAX_PATH];
+    ModuleDir(path, sizeof path);
+    strncat(path, "\\SkyRT.cfg", sizeof path - strlen(path) - 1);
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    char line[256];
+    int v = 0;
+    while (fgets(line, sizeof line, f))
+    {
+        if (sscanf(line, " texprobe = %d", &v) == 1) g_texProbe = v != 0;
+        if (sscanf(line, " matalbedo = %d", &v) == 1) { g_matAlbedo = v != 0; g_matTrack = v != 0; }
+    }
+    fclose(f);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo* pCreateInfo,
                                                          const VkAllocationCallbacks* pAllocator, VkDevice* pDevice) {
     g_stage = "vkCreateDevice";
+    TpEarlyCfg();
     InstanceData* inst = GetInst(Key(phys));
     if (!inst) return VK_ERROR_INITIALIZATION_FAILED;
 
@@ -1693,6 +1730,246 @@ static void LayoutStr(int l, char* out, size_t n) {
 static const char* LoadOpStr(int op) { return op == 0 ? "LOAD" : op == 1 ? "CLEAR" : op == 2 ? "DONT_CARE" : "NONE"; }
 static const char* StoreOpStr(int op) { return op == 0 ? "STORE" : op == 1 ? "DONT_CARE" : "NONE"; }
 
+// ---------------------------------------------------------------- texprobe (LOG ONLY, cfg texprobe=1)
+// Which textures does every pipeline sample? Builds the chain draw -> bound descriptor sets -> image views -> image format/size,
+// and prints a summary of one frame a few times per session. Needed to attach albedo/normal maps to the ray-traced scene later.
+// It never changes anything the game sees. Set texprobe=1 BEFORE starting the game (descriptor writes are recorded from the start).
+struct TpImg { uint32_t fmt, w, h, mips, layers; };
+struct TpView { VkImage img; uint32_t fmt, baseMip, mips, vtype; };
+static const int kTpBind = 16, kTpSets = 4;
+static std::mutex g_tpMtx;
+static std::unordered_map<VkImage, TpImg> g_tpImg;
+static std::unordered_map<VkImageView, TpView> g_tpView;
+static std::unordered_map<VkDescriptorSet, std::array<VkImageView, kTpBind>> g_tpSet;
+static std::unordered_map<VkCommandBuffer, std::array<VkDescriptorSet, kTpSets>> g_tpCb;
+struct TpUbo { VkBuffer buf; VkDeviceSize off; bool dyn; };
+static std::unordered_map<VkDescriptorSet, TpUbo> g_tpSetUbo;   // uniform buffer at binding 0 of every set
+static std::unordered_map<VkCommandBuffer, TpUbo> g_tpCbUbo;    // the per-draw block (set 0, binding 0) now bound, dynamic offset already added
+static std::map<std::string, uint64_t> g_tpKeys;
+static std::atomic<int> g_tpCollect{0};     // frames still to collect
+static uint64_t g_tpDraws = 0, g_tpUnresolved = 0;
+static int g_tpDumps = 0;
+
+static void TpOnImage(const VkImageCreateInfo* ci, VkImage img) {
+    if (!(ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || ci->imageType != VK_IMAGE_TYPE_2D) return;
+    std::lock_guard<std::mutex> lk(g_tpMtx);
+    if (g_tpImg.size() > 600000) return;
+    g_tpImg[img] = TpImg{(uint32_t)ci->format, ci->extent.width, ci->extent.height, ci->mipLevels, ci->arrayLayers};
+}
+static void TpOnView(const VkImageViewCreateInfo* ci, VkImageView v) {
+    std::lock_guard<std::mutex> lk(g_tpMtx);
+    if (g_tpView.size() > 600000) return;
+    g_tpView[v] = TpView{ci->image, (uint32_t)ci->format, ci->subresourceRange.baseMipLevel, ci->subresourceRange.levelCount, (uint32_t)ci->viewType};
+}
+static void TpOnWrite(uint32_t n, const VkWriteDescriptorSet* w) {
+    std::lock_guard<std::mutex> lk(g_tpMtx);
+    for (uint32_t i = 0; i < n; ++i) {
+        const bool ubo = w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, uboDyn = w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        if ((ubo || uboDyn) && w[i].pBufferInfo && w[i].dstSet && w[i].dstBinding == 0 && g_tpSetUbo.size() < 400000)
+            g_tpSetUbo[w[i].dstSet] = TpUbo{w[i].pBufferInfo[0].buffer, w[i].pBufferInfo[0].offset, uboDyn};
+        if ((w[i].descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && w[i].descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) || !w[i].pImageInfo || !w[i].dstSet)
+            continue;
+        if (g_tpSet.size() > 400000 && g_tpSet.find(w[i].dstSet) == g_tpSet.end()) continue;
+        std::array<VkImageView, kTpBind>& a = g_tpSet[w[i].dstSet];
+        for (uint32_t k = 0; k < w[i].descriptorCount; ++k) {
+            const uint32_t b = w[i].dstBinding + w[i].dstArrayElement + k;
+            if (b < (uint32_t)kTpBind) a[b] = w[i].pImageInfo[k].imageView;
+        }
+    }
+}
+static void TpOnBind(VkCommandBuffer cb, uint32_t firstSet, uint32_t setCount, const VkDescriptorSet* pSets, uint32_t dynCount, const uint32_t* pDyn) {
+    std::lock_guard<std::mutex> lk(g_tpMtx);
+    if (firstSet == 0 && setCount) {   // binding 0 is the lowest binding of set 0, so its dynamic offset comes first
+        auto uit = g_tpSetUbo.find(pSets[0]);
+        if (uit == g_tpSetUbo.end()) g_tpCbUbo.erase(cb);
+        else {
+            TpUbo u = uit->second;
+            if (u.dyn && dynCount) u.off += pDyn[0];
+            g_tpCbUbo[cb] = u;
+        }
+    }
+    std::array<VkDescriptorSet, kTpSets>& a = g_tpCb[cb];
+    for (uint32_t i = 0; i < setCount; ++i)
+        if (firstSet + i < (uint32_t)kTpSets) a[firstSet + i] = pSets[i];
+}
+static void TpOnDraw(DeviceData* d, VkCommandBuffer cb) {
+    if (g_tpCollect.load(std::memory_order_relaxed) <= 0) return;
+    { std::lock_guard<std::mutex> lk(d->paintMtx); if (!d->mainCb.count(cb)) return; }
+    VkPipeline pipe = VK_NULL_HANDLE;
+    { std::lock_guard<std::mutex> lk(d->cmdMtx); auto it = d->cmdState.find(cb); if (it != d->cmdState.end()) pipe = it->second.pipe; }
+    unsigned long long vs = 0, fs = 0;
+    { std::lock_guard<std::mutex> lk(d->regMtx); auto it = d->pipes.find(pipe); if (it != d->pipes.end()) { vs = it->second.vsHash; fs = it->second.fsHash; } }
+    char buf[160];
+    snprintf(buf, sizeof buf, "vs %016llx fs %016llx |", vs, fs);
+    std::string key = buf;
+    uint64_t unres = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_tpMtx);
+        auto cit = g_tpCb.find(cb);
+        if (cit != g_tpCb.end()) {
+            for (int s = 0; s < kTpSets; ++s) {
+                const VkDescriptorSet set = cit->second[s];
+                if (!set) continue;
+                auto sit = g_tpSet.find(set);
+                if (sit == g_tpSet.end()) { snprintf(buf, sizeof buf, " s%d:no-image-writes", s); key += buf; ++unres; continue; }
+                for (int b = 0; b < kTpBind; ++b) {
+                    const VkImageView v = sit->second[b];
+                    if (!v) continue;
+                    auto vit = g_tpView.find(v);
+                    if (vit == g_tpView.end()) { snprintf(buf, sizeof buf, " s%d.b%d:view?", s, b); key += buf; continue; }
+                    auto iit = g_tpImg.find(vit->second.img);
+                    if (iit == g_tpImg.end()) { snprintf(buf, sizeof buf, " s%d.b%d:%s image?", s, b, FormatName(vit->second.fmt)); key += buf; continue; }
+                    snprintf(buf, sizeof buf, " s%d.b%d:%s %ux%u m%u", s, b, FormatName(vit->second.fmt), iit->second.w, iit->second.h, iit->second.mips);
+                    key += buf;
+                }
+            }
+        }
+        ++g_tpDraws;
+        g_tpUnresolved += unres;
+        if (g_tpKeys.size() < 4000 || g_tpKeys.count(key)) g_tpKeys[key]++;
+    }
+}
+static void TpDump() {
+    std::vector<std::pair<uint64_t, std::string>> v;
+    uint64_t draws, unres; size_t ni, nv, ns;
+    {
+        std::lock_guard<std::mutex> lk(g_tpMtx);
+        for (auto& kv : g_tpKeys) v.push_back({kv.second, kv.first});
+        draws = g_tpDraws; unres = g_tpUnresolved; ni = g_tpImg.size(); nv = g_tpView.size(); ns = g_tpSet.size();
+        g_tpKeys.clear(); g_tpDraws = 0; g_tpUnresolved = 0;
+    }
+    std::sort(v.begin(), v.end(), [](const std::pair<uint64_t, std::string>& a, const std::pair<uint64_t, std::string>& b) { return a.first > b.first; });
+    Logf("--- texprobe #%d: %llu main-pass draws in the sampled frames, %zu distinct (shaders + textures) combos, sets without image writes: %llu | tracked: %zu sampled images, %zu views, %zu descriptor sets ---",
+         g_tpDumps, (unsigned long long)draws, v.size(), (unsigned long long)unres, ni, nv, ns);
+    for (size_t i = 0; i < v.size() && i < 90; ++i) Logf("  x%-5llu %s", (unsigned long long)v[i].first, v[i].second.c_str());
+    Logf("--- end of texprobe ---");
+}
+// ---------------------------------------------------------------- materials (cfg matalbedo=1)
+// Links the geometry of the static BLAS to the textures it was drawn with. First step: only fragment shaders whose texture slots were read from the
+// decompiled code, and one average colour per material. A real UV lookup at the hit point comes later.
+static const uint64_t kMatFs[] = {0xc7e04cd8a8bb69c0ull, 0xd48c7a6fc5216c17ull, 0x0d37c566b2c844e4ull};   // MeshSh, MeshShSl, MeshSlDarkvine: colour = texture s1.b8 * texture s1.b9 (the last two also tint it by a per-draw value, not read yet)
+// Rocks, grass and sand have no colour texture: their colour is a vec3 in the per-draw block (set 0, binding 0), at an offset that depends on the vertex shader.
+// For the rock and grass shaders the vertex shader uses it as albedo; for the two sand shaders this is the vec3 of their block, not traced to the output yet.
+struct MatVs { uint64_t vs; uint32_t off; };
+static const MatVs kMatVs[] = {{0x17a63a0f3447fc7cull, 0},     // RockFaceSh
+                               {0x80d5b0d5e9f45e34ull, 80},    // RockFaceShMesh
+                               {0xa179ffcd45e93352ull, 0},     // GrassSh
+                               {0xeb915f45b31552f8ull, 144},   // SandSh
+                               {0x0bbf0e4075f1943eull, 64}};   // SandSh
+static const uint32_t kMatMax = 2048, kMatStride = 256, kMatPerFrame = 8;   // the stride covers any minStorageBufferOffsetAlignment
+struct MatEnt { VkImageView a, b; bool done; };
+static std::mutex g_matMtx;
+static std::map<std::pair<VkImageView, VkImageView>, uint32_t> g_matIds;
+static std::vector<MatEnt> g_mats(1, MatEnt{VK_NULL_HANDLE, VK_NULL_HANDLE, true});   // id 0 = no material
+static std::map<uint32_t, uint32_t> g_matConstIds;   // quantized colour -> id
+
+static uint32_t MatConst(DeviceData* d, VkCommandBuffer cb, uint64_t vs, uint32_t off) {
+    if (!d->matColPtr) return 0;   // the first frames: the draw comes again
+    TpUbo u{};
+    {
+        std::lock_guard<std::mutex> lk(g_tpMtx);
+        auto it = g_tpCbUbo.find(cb);
+        if (it == g_tpCbUbo.end()) return 0;
+        u = it->second;
+    }
+    float c[3] = {};
+    if (!ReadBufHost(d, u.buf, u.off + off, c, sizeof c)) return 0;
+    uint32_t key = 0;
+    for (float v : c) {
+        if (!(v >= 0.0f && v <= 8.0f)) return 0;   // also catches NaN
+        key = (key << 10) | (uint32_t)std::min(1023.0f, v * 255.0f + 0.5f);
+    }
+    std::lock_guard<std::mutex> lk(g_matMtx);
+    auto it = g_matConstIds.find(key);
+    if (it != g_matConstIds.end()) return it->second;
+    if (g_mats.size() >= kMatMax) return 0;
+    const uint32_t id = (uint32_t)g_mats.size();
+    g_mats.push_back(MatEnt{VK_NULL_HANDLE, VK_NULL_HANDLE, true});
+    g_matConstIds[key] = id;
+    const float o[4] = {c[0], c[1], c[2], 1.0f};
+    memcpy(d->matColPtr + (size_t)id * kMatStride, o, sizeof o);
+    if (id <= 120) Logf("rt: material #%u: per-draw colour %.3f %.3f %.3f (vs %016llx)", id, (double)c[0], (double)c[1], (double)c[2], (unsigned long long)vs);
+    return id;
+}
+
+static uint32_t MatForDraw(DeviceData* d, VkCommandBuffer cb, uint64_t vs, uint64_t fs) {
+    if (!g_matTrack) return 0;
+    for (const MatVs& m : kMatVs) if (m.vs == vs) return MatConst(d, cb, vs, m.off);
+    bool known = false;
+    for (uint64_t k : kMatFs) if (k == fs) known = true;
+    if (!known) return 0;
+    VkImageView a = VK_NULL_HANDLE, b = VK_NULL_HANDLE;
+    {
+        std::lock_guard<std::mutex> lk(g_tpMtx);
+        auto cit = g_tpCb.find(cb);
+        if (cit == g_tpCb.end()) return 0;
+        auto sit = g_tpSet.find(cit->second[1]);
+        if (sit == g_tpSet.end()) return 0;
+        a = sit->second[8]; b = sit->second[9];
+    }
+    if (!a || !b) return 0;
+    std::lock_guard<std::mutex> lk(g_matMtx);
+    auto it = g_matIds.find({a, b});
+    if (it != g_matIds.end()) return it->second;
+    if (g_mats.size() >= kMatMax) return 0;
+    const uint32_t id = (uint32_t)g_mats.size();
+    g_mats.push_back(MatEnt{a, b, false});
+    g_matIds[{a, b}] = id;
+    return id;
+}
+
+// Average colours of the new materials. Only materials drawn in this very frame: their views are certainly alive, an old backlog entry may not be.
+static void MatAverage(DeviceData* d, VkCommandBuffer cb, const std::vector<uint32_t>& frameMats) {
+    uint32_t ids[kMatPerFrame];
+    VkImageView views[kMatPerFrame][2];
+    uint32_t n = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_matMtx);
+        for (uint32_t m : frameMats) {
+            if (n >= kMatPerFrame) break;
+            if (!m || m >= g_mats.size() || g_mats[m].done) continue;
+            g_mats[m].done = true;
+            ids[n] = m; views[n][0] = g_mats[m].a; views[n][1] = g_mats[m].b;
+            ++n;
+        }
+    }
+    if (!n) return;
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->matPipe);
+    for (uint32_t i = 0; i < n; ++i) {
+        VkDescriptorSet set = d->matSets[d->matRing.fetch_add(1) % 64];   // at most 8 a frame: a set comes back after 8 frames, later than any frame in flight
+        VkDescriptorImageInfo ii[2] = {};
+        ii[0].imageView = views[i][0]; ii[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ii[1].imageView = views[i][1]; ii[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkDescriptorBufferInfo bi{d->matColBuf, (VkDeviceSize)ids[i] * kMatStride, 16};
+        VkWriteDescriptorSet w[3] = {};
+        for (uint32_t k = 0; k < 3; ++k) {
+            w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[k].dstSet = set;
+            w[k].dstBinding = k;
+            w[k].descriptorCount = 1;
+            w[k].descriptorType = k < 2 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            if (k < 2) w[k].pImageInfo = &ii[k]; else w[k].pBufferInfo = &bi;
+        }
+        d->UpdateDescriptorSets(d->device, 3, w, 0, nullptr);
+        d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->matPl, 0, 1, &set, 0, nullptr);
+        d->CmdDispatch(cb, 1, 1, 1);
+    }
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+
+static void TpFrame(uint64_t f) {
+    if (!g_texProbe.load(std::memory_order_relaxed)) return;
+    const int c = g_tpCollect.load();
+    if (c > 0) {
+        if (g_tpCollect.fetch_sub(1) == 1) { ++g_tpDumps; TpDump(); }
+    } else if (f % 1800 == 300 && g_tpDumps < 20) {  // every ~25 s: the first dumps land in the menu and loading screens
+        g_tpCollect = 2;
+    }
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateImage(VkDevice device, const VkImageCreateInfo* pCreateInfo,
                                                         const VkAllocationCallbacks* pAllocator, VkImage* pImage) {
     DeviceData* d = GetDev(Key(device));
@@ -1751,6 +2028,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateImage(VkDevice device, const V
                  (finalUsage & VK_IMAGE_USAGE_STORAGE_BIT) ? "STORAGE" : "",
                  finalUsage != u ? " (patched: +STORAGE/+SAMPLED)" : "");
     }
+    if (r == VK_SUCCESS && g_texProbe.load(std::memory_order_relaxed)) TpOnImage(pCreateInfo, *pImage);
     return r;
 }
 
@@ -1909,6 +2187,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateImageView(VkDevice device, con
     DeviceData* d = GetDev(Key(device));
     if (!d) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult r = d->CreateImageView(device, pCreateInfo, pAllocator, pView);
+    if (r == VK_SUCCESS && g_texProbe.load(std::memory_order_relaxed)) TpOnView(pCreateInfo, *pView);
     if (r == VK_SUCCESS) {
         std::lock_guard<std::mutex> lk(d->regMtx);
         if (d->imgs.find(pCreateInfo->image) != d->imgs.end()) d->views[*pView] = DeviceData::ViewInfo{pCreateInfo->image};
@@ -2250,10 +2529,13 @@ struct FxParams {
     float tp[4];     // x = history valid, y = max samples
     float lt[4];     // step 21: x = light strength, y = range, z = brightness threshold, w = GI multiplier (strength * 0.5, applied in the trace pass)
     uint32_t lm[4];  // x = tile size, y = tiles in x, z = shadow rays for lights, w = bit0 lights on, bit1 debug
+    uint32_t mat[4]; // x = bit0 materials on, bit1 debug view, bit2 red test; y = AS slot of this frame; z = gain * 256
+    float sunCol[4]; // the game's sun colour (frame UBO +912), w = 1 when it could be read
+    float ambCol[4]; // the game's shade colour (frame UBO +944)
 };
 static const uint32_t kLightMax = 256, kLightBufBytes = 16 + 256 * 32 + 64 * 48;   // header, candidates (2 x vec4), 64 persistent lights (3 x vec4)
 
-static VkPipeline MakeComputePipe(DeviceData* d, const uint32_t* code, size_t bytes, const char* what) {
+static VkPipeline MakeComputePipe(DeviceData* d, const uint32_t* code, size_t bytes, const char* what, VkPipelineLayout layout = VK_NULL_HANDLE) {
     VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     sm.codeSize = bytes;
     sm.pCode = code;
@@ -2265,7 +2547,7 @@ static VkPipeline MakeComputePipe(DeviceData* d, const uint32_t* code, size_t by
     cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     cp.stage.module = mod;
     cp.stage.pName = "main";
-    cp.layout = d->paintPl;
+    cp.layout = layout ? layout : d->paintPl;
     VkPipeline pipe = VK_NULL_HANDLE;
     r = d->CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &cp, nullptr, &pipe);
     d->DestroyShaderModule(d->device, mod, nullptr);
@@ -2279,20 +2561,20 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->paintTried = true;
     g_stage = "EnsurePaintResources";
 
-    VkDescriptorSetLayoutBinding b[11] = {};
-    const VkDescriptorType types[11] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+    VkDescriptorSetLayoutBinding b[13] = {};
+    const VkDescriptorType types[13] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                                        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-    for (uint32_t i = 0; i < 11; ++i) {
+                                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    for (uint32_t i = 0; i < 13; ++i) {
         b[i].binding = i;
         b[i].descriptorType = types[i];
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.bindingCount = 11;
+    dl.bindingCount = 13;
     dl.pBindings = b;
     VkResult r = d->CreateDescriptorSetLayout(d->device, &dl, nullptr, &d->paintDsl);
     if (r != VK_SUCCESS) { Logf("!!! rt: descriptor set layout failed (%d)", (int)r); return false; }
@@ -2303,7 +2585,7 @@ static bool EnsurePaintResources(DeviceData* d) {
     r = d->CreatePipelineLayout(d->device, &pl, nullptr, &d->paintPl);
     if (r != VK_SUCCESS) { Logf("!!! rt: pipeline layout failed (%d)", (int)r); return false; }
 
-    d->paintPipe = MakeComputePipe(d, kRtSpv, sizeof(kRtSpv), "trace");
+    d->paintPipe = d->posFetch ? MakeComputePipe(d, kRtPfSpv, sizeof(kRtPfSpv), "trace") : MakeComputePipe(d, kRtSpv, sizeof(kRtSpv), "trace");   // with position fetch the hit normal is real
     d->fxPipe = MakeComputePipe(d, kRtFxSpv, sizeof(kRtFxSpv), "composite");
     if (!d->paintPipe || !d->fxPipe) return false;
     if (d->posFetch) d->deepPipe = MakeComputePipe(d, kRtDeepSpv, sizeof(kRtDeepSpv), "deep trace");   // optional: without it the deep bounce mode is unavailable
@@ -2314,7 +2596,7 @@ static bool EnsurePaintResources(DeviceData* d) {
 
     VkDescriptorPoolSize ps[5] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 * 7}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16},
                                   {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16},
-                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16}};
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 3}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 16;
     pi.poolSizeCount = 5;
@@ -2339,6 +2621,52 @@ static bool EnsurePaintResources(DeviceData* d) {
         } else if (MakeBufEx(d, 64, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->statBuf, d->statMem, da)) {
             void* sp = nullptr;
             if (d->MapMemory(d->device, d->statMem, 0, VK_WHOLE_SIZE, 0, &sp) == VK_SUCCESS && sp) { d->statPtr = (char*)sp; memset(sp, 0, 64); }
+        }
+    }
+    {   // material step: the trace shader always reads these two buffers, so they are required; the averaging pipeline is optional
+        VkDeviceAddress da = 0;
+        void* gp = nullptr;
+        void* cp = nullptr;
+        if (!MakeBufEx(d, (VkDeviceSize)8 * kMaxCacheGeoms * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->geoMatBuf, d->geoMatMem, da) ||
+            !MakeBufEx(d, (VkDeviceSize)kMatMax * kMatStride, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->matColBuf, d->matColMem, da) ||
+            d->MapMemory(d->device, d->geoMatMem, 0, VK_WHOLE_SIZE, 0, &gp) != VK_SUCCESS || !gp ||
+            d->MapMemory(d->device, d->matColMem, 0, VK_WHOLE_SIZE, 0, &cp) != VK_SUCCESS || !cp) { Logf("!!! rt: material buffers failed"); return false; }
+        d->geoMatPtr = (uint32_t*)gp;
+        d->matColPtr = (char*)cp;
+        memset(gp, 0, (size_t)8 * kMaxCacheGeoms * sizeof(uint32_t));
+        memset(cp, 0, (size_t)kMatMax * kMatStride);
+        if (g_matTrack) {
+            VkDescriptorSetLayoutBinding mb[3] = {};
+            for (uint32_t i = 0; i < 3; ++i) {
+                mb[i].binding = i;
+                mb[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                mb[i].descriptorCount = 1;
+                mb[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            }
+            VkDescriptorSetLayoutCreateInfo mdl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            mdl.bindingCount = 3;
+            mdl.pBindings = mb;
+            VkPipelineLayoutCreateInfo mpl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            mpl.setLayoutCount = 1;
+            mpl.pSetLayouts = &d->matDsl;
+            VkDescriptorPoolSize mps[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 64 * 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64}};
+            VkDescriptorPoolCreateInfo mpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            mpi.maxSets = 64;
+            mpi.poolSizeCount = 2;
+            mpi.pPoolSizes = mps;
+            VkDescriptorSetLayout mlayouts[64];
+            VkDescriptorSetAllocateInfo mai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            if (d->CreateDescriptorSetLayout(d->device, &mdl, nullptr, &d->matDsl) == VK_SUCCESS &&
+                d->CreatePipelineLayout(d->device, &mpl, nullptr, &d->matPl) == VK_SUCCESS &&
+                d->CreateDescriptorPool(d->device, &mpi, nullptr, &d->matPool) == VK_SUCCESS) {
+                for (int i = 0; i < 64; ++i) mlayouts[i] = d->matDsl;
+                mai.descriptorPool = d->matPool;
+                mai.descriptorSetCount = 64;
+                mai.pSetLayouts = mlayouts;
+                if (d->AllocateDescriptorSets(d->device, &mai, d->matSets) == VK_SUCCESS)
+                    d->matPipe = MakeComputePipe(d, kRtMatSpv, sizeof(kRtMatSpv), "material average", d->matPl);
+            }
+            Logf("rt: materials %s (textures: MeshSh family; per-draw colour: rock, grass, sand)", d->matPipe ? "on" : "UNAVAILABLE");
         }
     }
     // one small host-visible parameter buffer per descriptor set, bound once
@@ -2368,6 +2696,17 @@ static bool EnsurePaintResources(DeviceData* d) {
             lw.pBufferInfo = &lbi;
             d->UpdateDescriptorSets(d->device, 1, &lw, 0, nullptr);
         }
+        VkDescriptorBufferInfo mbi[2] = {{d->geoMatBuf, 0, VK_WHOLE_SIZE}, {d->matColBuf, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet mw[2] = {};
+        for (uint32_t k = 0; k < 2; ++k) {
+            mw[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            mw[k].dstSet = d->paintSets[i];
+            mw[k].dstBinding = 11 + k;
+            mw[k].descriptorCount = 1;
+            mw[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            mw[k].pBufferInfo = &mbi[k];
+        }
+        d->UpdateDescriptorSets(d->device, 2, mw, 0, nullptr);
     }
 
     d->paintOk = true;
@@ -2805,10 +3144,12 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
     // vertex format of the pipeline: float3 position at location 0, per-vertex, opaque, not instanced
     bool fmtOk = false, isWater = false, isProp = false;
     uint32_t binding = 0, vstride = 0, voff = 0, propIb = 0, propIstride = 0;
+    uint64_t vsHash = 0, fsHash = 0;
     {
         std::lock_guard<std::mutex> lk(d->regMtx);
         auto pit = d->pipes.find(st.pipe);
         isWater = pit != d->pipes.end() && IsWaterPair(pit->second.vsHash, pit->second.fsHash);
+        if (pit != d->pipes.end()) { vsHash = pit->second.vsHash; fsHash = pit->second.fsHash; }
         if (pit != d->pipes.end() && g_instGeo && g_dynGeo && pit->second.opaque && pit->second.instanced) {   // step 18: decoded instanced shaders only
             for (uint64_t kv : kInstVs) if (kv == pit->second.vsHash) isProp = true;
             if (isProp) for (const DeviceData::PipeInfo::Bind& bd : pit->second.binds) if (bd.rate) { propIb = bd.binding; propIstride = bd.stride; }
@@ -2846,6 +3187,7 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
                  (void*)st.vb[binding], (unsigned)vbi.usage, pit != d->pipes.end() ? (unsigned long long)pit->second.vsHash : 0ull);
         }
     }
+    const uint32_t matId = bufsOk ? MatForDraw(d, cb, vsHash, fsHash) : 0;
     std::lock_guard<std::mutex> lk(d->geoMtx);
     DeviceData::FrameGeo& fg = d->frameGeo[cb];
     fg.draws += indirect ? 1 : 1;
@@ -2914,6 +3256,7 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         fg.ranges.push_back(rg);
         fg.keys.push_back(GeoKey{st.vb[binding], st.ib, vbase, ibase, c.indexCount, vstride});
         fg.mems.emplace_back(vbi.mem, ibi.mem);
+        fg.mats.push_back(matId);
         fg.tris += rg.primitiveCount;
     }
 }
@@ -3130,7 +3473,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         char key[32] = {};
         strncpy(key, k, sizeof key - 1);
         for (int i = (int)strlen(key) - 1; i >= 0 && (key[i] == ' ' || key[i] == '\t'); --i) key[i] = 0;
-        if (!strcmp(key, "view")) g_view = (uint32_t)v % 8u;
+        if (!strcmp(key, "view")) g_view = (uint32_t)v % 10u;
         else if (!strcmp(key, "enabled")) g_enabled = v != 0.0;
         else if (!strcmp(key, "autosun")) g_autoSun = v != 0.0;
         else if (!strcmp(key, "az")) g_sunAz = v;
@@ -3169,6 +3512,9 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "instgeo")) g_instGeo = v != 0.0;
         else if (!strcmp(key, "instscale")) g_instScale = (float)v;
         else if (!strcmp(key, "aniso")) g_aniso = (int)std::max(0.0, std::min(16.0, v));
+        else if (!strcmp(key, "texprobe")) g_texProbe = v != 0.0;
+        else if (!strcmp(key, "matalbedo")) g_matAlbedo = v != 0.0;
+        else if (!strcmp(key, "matgain")) g_matGain = (float)std::max(0.0, std::min(8.0, (double)v));
         else if (!strcmp(key, "lodbias")) g_lodBias = (float)std::max(-2.0, std::min(1.0, v));
     }
     if (logIt)
@@ -3210,6 +3556,12 @@ static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = shader
     if (pd && !pdWas) ProbeKey(false);
     if (pu && !puWas) ProbeKey(true);
     puWas = pu;
+    {   // Ctrl+F9 = material colours on/off (compare with the old fallback)
+        static bool f9Was = false;
+        const bool f9 = ctrl && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+        if (f9 && !f9Was) { g_matAlbedo = !g_matAlbedo.load(); Logf("rt: KEY Ctrl+F9 -> material colours %s%s", g_matAlbedo.load() ? "ON" : "off", g_matTrack ? "" : " (no effect: matalbedo=1 must be in SkyRT.cfg when the game starts)"); }
+        f9Was = f9;
+    }
     {   // step 25: Ctrl+Backspace = screenshot ('path tracing') mode on/off
         static bool bsWas = false;
         const bool bs = ctrl && (GetAsyncKeyState(VK_BACK) & 0x8000) != 0;
@@ -3376,7 +3728,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         for (size_t i = 0; i < fg.dynGeoms.size(); ++i) {
             if (i < fg.dynProp.size() && fg.dynProp[i]) continue;   // props have no meaning without their transform
             fg.geoms.push_back(fg.dynGeoms[i]); fg.ranges.push_back(fg.dynRanges[i]);
-            fg.keys.push_back(fg.dynKeys[i]); fg.mems.push_back(fg.dynMems[i]);
+            fg.keys.push_back(fg.dynKeys[i]); fg.mems.push_back(fg.dynMems[i]); fg.mats.push_back(0);
             fg.tris += fg.dynRanges[i].primitiveCount;
         }
         fg.dynGeoms.clear(); fg.dynRanges.clear(); fg.dynKeys.clear(); fg.dynMems.clear(); fg.dynXf.clear(); fg.dynProp.clear(); fg.dynTris = 0; fg.propTris = 0; fg.propGeoms = 0;
@@ -3398,6 +3750,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     };
     std::vector<VkAccelerationStructureGeometryKHR> geoms;
     std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
+    std::vector<uint32_t> geoMats;   // material of every entry of `geoms`
     uint64_t cacheTrisNow = 0;
     bool rebuild = false;
     int curSlot = -1;
@@ -3407,7 +3760,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         for (size_t i = 0; i < fg.keys.size(); ++i) {
             auto it = d->geoCache.find(fg.keys[i]);
             if (it == d->geoCache.end()) {
-                d->geoCache.emplace(fg.keys[i], GeoEnt{fg.geoms[i], fg.ranges[i], fr, fg.mems[i].first, fg.mems[i].second});
+                d->geoCache.emplace(fg.keys[i], GeoEnt{fg.geoms[i], fg.ranges[i], fr, fg.mems[i].first, fg.mems[i].second, fg.mats[i]});
                 d->buildMems.insert(fg.mems[i].first);
                 d->buildMems.insert(fg.mems[i].second);
                 d->cachedBufs.insert(fg.keys[i].vb);
@@ -3416,6 +3769,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 d->cacheDirty = true;
             } else {
                 it->second.lastSeen = fr;
+                if (!it->second.mat) it->second.mat = fg.mats[i];
             }
         }
         if (fr - d->lastEvict >= 300) {  // forget what has not been drawn for a minute
@@ -3455,7 +3809,8 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             d->lastRebuildFrameA = fr;
             geoms.reserve(d->geoCache.size());
             ranges.reserve(d->geoCache.size());
-            for (auto& kv : d->geoCache) { geoms.push_back(kv.second.g); ranges.push_back(kv.second.r); }
+            geoMats.reserve(d->geoCache.size());
+            for (auto& kv : d->geoCache) { geoms.push_back(kv.second.g); ranges.push_back(kv.second.r); geoMats.push_back(kv.second.mat); }
         }
     }
     if (!g_enabled) {  // original picture: keep the cache up to date but do no GPU work
@@ -3528,6 +3883,8 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             return;
         }
 
+        if (d->geoMatPtr) memcpy(d->geoMatPtr + (size_t)idx * kMaxCacheGeoms, geoMats.data(), std::min(geoMats.size(), kMaxCacheGeoms) * sizeof(uint32_t));   // this slot is not in flight (see above)
+
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
@@ -3574,6 +3931,20 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             Logf("rt: BLAS rebuild #%llu: %zu geometries, %llu triangles (cache), BLAS %.2f MB, scratch %.2f MB | this frame drew %zu geometries / %llu tris",
                  (unsigned long long)nb, geoms.size(), (unsigned long long)cacheTrisNow, sz.accelerationStructureSize / 1048576.0,
                  sz.buildScratchSize / 1048576.0, fg.geoms.size(), (unsigned long long)fg.tris);
+        if ((nb <= 30 || nb % 200 == 0) && g_matTrack) {
+            size_t withMat = 0;
+            for (uint32_t gm : geoMats) if (gm) ++withMat;
+            size_t known = 0;
+            { std::lock_guard<std::mutex> lk(g_matMtx); known = g_mats.size() - 1; }
+            std::string cols;
+            for (size_t i = 1; i <= known && i <= 6 && d->matColPtr; ++i) {
+                const float* mc = (const float*)(d->matColPtr + i * kMatStride);
+                char t[64];
+                snprintf(t, sizeof t, " #%zu(%.2f %.2f %.2f)", i, (double)mc[0], (double)mc[1], (double)mc[2]);
+                cols += t;
+            }
+            Logf("rt: materials: %zu of %zu BLAS geometries have one, %zu materials known |%s", withMat, geoMats.size(), known, cols.c_str());
+        }
     } else {
         slot = &d->rtSlots[curSlot];
     }
@@ -3747,7 +4118,22 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         case 5: modeEff = 5u; flagsEff = 4u; break;
         case 6: modeEff = 1u; break;
         case 7: modeEff = 2u; break;
+        case 8: modeEff = 5u; flagsEff = 4u; break;   // material colour of every pixel, see rt.comp
+        case 9: modeEff = 5u; flagsEff = 4u; break;   // bounce light, rays that use a material are red
         default: flagsEff |= 8u; if (lightsOn) flagsEff |= 16u; break;
+    }
+    const bool matOn = g_matTrack && d->matPipe;
+    par->mat[0] = (matOn && g_matAlbedo.load(std::memory_order_relaxed) ? 1u : 0u) | (matOn && g_view == 8 ? 2u : 0u) | (matOn && g_view == 9 ? 4u : 0u);
+    par->mat[1] = (uint32_t)(slot - d->rtSlots);
+    par->mat[2] = (uint32_t)(g_matGain * 256.0f);
+    par->mat[3] = 0;
+    {
+        float sc[3] = {}, ac[3] = {};
+        const bool ok = ReadBufHost(d, ubo.buf, ubo.off + 912, sc, sizeof sc) && ReadBufHost(d, ubo.buf, ubo.off + 944, ac, sizeof ac) && FiniteMat(sc, 3) && FiniteMat(ac, 3);
+        par->sunCol[0] = sc[0]; par->sunCol[1] = sc[1]; par->sunCol[2] = sc[2]; par->sunCol[3] = ok ? 1.0f : 0.0f;
+        par->ambCol[0] = ac[0]; par->ambCol[1] = ac[1]; par->ambCol[2] = ac[2]; par->ambCol[3] = 0.0f;
+        static std::atomic<uint64_t> cn{0};
+        if (matOn && cn.fetch_add(1) % 1800 == 0) Logf("rt: hit lighting: sun colour %.3f %.3f %.3f, shade %.3f %.3f %.3f (%s)", (double)sc[0], (double)sc[1], (double)sc[2], (double)ac[0], (double)ac[1], (double)ac[2], ok ? "read" : "NOT readable");
     }
     // step 25: screenshot mode is adaptive - full quality only while the camera stands still (a short moment after it stopped), normal cost while moving
     bool ptFull = false;
@@ -3842,6 +4228,8 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &hmb, 0, nullptr, 4, pre);
+
+    if (matOn) MatAverage(d, cb, fg.mats);
 
     // ---- pass 0 (step 21): find emissive light sources. The list is cleared, filled tile by tile and then read by the trace pass
     if (lightsOn) {
@@ -3952,6 +4340,21 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         Logf("rt: emissive lights: %u candidates this frame%s, %u persistent lights alive | brightest pixel %.2f, threshold lightthr=%.2f (raise it if ordinary surfaces glow, lower it if fire does not light anything)",
              std::min<uint32_t>(hdr[0], kLightMax), hdr[0] > kLightMax ? " (more than fit - raise lightthr)" : "", hdr[2], hdr[1] / 1000.0, (double)g_lightThr);
     }
+    if (g_matTrack && n % 600 == 11) {
+        size_t all = 0, withMat = 0;
+        uint64_t trisAll = 0, trisMat = 0;
+        {
+            std::lock_guard<std::mutex> lk(d->cacheMtx);
+            for (auto& kv : d->geoCache) {
+                ++all;
+                trisAll += kv.second.r.primitiveCount;
+                if (kv.second.mat) { ++withMat; trisMat += kv.second.r.primitiveCount; }
+            }
+        }
+        size_t known = 0;
+        { std::lock_guard<std::mutex> lk(g_matMtx); known = g_mats.size() - 1; }
+        Logf("rt: material coverage: %zu of %zu cached geometries, %llu of %llu triangles, %zu materials known, colours %s", withMat, all, (unsigned long long)trisMat, (unsigned long long)trisAll, known, g_matAlbedo.load() ? "ON" : "off");
+    }
     if (n == 1 || n == 2000) {
         Logf("rt: %s frame: drew %zu geometries, %llu triangles (draws %llu; skipped: pipeline/format %llu, range %llu, other %llu, "
              "unreadable %llu) | cache holds %llu triangles",
@@ -4034,6 +4437,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_UpdateDescriptorSets(VkDevice device, ui
             }
         }
     }
+    if ((g_texProbe.load(std::memory_order_relaxed) || g_matTrack) && pWrites) TpOnWrite(writeCount, pWrites);
     d->UpdateDescriptorSets(device, writeCount, pWrites, copyCount, pCopies);
 }
 
@@ -4059,6 +4463,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdBindDescriptorSets(VkCommandBuffer cb
             }
         }
     }
+    if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && (g_texProbe.load(std::memory_order_relaxed) || g_matTrack)) TpOnBind(cb, firstSet, setCount, pSets, dynCount, pDyn);
     d->CmdBindDescriptorSets(cb, bindPoint, layout, firstSet, setCount, pSets, dynCount, pDyn);
 }
 
@@ -4270,6 +4675,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_QueuePresentKHR(VkQueue queue, const
     g_stage = "vkQueuePresentKHR";
     VkResult r = d->QueuePresentKHR(queue, pPresentInfo);
     uint64_t f = ++d->frames;
+    TpFrame(f);
     d->presentQueue = queue;
     {   // step 14: frame-time hitch detector (what happened around a frame that took much longer than usual)
         static LARGE_INTEGER fq = {}, last = {};
@@ -4340,6 +4746,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDraw(VkCommandBuffer cb, uint32_t ver
     DeviceData* d = GetDev(Key(cb));
     if (!d) return;
     g_cDraw.fetch_add(1, std::memory_order_relaxed);
+    TpOnDraw(d, cb);
     if (g_ppState.load(std::memory_order_relaxed) && PassProbeDraw(d, cb)) return;
     if ((g_probeOn.load(std::memory_order_relaxed) || (g_hide.load(std::memory_order_relaxed) >= 0 || g_hideGroup.load(std::memory_order_relaxed) > 0)) && d->mainCount.load(std::memory_order_relaxed) > 0) {
         bool inMain;
@@ -4429,6 +4836,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDrawIndexed(VkCommandBuffer cb, uint3
     DeviceData* d = GetDev(Key(cb));
     if (!d) return;
     d->drawIndexed.fetch_add(1, std::memory_order_relaxed);
+    TpOnDraw(d, cb);
     if (g_ppState.load(std::memory_order_relaxed) && PassProbeDraw(d, cb)) return;
     if (d->capturing.load(std::memory_order_relaxed)) {
         VkDrawIndexedIndirectCommand c{indexCount, instanceCount, firstIndex, vertexOffset, firstInstance};
@@ -4447,6 +4855,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDrawIndexedIndirect(VkCommandBuffer c
     DeviceData* d = GetDev(Key(cb));
     if (!d) return;
     d->indirectCalls.fetch_add(1, std::memory_order_relaxed);
+    TpOnDraw(d, cb);
     if (g_ppState.load(std::memory_order_relaxed) && PassProbeDraw(d, cb)) return;
     d->indirectSubdraws.fetch_add(drawCount, std::memory_order_relaxed);
     if (d->capturing.load(std::memory_order_relaxed)) {
@@ -4466,6 +4875,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDrawIndexedIndirect(VkCommandBuffer c
 // step 12: the draw paths we did not hook before (the water may use one of them)
 static bool OtherDraw(DeviceData* d, VkCommandBuffer cb, std::atomic<uint64_t>& ctr, const char* what, uint32_t count) {  // true = skip
     ctr.fetch_add(1, std::memory_order_relaxed);
+    TpOnDraw(d, cb);
     if (g_ppState.load(std::memory_order_relaxed) && PassProbeDraw(d, cb)) return true;
     if ((g_probeOn.load(std::memory_order_relaxed) || (g_hide.load(std::memory_order_relaxed) >= 0 || g_hideGroup.load(std::memory_order_relaxed) > 0)) && d->mainCount.load(std::memory_order_relaxed) > 0) {
         bool inMain;

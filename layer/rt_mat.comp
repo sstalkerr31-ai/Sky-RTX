@@ -1,0 +1,24 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+// SkyRT material step: average colour of one material (colour texture A x colour texture B, as MeshSh multiplies them).
+// Runs once per material, the result lands at the buffer offset of that material.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D uA;
+layout(set = 0, binding = 1) uniform texture2D uB;
+layout(set = 0, binding = 2, std430) writeonly buffer Out { vec4 c; } o;
+
+vec3 avg(texture2D t) {
+    int lod = textureQueryLevels(t) - 1;   // the smallest mip is already an average (a texture without mips is sampled on a grid)
+    ivec2 s = textureSize(t, lod);
+    ivec2 n = min(s, ivec2(8));
+    vec3 sum = vec3(0.0);
+    for (int y = 0; y < n.y; ++y)
+        for (int x = 0; x < n.x; ++x)
+            sum += texelFetch(t, ivec2((vec2(x, y) + 0.5) * vec2(s) / vec2(n)), lod).rgb;
+    return sum / float(n.x * n.y);
+}
+
+void main() {
+    o.c = vec4(avg(uA) * avg(uB), 1.0);
+}

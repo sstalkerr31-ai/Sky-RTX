@@ -1,6 +1,9 @@
 #version 460
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_EXT_ray_query : require
+#ifdef POSFETCH
+#extension GL_EXT_ray_tracing_position_fetch : require
+#endif
 // SkyRT step 8, pass 1 (trace): for every non-sky pixel shoots rays and stores raw, noisy results:
 //   uSh.r   = sun visibility (soft shadow: several rays inside the sun's cone)
 //   uGI.rgb = diffuse bounce light (cosine rays; the color of whatever a ray hits is read back from the frame itself)
@@ -25,7 +28,13 @@ layout(set = 0, binding = 5, std140) uniform Params {
     vec4 tp;       // x = history valid, y = max samples, z = multi-bounce strength (step 22), w = ceiling of the light added per pixel
     vec4 lt;       // step 21: x = light strength, y = light range, z = brightness threshold, w = GI multiplier (strength * 0.5, 0 = GI off)
     uvec4 lm;      // x = tile size, y = tiles in x, z = shadow rays per pixel for lights, w = bit0 lights on
+    uvec4 mat;     // x = bit0 materials on, bit1 debug view, bit2 red test; y = AS slot of this frame; z = gain * 256
+    vec4 sunCol;   // the game's sun colour (frame UBO +912), w = 1 when it could be read
+    vec4 ambCol;   // the game's shade colour (frame UBO +944)
 } u;
+layout(set = 0, binding = 11, std430) readonly buffer GeoMat { uint geoMat[]; };   // material of every geometry of the static BLAS: [slot * 30000 + geometry index]
+struct MatColor { vec4 c; vec4 pad[15]; };   // 256 bytes: rt_mat.comp writes through a descriptor offset
+layout(set = 0, binding = 12, std430) readonly buffer MatColors { MatColor matColor[]; };
 layout(set = 0, binding = 8, rgba16f) uniform image2D uHAp;    // step 22: previous frame accumulated indirect light (read only here)
 layout(set = 0, binding = 9, rgba32f) uniform image2D uHBp;    // previous frame: shadow, depth, sample count
 layout(set = 0, binding = 10, std430) readonly buffer Lights {
@@ -35,6 +44,13 @@ layout(set = 0, binding = 10, std430) readonly buffer Lights {
     uint pad1;
     vec4 L[];      // [512 + 3*s]: persistent light s = (position.xyz, intensity), [+1] = (hue.rgb, ttl)
 } lights;
+
+// average colour of the material a ray hit; w = 0 when the geometry has none (characters, shaders that are not decoded yet)
+vec4 hitMaterial(uint inst, uint geom) {
+    if (inst != 0u || geom >= 30000u) return vec4(0.0);
+    uint id = geoMat[u.mat.y * 30000u + geom];
+    return id != 0u ? matColor[id].c : vec4(0.0);
+}
 
 vec3 worldAt(ivec2 p, float z) {
     vec2 ndc = (vec2(p) + 0.5) / vec2(u.misc.xy) * 2.0 - 1.0;
@@ -163,6 +179,22 @@ void main() {
     if (z <= 0.0) return;
 
     vec3 P = worldAt(p, z);
+    if ((u.mat.x & 2u) != 0u) {   // view=8: what the rays know about the surface in this pixel (black = no material)
+        vec3 vd = P - u.cam.xyz;
+        float vl = length(vd);
+        rayQueryEXT rm;
+        rayQueryInitializeEXT(rm, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0xFF, u.cam.xyz, 0.0, vd / vl, vl + 1.0);
+        while (rayQueryProceedEXT(rm)) {}
+        vec3 mc = vec3(0.0);
+        if (rayQueryGetIntersectionTypeEXT(rm, true) != gl_RayQueryCommittedIntersectionNoneEXT)
+        {
+            vec4 vm = hitMaterial(rayQueryGetIntersectionInstanceIdEXT(rm, true), rayQueryGetIntersectionGeometryIndexEXT(rm, true));
+            if (vm.w > 0.5) mc = vm.rgb + vec3(0.02, 0.0, 0.02);   // the violet tint tells a dark material from no material
+        }
+        imageStore(uGI, p, vec4(mc, 0.0));
+        imageStore(uSh, p, vec4(1.0));
+        return;
+    }
     vec3 Pr, Pl, Pu, Pd;
     bool okR = neighbour(p + ivec2(1, 0), Pr);
     bool okL = neighbour(p - ivec2(1, 0), Pl);
@@ -240,7 +272,35 @@ void main() {
                 float t = rayQueryGetIntersectionTEXT(rq, true);
                 if (t < aoR) occ += 1.0 - t / aoR;
                 vec3 hp = origin + dir * t;
-                vec3 hc = screenColor(hp, c * 0.5, false);
+                vec3 hc = screenColor(hp, vec3(-1.0), false);
+                if (hc.x < 0.0) {   // off screen: the frame knows nothing about this surface
+                    hc = c * 0.5;
+                    vec4 hm = (u.mat.x & 1u) != 0u ? hitMaterial(rayQueryGetIntersectionInstanceIdEXT(rq, true), rayQueryGetIntersectionGeometryIndexEXT(rq, true)) : vec4(0.0);
+                    if (hm.w > 0.5 && u.sunCol.w > 0.5) {   // light it the way the game's own shaders do: albedo * (sun * N.L * shadow + shade)
+                        vec3 sl = normalize(u.sun.xyz);
+#ifdef POSFETCH
+                        vec3 vp3[3];
+                        rayQueryGetIntersectionTriangleVertexPositionsEXT(rq, true, vp3);
+                        vec3 hn = cross(vp3[1] - vp3[0], vp3[2] - vp3[0]);
+                        float hnl = length(hn);
+                        hn = hnl > 1e-12 ? hn / hnl : -dir;
+                        if (dot(hn, dir) > 0.0) hn = -hn;
+                        float ndl = max(dot(hn, sl), 0.0);
+#else
+                        vec3 hn = -dir;
+                        float ndl = 0.5;   // no triangle data on this GPU
+#endif
+                        float hv = 0.0;
+                        if (ndl > 0.0) {
+                            rayQueryEXT rh;
+                            rayQueryInitializeEXT(rh, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, hp + hn * 0.05, 0.0, sl, 2000.0);
+                            while (rayQueryProceedEXT(rh)) {}
+                            hv = rayQueryGetIntersectionTypeEXT(rh, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+                        }
+                        hc = hm.rgb * (u.sunCol.rgb * ndl * hv + u.ambCol.rgb) * (float(u.mat.z) / 256.0);
+                        if ((u.mat.x & 4u) != 0u) hc = vec3(1.0, 0.0, 0.0);   // view=9: every ray that really uses a material turns red
+                    }
+                }
                 if (multi) {   // + the indirect light that surface received last frame, tinted by its own colour (chroma capped at 1: the series must converge)
                     float hl = dot(hc, vec3(0.2126, 0.7152, 0.0722));
                     hc += min(hc / (hl + 0.02), vec3(1.0)) * prevIndirect(hp) * u.tp.z;
