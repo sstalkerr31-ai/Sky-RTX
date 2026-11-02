@@ -8,3 +8,4 @@ SkyRT_*.log
 SkyRT_shaders/
 SkyRT.cfg
 *.spv
+installer/build/
