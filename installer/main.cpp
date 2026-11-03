@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "imgui.h"
+#include "../layer/skyrt_settings.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #define STB_IMAGE_IMPLEMENTATION
@@ -399,7 +400,7 @@ static ID3D11ShaderResourceView* LoadSprite(int id) {
 
 // ============================================================ the conversation
 enum Pose { Hello, Think, Shock, Cover, Laugh, Dust, Serious, Guilty, Run, Joy, PoseCount };
-enum Screen { ScrHello, ScrInstalling, ScrDone, ScrManage, ScrRemoved, ScrError };
+enum Screen { ScrHello, ScrInstalling, ScrDone, ScrManage, ScrRemoved, ScrError, ScrSettings };
 static Screen g_screen = ScrHello;
 static Pose g_pose = Hello;
 static std::string g_say;
@@ -436,6 +437,151 @@ static void CopyText(const char* s) {
     }
     CloseClipboard();
 }
+
+// ============================================================ settings: every key of SkyRT.cfg, from the one table in skyrt_settings.h
+static float g_set[sizeof(skyrt::kSettings) / sizeof(skyrt::kSettings[0])];
+static const int kSetCount = (int)(sizeof(skyrt::kSettings) / sizeof(skyrt::kSettings[0]));
+static double g_setDirtyAt = -1.0;
+static std::string g_setNote;
+static Screen g_setBack = ScrManage;
+
+static std::wstring CfgPath() { return InstallDir() + L"\\SkyRT.cfg"; }
+static std::string Trim(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
+    return a == std::string::npos ? "" : s.substr(a, b - a + 1);
+}
+// key=value lines of the file in their order; comments dropped
+static std::vector<std::pair<std::string, std::string>> ReadCfg() {
+    std::vector<std::pair<std::string, std::string>> o;
+    const std::string t = ReadText(CfgPath());
+    size_t i = 0;
+    while (i < t.size()) {
+        size_t e = t.find('\n', i);
+        if (e == std::string::npos) e = t.size();
+        std::string line = t.substr(i, e - i);
+        i = e + 1;
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line = line.substr(0, hash);
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = Trim(line.substr(0, eq)), v = Trim(line.substr(eq + 1));
+        if (k.empty()) continue;
+        bool dup = false;
+        for (auto& kv : o) if (kv.first == k) { kv.second = v; dup = true; }   // the layer takes the last value: so do we
+        if (!dup) o.push_back({k, v});
+    }
+    return o;
+}
+static void LoadSettings() {
+    for (int i = 0; i < kSetCount; ++i) g_set[i] = skyrt::kSettings[i].def;
+    for (const auto& kv : ReadCfg())
+        for (int i = 0; i < kSetCount; ++i)
+            if (kv.first == skyrt::kSettings[i].key) g_set[i] = (float)atof(kv.second.c_str());
+}
+static std::string FormatValue(int i) {
+    const skyrt::Setting& s = skyrt::kSettings[i];
+    char b[32];
+    if (s.kind == skyrt::Kind::Float) {
+        snprintf(b, sizeof b, "%.3f", g_set[i]);
+        std::string v = b;
+        while (v.size() > 1 && v.back() == '0') v.pop_back();
+        if (v.back() == '.') v.pop_back();
+        return v;
+    }
+    snprintf(b, sizeof b, "%d", (int)lroundf(g_set[i]));
+    return b;
+}
+// writes every known key and keeps the keys this table does not know (compact: the layer reads only the first 4 KB)
+static bool SaveSettings(std::string& err) {
+    if (g_demo) return true;
+    std::vector<std::pair<std::string, std::string>> kv = ReadCfg();
+    for (int i = 0; i < kSetCount; ++i) {
+        bool found = false;
+        for (auto& e : kv) if (e.first == skyrt::kSettings[i].key) { e.second = FormatValue(i); found = true; }
+        if (!found) kv.push_back({skyrt::kSettings[i].key, FormatValue(i)});
+    }
+    std::string out = "# written by the SkyRT installer - live settings, applied while the game runs\r\n";
+    for (const auto& e : kv) out += e.first + "=" + e.second + "\r\n";
+    const std::wstring tmp = CfgPath() + L".tmp";
+    {
+        std::ofstream f(tmp.c_str(), std::ios::binary | std::ios::trunc);
+        f << out;
+        if (!f) { err = "Не смог записать настройки."; return false; }
+    }
+    if (!MoveFileExW(tmp.c_str(), CfgPath().c_str(), MOVEFILE_REPLACE_EXISTING)) { err = "Не смог сохранить настройки: " + LastError(); return false; }
+    return true;
+}
+static bool SmallButton(const char* t, float w) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.12f, 0.08f, 0.02f, 1.0f));
+    const bool hit = ImGui::Button(t, ImVec2(w, 34));
+    ImGui::PopStyleColor();
+    return hit;
+}
+static void OpenModFolder() {
+    const std::wstring d = InstallDir();
+    if (GetFileAttributesW(d.c_str()) == INVALID_FILE_ATTRIBUTES) { g_setNote = "Папки ещё нет: сначала установите лучи."; return; }
+    ShellExecuteW(nullptr, L"open", d.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+static void DrawSettings() {
+    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.43f, 1.0f), "Настройки лучей");
+    ImGui::TextWrapped("Всё применяется сразу, даже пока игра запущена. Пункты со звёздочкой — после перезапуска игры. Наведи мышку, чтобы прочитать подсказку.");
+    if (g_demo) ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "Режим показа: настройки не сохраняются.");
+    const float gap = ImGui::GetStyle().ItemSpacing.x;
+    const float pw = (ImGui::GetContentRegionAvail().x - gap * 4) / 5.0f;
+    for (const skyrt::Preset& pr : skyrt::kPresets) {
+        if (SmallButton(pr.name, pw)) {
+            for (int k = 0; k < 6 && pr.keys[k]; ++k)
+                for (int i = 0; i < kSetCount; ++i)
+                    if (!strcmp(skyrt::kSettings[i].key, pr.keys[k])) g_set[i] = pr.vals[k];
+            g_setDirtyAt = ImGui::GetTime();
+        }
+        ImGui::SameLine();
+    }
+    if (SmallButton("Сбросить", pw)) { for (int i = 0; i < kSetCount; ++i) g_set[i] = skyrt::kSettings[i].def; g_setDirtyAt = ImGui::GetTime(); }
+    ImGui::BeginChild("##list", ImVec2(0, ImGui::GetContentRegionAvail().y - 46), ImGuiChildFlags_Borders);
+    const char* group = "";
+    bool open = false;
+    for (int i = 0; i < kSetCount; ++i) {
+        const skyrt::Setting& s = skyrt::kSettings[i];
+        if (strcmp(group, s.group)) {
+            group = s.group;
+            const bool first = !strcmp(group, "Главное") || !strcmp(group, "Тени") || !strcmp(group, "Отражённый свет") || !strcmp(group, "Материалы (эксперимент)");
+            open = ImGui::CollapsingHeader(group, first ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+        }
+        if (!open) continue;
+        ImGui::PushID(i);
+        std::string label = std::string(s.label) + (s.live ? "" : " *");
+        bool changed = false;
+        if (s.kind == skyrt::Kind::Bool) {
+            bool b = g_set[i] != 0.0f;
+            if (ImGui::Checkbox(label.c_str(), &b)) { g_set[i] = b ? 1.0f : 0.0f; changed = true; }
+        } else {
+            ImGui::TextUnformatted(label.c_str());
+            ImGui::SetNextItemWidth(-1);
+            if (s.kind == skyrt::Kind::Int) {
+                int v = (int)lroundf(g_set[i]);
+                if (ImGui::SliderInt("##v", &v, (int)s.lo, (int)s.hi)) { g_set[i] = (float)v; changed = true; }
+            } else {
+                changed = ImGui::SliderFloat("##v", &g_set[i], s.lo, s.hi, s.hi - s.lo > 20 ? "%.1f" : "%.2f");
+            }
+        }
+        if (s.hint[0] && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", s.hint);
+        if (changed) g_setDirtyAt = ImGui::GetTime();
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    const float half = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+    if (SmallButton("Открыть папку мода", half)) OpenModFolder();
+    ImGui::SameLine();
+    if (SmallButton("Назад", half)) Go(g_setBack);
+    if (!g_setNote.empty()) ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "%s", g_setNote.c_str());
+    if (g_setDirtyAt >= 0 && ImGui::GetTime() - g_setDirtyAt > 0.3) {   // save shortly after the last change, not on every slider pixel
+        g_setDirtyAt = -1.0;
+        std::string e;
+        g_setNote = SaveSettings(e) ? "" : e;
+    }
+}
+
 static void BrowseGame(HWND hwnd) {
     wchar_t f[MAX_PATH * 2] = L"Sky.exe";
     OPENFILENAMEW o{sizeof o};
@@ -888,6 +1034,8 @@ static void UpdateConversation() {
         Say(Serious, "Лучи уже установлены. Чем могу помочь?");
     } else if (g_screen == ScrRemoved) {
         Say(Cover, "Всё убрал. Мне немножко грустно, но я понимаю.");
+    } else if (g_screen == ScrSettings) {
+        Say(Think, "Подкрутим?");
     }
 }
 
@@ -939,12 +1087,17 @@ static void DrawActions(HWND hwnd) {
         if (BigButton("Для запуска из Steam", half)) { CopyText(kSteamLine); g_note = "Скопировал. Вставьте в Steam: Sky → Свойства → Параметры запуска."; }
         ImGui::SameLine();
         if (BigButton("Где Sky.exe?", half)) BrowseGame(hwnd);
+        if (BigButton("Настройки", half)) { g_setBack = g_screen; LoadSettings(); Go(ScrSettings); }
+        ImGui::SameLine();
+        if (BigButton("Открыть папку мода", half)) OpenModFolder();
         if (g_screen == ScrManage) {
             if (BigButton("Переустановить", half)) { g_removing = false; Go(ScrInstalling); RunJob(DoInstall); }
             ImGui::SameLine();
             if (BigButton("Удалить", half)) { g_removing = true; Go(ScrInstalling); RunJob(DoUninstall); }
         }
         if (!g_note.empty()) ImGui::TextWrapped("%s", g_note.c_str());
+        if (!g_setNote.empty()) ImGui::TextWrapped("%s", g_setNote.c_str());
+    } else if (g_screen == ScrSettings) {
     } else {
         if (g_screen == ScrError && BigButton("Попробовать ещё раз")) { Go(IsCurrent() ? ScrManage : ScrHello); }
         if (BigButton("Закрыть")) PostQuitMessage(0);
@@ -1022,6 +1175,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         g_demo = HasArg(argc, argv, L"--demo") || name.find(L"demo") != std::wstring::npos;
     }
     if (HasArg(argc, argv, L"--selftest")) return SelfTest();
+    if (HasArg(argc, argv, L"--settest")) {   // test: load the cfg, change one value, save
+        LoadSettings();
+        for (int i = 0; i < kSetCount; ++i) if (!strcmp(skyrt::kSettings[i].key, "gistrength")) g_set[i] = 0.5f;
+        std::string e;
+        return SaveSettings(e) ? 0 : 1;
+    }
     bool startUi = true;
     if (HasArg(argc, argv, L"--play") && !g_demo) {
         std::string e;
@@ -1056,8 +1215,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
     ImFontConfig fc;
-    if (FileThere(L"C:\\Windows\\Fonts\\segoeui.ttf")) io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 20.0f, &fc, io.Fonts->GetGlyphRangesCyrillic());
-    else if (FileThere(L"C:\\Windows\\Fonts\\arial.ttf")) io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\arial.ttf", 20.0f, &fc, io.Fonts->GetGlyphRangesCyrillic());
+    static const ImWchar glyphs[] = {0x0020, 0x00FF, 0x0400, 0x052F, 0x2010, 0x2027, 0x2190, 0x2193, 0};   // Latin, Cyrillic, dashes and the ellipsis, arrows
+    if (FileThere(L"C:\\Windows\\Fonts\\segoeui.ttf")) io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 20.0f, &fc, glyphs);
+    else if (FileThere(L"C:\\Windows\\Fonts\\arial.ttf")) io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\arial.ttf", 20.0f, &fc, glyphs);
     ImGui::StyleColorsDark();
     ImGuiStyle& st = ImGui::GetStyle();
     st.FrameRounding = 10.0f; st.WindowRounding = 0.0f; st.WindowBorderSize = 0.0f;
@@ -1083,6 +1243,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (shotScreen == L"manage") g_screen = ScrManage;
     if (shotScreen == L"removed") g_screen = ScrRemoved;
     if (shotScreen == L"hello") g_screen = ScrHello;
+    if (shotScreen == L"settings") { LoadSettings(); g_screen = ScrSettings; }
 
     int frames = 0;
     bool quit = false;
@@ -1116,12 +1277,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         ImGui::SetCursorScreenPos(sp);
         ImGui::InvisibleButton("##luchik", ImVec2(256, 256));
         if (ImGui::IsItemClicked() && ++g_pokes >= 5) { g_pokes = 0; Say(Shock, "Ой! Ну щекотно же… Я тут вообще-то файлы раскладываю."); }
-        DrawBubble(ImVec2(320, 28), ImVec2(ds.x - 350, 170));
-        PrankDrawInside(dl);
-        ImGui::SetCursorScreenPos(ImVec2(320, 222));
-        ImGui::BeginChild("##actions", ImVec2(ds.x - 350, 280));
-        DrawActions(hwnd);
-        ImGui::EndChild();
+        if (g_screen == ScrSettings) {   // the settings take the whole right side
+            ImGui::SetCursorScreenPos(ImVec2(320, 16));
+            ImGui::BeginChild("##settings", ImVec2(ds.x - 336, ds.y - 28));
+            DrawSettings();
+            ImGui::EndChild();
+        } else {
+            DrawBubble(ImVec2(320, 28), ImVec2(ds.x - 350, 170));
+            PrankDrawInside(dl);
+            ImGui::SetCursorScreenPos(ImVec2(320, 222));
+            ImGui::BeginChild("##actions", ImVec2(ds.x - 350, 280));
+            DrawActions(hwnd);
+            ImGui::EndChild();
+        }
         ImGui::End();
         ImGui::Render();
         const float clear[4] = {0.09f, 0.11f, 0.18f, 1.0f};
