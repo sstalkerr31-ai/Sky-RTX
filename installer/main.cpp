@@ -472,35 +472,46 @@ static void DrawBubble(ImVec2 pos, ImVec2 size) {
 }
 
 // ============================================================ the "do not press" button: the progress bar breaks out of the window
-// The bar shakes, a shot rings out, it breaks through the window edge (cracks inside, shards outside) and flies to another monitor:
-// right = 666%, left = -666% (it went "back"), above = a hook and straight up, one monitor = off the screen. It stays there 5 seconds while
-// Лучик peeks out from behind that monitor's edge, then everything comes back. Click-through topmost layered windows carry the bar, the
-// shards and Лучик; the real install keeps running.
+// The bar stays where it is, shakes, a shot rings out, and its continuation stretches out of the window: it breaks the window edge
+// (cracks inside, glass outside) and runs on to another monitor: right = 666%, left = -666% (it went "back"), above = straight up,
+// one monitor = to the screen edge. It stays 5 seconds while Лучик peeks out from behind that monitor's edge, then it pulls back in.
+// Click-through topmost layered windows carry the stretched part, the glass and Лучик; the real install keeps running.
 enum PrankWay { WayRight, WayLeft, WayUp, WayNone };
 struct Prank {
     bool on = false;
     double t0 = 0;
     PrankWay way = WayNone;
-    POINT start{}, target{}, p1{}, crack{};   // screen coordinates; crack = where the bar breaks the window edge
-    POINT crackClient{};
-    RECT tmon{};                              // the monitor the bar flies to (the home monitor when there is none)
+    RECT bar{};                 // the bar in the window, client coordinates
+    POINT clientOrg{};          // screen position of the client area's corner
+    POINT crack{}, crackClient{};
+    LONG from = 0, to = 0;      // the stretched part runs from the window edge to here (x for left/right, y for up)
+    LONG col = 0;               // for up: x of the column (screen)
+    RECT tmon{};                // the monitor it stretches to (the home monitor when there is none)
     int percent = 0, finalPercent = -666;
     bool banged = false;
-    HWND bar = nullptr, shards = nullptr, peek = nullptr;
+    HWND ext = nullptr, shards = nullptr, peek = nullptr;
 };
 static Prank g_prank;
 static const int kBarW = 510, kBarH = 30;
-static const double kShake = 0.6, kHoldFor = 5.0, kBackFor = 0.8;
-static double PrankBreak() { return g_prank.way == WayUp ? 1.3 : kShake; }
-static double PrankArrive() { return g_prank.way == WayUp ? 2.1 : 2.0; }
+static const double kShake = 0.6, kGrow = 1.4, kHoldFor = 5.0, kBackFor = 0.8;
+static double PrankBreak() { return kShake; }
+static double PrankArrive() { return kShake + kGrow; }
 static double PrankReturn() { return PrankArrive() + kHoldFor; }
 static double PrankHome() { return PrankReturn() + kBackFor; }
 static double PrankEnd() { return PrankHome() + 5.2; }
 static double PrankT() { return ImGui::GetTime() - g_prank.t0; }
-static bool PrankBarAway() { return g_prank.on && PrankT() < PrankHome(); }
 static bool PrankLuchikAway() { return g_prank.on && PrankT() >= PrankBreak() && PrankT() < PrankHome(); }
+static float PrankShakeX() { return g_prank.on && PrankT() < kShake ? (float)sin(PrankT() * 70.0) * 3.0f : 0.0f; }
+// how far out the stretched part is, 0..1
+static double PrankReach(double t) {
+    if (t < kShake) return 0.0;
+    if (t < PrankArrive()) { const double k = (t - kShake) / kGrow; return 1.0 - (1.0 - k) * (1.0 - k); }
+    if (t < PrankReturn()) return 1.0;
+    if (t < PrankHome()) { const double k = (t - PrankReturn()) / kBackFor; return 1.0 - k * k; }
+    return 0.0;
+}
 
-static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+static LRESULT CALLBACK ExtProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
@@ -509,19 +520,28 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         HBRUSH key = CreateSolidBrush(RGB(255, 0, 255));
         FillRect(dc, &rc, key);
         DeleteObject(key);
-        HBRUSH g = CreateSolidBrush(RGB(89, 219, 115));
-        HPEN pen = CreatePen(PS_SOLID, 2, RGB(30, 90, 40));
+        HBRUSH g = CreateSolidBrush(RGB(170, 235, 70));   // the light green of the drawing
+        HPEN pen = CreatePen(PS_SOLID, 2, RGB(60, 110, 20));
         HGDIOBJ ob = SelectObject(dc, g), op = SelectObject(dc, pen);
-        RoundRect(dc, 1, 1, rc.right - 1, rc.bottom - 1, 18, 18);
+        Rectangle(dc, 0, 0, rc.right, rc.bottom);
         SelectObject(dc, ob); SelectObject(dc, op);
         DeleteObject(g); DeleteObject(pen);
-        HFONT f = CreateFontW(22, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
-        HGDIOBJ of = SelectObject(dc, f);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(20, 50, 25));
         wchar_t t[32];
         swprintf(t, 32, L"%d%%", g_prank.percent);
-        DrawTextW(dc, t, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(30, 60, 10));
+        const bool up = g_prank.way == WayUp;
+        HFONT f = CreateFontW(22, 0, up ? 900 : 0, up ? 900 : 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+        HGDIOBJ of = SelectObject(dc, f);
+        if (up) {   // written upwards, at the far end
+            SIZE sz{};
+            GetTextExtentPoint32W(dc, t, (int)wcslen(t), &sz);
+            if (rc.bottom > sz.cx + 16) TextOutW(dc, (rc.right - sz.cy) / 2, sz.cx + 10, t, (int)wcslen(t));
+        } else {
+            RECT tr = rc;
+            InflateRect(&tr, -12, 0);
+            DrawTextW(dc, t, -1, &tr, DT_VCENTER | DT_SINGLELINE | (g_prank.way == WayRight ? DT_RIGHT : DT_LEFT));
+        }
         SelectObject(dc, of);
         DeleteObject(f);
         EndPaint(h, &ps);
@@ -641,61 +661,56 @@ static void PrankStart(HWND main, POINT barTopLeft) {
     ClientToScreen(main, &tl);
     ClientToScreen(main, &br);
     Prank& p = g_prank;
-    p = Prank{false, 0, WayNone, barTopLeft, {}, {}, {}, {}, home, 0, -666, false, p.bar, p.shards, p.peek};
-    auto centre = [](const RECT& r) { return POINT{(r.left + r.right) / 2 - kBarW / 2, (r.top + r.bottom) / 2 - kBarH / 2}; };
-    if (up) { p.way = WayUp; p.tmon = *up; p.target = centre(*up); p.finalPercent = 666; }
-    else if (right) { p.way = WayRight; p.tmon = *right; p.target = centre(*right); p.finalPercent = 666; }
-    else if (left) { p.way = WayLeft; p.tmon = *left; p.target = centre(*left); p.finalPercent = -666; }
-    else { p.way = WayNone; p.target = {home.left - kBarW - 400, barTopLeft.y}; p.finalPercent = -666; }
-    const int midY = barTopLeft.y + kBarH / 2;
-    if (p.way == WayUp) {
-        p.p1 = {barTopLeft.x + 160, barTopLeft.y};
-        p.crack = {p.p1.x + kBarW / 2, tl.y};
-        if (p.crack.x > br.x - 20) p.crack.x = br.x - 20;
-    } else if (p.way == WayRight) {
+    const HWND ext = p.ext, shards = p.shards, peek = p.peek;
+    p = Prank{};
+    p.ext = ext; p.shards = shards; p.peek = peek;
+    p.clientOrg = tl;
+    p.bar = {barTopLeft.x - tl.x, barTopLeft.y - tl.y, barTopLeft.x - tl.x + kBarW, barTopLeft.y - tl.y + kBarH};
+    p.tmon = home;
+    const LONG midY = barTopLeft.y + kBarH / 2;
+    auto cx = [](const RECT& r) { return (r.left + r.right) / 2; };
+    auto cy = [](const RECT& r) { return (r.top + r.bottom) / 2; };
+    if (up) {
+        p.way = WayUp; p.tmon = *up; p.finalPercent = 666;
+        p.col = barTopLeft.x + kBarW / 3;
+        p.from = tl.y; p.to = cy(*up);
+        p.crack = {p.col, tl.y};
+    } else if (right) {
+        p.way = WayRight; p.tmon = *right; p.finalPercent = 666;
+        p.from = br.x; p.to = cx(*right);
         p.crack = {br.x, midY};
+    } else if (left) {
+        p.way = WayLeft; p.tmon = *left; p.finalPercent = -666;
+        p.from = tl.x; p.to = cx(*left);
+        p.crack = {tl.x, midY};
     } else {
+        p.way = WayNone; p.finalPercent = -666;
+        p.from = tl.x; p.to = home.left;
         p.crack = {tl.x, midY};
     }
     p.crackClient = {p.crack.x - tl.x, p.crack.y - tl.y};
-    if (!p.bar) p.bar = MakeOverlay(L"SkyRTFlyingBar", BarProc);
+    if (!p.ext) p.ext = MakeOverlay(L"SkyRTStretchedBar", ExtProc);
     if (!p.shards) p.shards = MakeOverlay(L"SkyRTShards", DefWindowProcW);
     if (!p.peek) p.peek = MakeOverlay(L"SkyRTPeek", DefWindowProcW);
-    SetLayeredWindowAttributes(p.bar, RGB(255, 0, 255), 0, LWA_COLORKEY);
+    SetLayeredWindowAttributes(p.ext, RGB(255, 0, 255), 0, LWA_COLORKEY);
     if (g_shot.empty()) MakeShotSound();
     LoadPeekPixels();
     p.percent = (int)(g_job.progress.load() * 100.0f);
-    SetWindowPos(p.bar, HWND_TOPMOST, barTopLeft.x, barTopLeft.y, kBarW, kBarH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     p.t0 = ImGui::GetTime();
     p.on = true;
 }
-static POINT Lerp(POINT a, POINT b, double k) { return {(LONG)(a.x + (b.x - a.x) * k), (LONG)(a.y + (b.y - a.y) * k)}; }
 static void PrankStop() {
-    for (HWND h : {g_prank.bar, g_prank.shards, g_prank.peek}) if (h) ShowWindow(h, SW_HIDE);
+    for (HWND h : {g_prank.ext, g_prank.shards, g_prank.peek}) if (h) ShowWindow(h, SW_HIDE);
     g_prank.on = false;
 }
-
-static POINT PrankBarPos(double t, int real) {
-    Prank& p = g_prank;
-    const double tb = PrankBreak(), ta = PrankArrive(), tr = PrankReturn(), th = PrankHome();
-    if (t < kShake) { p.percent = real; return {(LONG)(p.start.x + sin(t * 70.0) * 3.0), p.start.y}; }   // it stops and shakes
-    if (t < ta) {
-        double u;
-        POINT from = p.start;
-        if (p.way == WayUp && t < tb) {
-            if (t < 0.9) return Lerp(p.start, p.p1, (t - kShake) / 0.3);   // a little to the right...
-            const double a = (t - 0.9) / 0.4 * 6.2831853, R = 90.0;          // ...the hook from the drawing...
-            return {(LONG)(p.p1.x + R * sin(a)), (LONG)(p.p1.y - R + R * cos(a))};
-        }
-        if (p.way == WayUp) from = p.p1;                                     // ...and straight up
-        u = (t - tb) / (ta - tb);
-        p.percent = (int)(real + (p.finalPercent - real) * u);
-        return Lerp(from, p.target, u * u);
-    }
-    if (t < tr) { p.percent = p.finalPercent; return {p.target.x, (LONG)(p.target.y + sin(t * 3.0) * 6.0)}; }
-    const double k = std::min(1.0, (t - tr) / (th - tr));
-    p.percent = (int)(p.finalPercent + (real - p.finalPercent) * k);
-    return Lerp(p.target, p.start, 1.0 - (1.0 - k) * (1.0 - k));
+// the stretched part outside the window, screen coordinates (empty when it is all inside)
+static RECT PrankExtRect(double reach) {
+    const Prank& p = g_prank;
+    const LONG len = (LONG)((p.to - p.from) * reach);
+    if (p.way == WayUp) return RECT{p.col - kBarH / 2, p.from + len, p.col + kBarH / 2, p.from};
+    const LONG y = p.clientOrg.y + p.bar.top;
+    if (len >= 0) return RECT{p.from, y, p.from + len, y + kBarH};
+    return RECT{p.from + len, y, p.from, y + kBarH};
 }
 
 static void PrankShards(double since) {
@@ -707,9 +722,10 @@ static void PrankShards(double since) {
     uint32_t seed = 777;
     auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return ((seed >> 8) & 0xFFFF) / 65535.0f; };
     const float fade = std::max(0.0f, 1.0f - (float)since / 1.3f);
+    if (fade <= 0.0f) { ShowWindow(g_prank.shards, SW_HIDE); return; }
     for (int i = 0; i < 46; ++i) {
         const float sp = 260.0f + rnd() * 520.0f, side = (rnd() - 0.5f) * 1.6f;
-        const float vx = (dx + (dy != 0 ? side : 0)) * sp + (dy == 0 ? 0 : 0), vy = (dy + (dx != 0 ? side : 0)) * sp;
+        const float vx = (dx + (dy != 0 ? side : 0)) * sp, vy = (dy + (dx != 0 ? side : 0)) * sp;
         const float x = S / 2 + vx * (float)since, y = S / 2 + vy * (float)since + 900.0f * (float)(since * since) * 0.5f;
         const int sz = 4 + (int)(rnd() * 8);
         const uint32_t shade = rnd() < 0.5f ? 0xFFDCEBFFu : 0xFF8FA8D8u;   // glass: white-blue and blue
@@ -719,7 +735,6 @@ static void PrankShards(double since) {
             for (int xx = (int)x; xx < (int)x + sz; ++xx)
                 if (xx >= 0 && yy >= 0 && xx < S && yy < S) px[yy * S + xx] = c;
     }
-    if (fade <= 0.0f) { ShowWindow(g_prank.shards, SW_HIDE); return; }
     PushPixels(g_prank.shards, g_prank.crack.x - S / 2, g_prank.crack.y - S / 2, S, S, px.data());
 }
 
@@ -732,11 +747,13 @@ static void PrankPeek(double t) {
     if (t > out1 - 0.6) k = std::min(k, (out1 - t) / 0.6);
     const int show = (int)(160 * (1.0 - (1.0 - k) * (1.0 - k)));   // how far he leans out
     const RECT& m = p.tmon;
+    const LONG barY = p.clientOrg.y + p.bar.top;
+    auto clampY = [&](LONG y) { return std::max<LONG>(m.top, std::min<LONG>(m.bottom - 256, y)); };
     int sx, sy;   // where the whole 256x256 picture would be
-    if (p.way == WayRight) { sx = m.left - 256 + show; sy = std::max<LONG>(m.top, std::min<LONG>(m.bottom - 256, p.target.y - 100)); }
-    else if (p.way == WayLeft) { sx = m.right - show; sy = std::max<LONG>(m.top, std::min<LONG>(m.bottom - 256, p.target.y - 100)); }
-    else if (p.way == WayUp) { sx = p.target.x + kBarW / 2 - 128; sy = m.bottom - show; }
-    else { sx = m.left - 256 + show; sy = std::max<LONG>(m.top, std::min<LONG>(m.bottom - 256, p.start.y - 100)); }
+    if (p.way == WayRight) { sx = m.left - 256 + show; sy = clampY(barY + 60); }
+    else if (p.way == WayLeft) { sx = m.right - show; sy = clampY(barY + 60); }
+    else if (p.way == WayUp) { sx = p.col + 60; sy = m.bottom - show; }
+    else { sx = m.left - 256 + show; sy = clampY(barY + 60); }
     const int x0 = std::max<int>(sx, m.left), y0 = std::max<int>(sy, m.top);
     const int x1 = std::min<int>(sx + 256, m.right), y1 = std::min<int>(sy + 256, m.bottom);
     const int w = x1 - x0, h = y1 - y0;
@@ -746,7 +763,6 @@ static void PrankPeek(double t) {
     PushPixels(p.peek, x0, y0, w, h, crop.data());
 }
 
-// moves everything; returns while the scene runs
 static bool PrankUpdate() {
     if (!g_prank.on) return false;
     const double t = PrankT();
@@ -757,28 +773,41 @@ static bool PrankUpdate() {
     }
     if (g_prank.banged) PrankShards(t - PrankBreak());
     PrankPeek(t);
-    if (t >= PrankHome()) { if (IsWindowVisible(g_prank.bar)) ShowWindow(g_prank.bar, SW_HIDE); return true; }
+    const double reach = PrankReach(t);
     const int real = (int)(g_job.progress.load() * 100.0f);
-    const POINT p = PrankBarPos(t, real);
-    SetWindowPos(g_prank.bar, HWND_TOPMOST, p.x, p.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(g_prank.bar, nullptr, FALSE);
+    g_prank.percent = (int)(real + (g_prank.finalPercent - real) * reach);
+    const RECT r = PrankExtRect(reach);
+    if (r.right - r.left < 2 || r.bottom - r.top < 2) { if (IsWindowVisible(g_prank.ext)) ShowWindow(g_prank.ext, SW_HIDE); }
+    else {
+        SetWindowPos(g_prank.ext, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(g_prank.ext, nullptr, FALSE);
+    }
     if (g_autoPrank) {   // test trace: positions only, never a picture of the user's screen
         wchar_t tmp[MAX_PATH];
         GetTempPathW(MAX_PATH, tmp);
         static FILE* tf = _wfopen((std::wstring(tmp) + L"skyrt_prank.txt").c_str(), L"w");
         RECT pr{};
         if (IsWindowVisible(g_prank.peek)) GetWindowRect(g_prank.peek, &pr);
-        if (tf) { fprintf(tf, "%.2f bar %ld %ld %d peek %ld %ld %ld %ld shards %d\n", t, p.x, p.y, g_prank.percent, pr.left, pr.top, pr.right, pr.bottom, IsWindowVisible(g_prank.shards) ? 1 : 0); fflush(tf); }
+        if (tf) { fprintf(tf, "%.2f ext %ld %ld %ld %ld %d peek %ld %ld %ld %ld shards %d\n", t, r.left, r.top, r.right, r.bottom, g_prank.percent, pr.left, pr.top, pr.right, pr.bottom, IsWindowVisible(g_prank.shards) ? 1 : 0); fflush(tf); }
     }
     return true;
 }
-// the broken window edge: a dark hole with cracks running from it, healing after the bar is back
-static void PrankDrawCracks(ImDrawList* dl) {
+// inside the window: the stretched part between the bar and the broken edge, the hole and the cracks (they heal after it is back)
+static void PrankDrawInside(ImDrawList* dl) {
     if (!g_prank.on || !g_prank.banged) return;
     const double t = PrankT();
-    const float a = t < PrankHome() ? 1.0f : std::max(0.0f, 1.0f - (float)(t - PrankHome()) / 0.8f);
-    if (a <= 0.0f) return;
-    const ImVec2 c((float)g_prank.crackClient.x, (float)g_prank.crackClient.y);
+    const Prank& p = g_prank;
+    if (PrankReach(t) > 0.0) {
+        ImVec2 a, b;
+        if (p.way == WayUp) { const float x = (float)(p.col - p.clientOrg.x); a = ImVec2(x - kBarH / 2, 0); b = ImVec2(x + kBarH / 2, (float)p.bar.top); }
+        else if (p.way == WayRight) { a = ImVec2((float)p.bar.right, (float)p.bar.top); b = ImVec2((float)p.crackClient.x, (float)p.bar.bottom); }
+        else { a = ImVec2((float)p.crackClient.x, (float)p.bar.top); b = ImVec2((float)p.bar.left, (float)p.bar.bottom); }
+        dl->AddRectFilled(a, b, IM_COL32(170, 235, 70, 255));
+        dl->AddRect(a, b, IM_COL32(60, 110, 20, 255), 0.0f, 0, 2.0f);
+    }
+    const float al = t < PrankHome() ? 1.0f : std::max(0.0f, 1.0f - (float)(t - PrankHome()) / 0.8f);
+    if (al <= 0.0f) return;
+    const ImVec2 c((float)p.crackClient.x, (float)p.crackClient.y);
     uint32_t seed = 4242;
     auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return ((seed >> 8) & 0xFFFF) / 65535.0f; };
     ImVec2 hole[14];
@@ -786,15 +815,15 @@ static void PrankDrawCracks(ImDrawList* dl) {
         const float ang = i / 14.0f * 6.2831853f, r = 26.0f + rnd() * 22.0f;
         hole[i] = ImVec2(c.x + cosf(ang) * r, c.y + sinf(ang) * r);
     }
-    dl->AddConvexPolyFilled(hole, 14, IM_COL32(4, 6, 12, (int)(255 * a)));
+    dl->AddConvexPolyFilled(hole, 14, IM_COL32(4, 6, 12, (int)(170 * al)));
     for (int i = 0; i < 11; ++i) {
         float ang = rnd() * 6.2831853f, len = 50.0f + rnd() * 120.0f;
-        ImVec2 p = c;
+        ImVec2 q0 = c;
         for (int s = 0; s < 4; ++s) {
             ang += (rnd() - 0.5f) * 0.8f;
-            const ImVec2 q(p.x + cosf(ang) * len / 4, p.y + sinf(ang) * len / 4);
-            dl->AddLine(p, q, IM_COL32(200, 220, 255, (int)(200 * a)), 2.0f - s * 0.35f);
-            p = q;
+            const ImVec2 q(q0.x + cosf(ang) * len / 4, q0.y + sinf(ang) * len / 4);
+            dl->AddLine(q0, q, IM_COL32(200, 220, 255, (int)(200 * al)), 2.0f - s * 0.35f);
+            q0 = q;
         }
     }
 }
@@ -834,15 +863,10 @@ static void DrawActions(HWND hwnd) {
         ImGui::EndDisabled();
         if (BigButton("Я случайно нажал, выпустите меня")) PostQuitMessage(0);
     } else if (g_screen == ScrInstalling) {
-        const bool away = PrankBarAway();
-        if (away) {   // an empty slot where the bar used to be
-            const ImVec2 a = ImGui::GetCursorScreenPos();
-            ImGui::GetWindowDrawList()->AddRect(a, ImVec2(a.x + ImGui::GetContentRegionAvail().x, a.y + kBarH), IM_COL32(200, 80, 80, 255), 10.0f, 0, 2.0f);
-            ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, kBarH));
-        } else {
-            ImGui::ProgressBar(g_job.progress.load(), ImVec2(-1, kBarH), "");
-        }
-        const ImVec2 barMin = ImGui::GetItemRectMin();
+        const float shake = PrankShakeX();   // the bar stays in place; before the shot it shakes
+        if (shake != 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + shake);
+        ImGui::ProgressBar(g_job.progress.load(), ImVec2(kBarW, kBarH), "");
+        const ImVec2 barMin = ImVec2(ImGui::GetItemRectMin().x - shake, ImGui::GetItemRectMin().y);
         ImGui::Spacing();
         ImGui::BeginDisabled(g_prank.on);
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.80f, 0.20f, 0.20f, 1.0f));
@@ -1058,7 +1082,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         ImGui::InvisibleButton("##luchik", ImVec2(256, 256));
         if (ImGui::IsItemClicked() && ++g_pokes >= 5) { g_pokes = 0; Say(Shock, "Ой! Ну щекотно же… Я тут вообще-то файлы раскладываю."); }
         DrawBubble(ImVec2(320, 28), ImVec2(ds.x - 350, 170));
-        PrankDrawCracks(dl);
+        PrankDrawInside(dl);
         ImGui::SetCursorScreenPos(ImVec2(320, 222));
         ImGui::BeginChild("##actions", ImVec2(ds.x - 350, 280));
         DrawActions(hwnd);
