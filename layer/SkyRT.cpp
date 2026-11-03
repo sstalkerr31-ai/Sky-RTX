@@ -90,7 +90,13 @@ static std::atomic<bool> g_texProbe{false};  // cfg texprobe=1: log which textur
 static std::atomic<bool> g_matAlbedo{false}; // cfg matalbedo=1: off-screen ray hits use the average colour of their material (Ctrl+F9 on/off)
 static bool g_matTrack = false;              // descriptor tracking for materials, decided at start: set before the game creates its textures
 static bool g_matBaked = true;               // cfg matbaked=0: the trace shader reads no vertices, ambient at the hit stays one shade colour
-static const uint64_t kMatBakeVs = 0x80d5b0d5e9f45e34ull;   // RockFaceShMesh: baked light in attributes loc2, loc3
+static const uint64_t kMatBakeVs[] = {0x80d5b0d5e9f45e34ull,    // RockFaceShMesh: baked light in attributes loc2, loc3
+                                      0xa179ffcd45e93352ull,    // GrassSh: the same layout of baked light
+                                      0x56c003f7b5e9b06eull};   // GrassShSkirt (the big grass ground): the same
+static bool IsBakeVs(uint64_t vs) { for (uint64_t k : kMatBakeVs) if (k == vs) return true; return false; }
+// Grass ground is drawn with blending on but writes depth like any solid surface: without it rays fly through the ground.
+static const uint64_t kSolidBlendedVs[] = {0xa179ffcd45e93352ull, 0x56c003f7b5e9b06eull};   // GrassSh, GrassShSkirt
+static bool IsSolidBlended(uint64_t vs) { for (uint64_t k : kSolidBlendedVs) if (k == vs) return true; return false; }
 static float g_matGain = 1.0f;               // cfg matgain: brightness of the material-tinted fallback (1 = same brightness as the old c * 0.5)
 static float g_lodBias = 0.0f;    // cfg: lodbias (negative = sharper textures, e.g. -0.5)
 static float g_giStrength = 0.3f, g_giRange = 30.0f, g_sunSize = 2.5f;  // sun size in degrees (soft shadow penumbra)
@@ -1874,6 +1880,7 @@ struct MatVs { uint64_t vs; uint32_t off; };
 static const MatVs kMatVs[] = {{0x17a63a0f3447fc7cull, 0},     // RockFaceSh
                                {0x80d5b0d5e9f45e34ull, 80},    // RockFaceShMesh
                                {0xa179ffcd45e93352ull, 0},     // GrassSh
+                               {0x56c003f7b5e9b06eull, 0},     // GrassShSkirt
                                {0xeb915f45b31552f8ull, 144},   // SandSh
                                {0x0bbf0e4075f1943eull, 64}};   // SandSh
 static const uint32_t kMatMax = 2048, kMatStride = 256, kMatPerFrame = 8;   // the stride covers any minStorageBufferOffsetAlignment
@@ -3177,7 +3184,7 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         auto pit = d->pipes.find(st.pipe);
         isWater = pit != d->pipes.end() && IsWaterPair(pit->second.vsHash, pit->second.fsHash);
         if (pit != d->pipes.end()) { vsHash = pit->second.vsHash; fsHash = pit->second.fsHash; }
-        if (pit != d->pipes.end() && g_matTrack && vsHash == kMatBakeVs) {
+        if (pit != d->pipes.end() && g_matTrack && IsBakeVs(vsHash)) {
             bool have2 = false, have3 = false;
             uint32_t b3 = 8;
             for (const DeviceData::PipeInfo::Attr& a : pit->second.attrs) {
@@ -3193,7 +3200,8 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
             if (isProp) for (const DeviceData::PipeInfo::Bind& bd : pit->second.binds) if (bd.rate) { propIb = bd.binding; propIstride = bd.stride; }
             if (propIb >= 8 || propIstride < 16) isProp = false;
         }
-        if (pit != d->pipes.end() && (pit->second.opaque || (isWater && g_reflOn)) && (!pit->second.instanced || isProp)) {
+        const bool solid = pit != d->pipes.end() && (pit->second.opaque || (pit->second.depthWrite && g_grass && IsSolidBlended(pit->second.vsHash)));
+        if (pit != d->pipes.end() && (solid || (isWater && g_reflOn)) && (!pit->second.instanced || isProp)) {
             for (const DeviceData::PipeInfo::Attr& a : pit->second.attrs) {
                 if (a.loc != 0 || a.format != (uint32_t)VK_FORMAT_R32G32B32_SFLOAT) continue;
                 for (const DeviceData::PipeInfo::Bind& b : pit->second.binds)
