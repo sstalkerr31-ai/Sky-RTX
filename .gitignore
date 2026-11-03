@@ -9,3 +9,4 @@ SkyRT_shaders/
 SkyRT.cfg
 *.spv
 installer/build/
+tools/levelprobe/levelprobe.exe

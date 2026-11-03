@@ -1,0 +1,12 @@
+SkyRT includes or builds on the following work.
+
+meshoptimizer (third_party/meshoptimizer: meshoptimizer.h, vertexcodec.cpp), v0.24
+  Copyright (c) 2016-2025 Arseny Kapoulkine. MIT License, see third_party/meshoptimizer/LICENSE.md.
+  https://github.com/zeux/meshoptimizer
+
+Level file format (BstBaked.meshes, GEO0 section), used by layer/level_terrain.h
+  The layout was learned from Sky-Export-Tool (MIT, "光遇地图工具套件作者") and the SkyBstbake project it credits
+  (MIT, Copyright (c) 2026 ThatSkyOldServer, https://github.com/ThatSkyOldServer/SkyBstbake).
+  SkyRT's reader is its own C++ code; no code from those projects is included.
+
+Objects.level.bin (TGCL) layout: Stalker 31's own reverse engineering.
