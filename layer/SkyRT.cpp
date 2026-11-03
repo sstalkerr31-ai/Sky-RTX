@@ -106,7 +106,20 @@ static bool IsSolidBlended(uint64_t vs) { for (uint64_t k : kSolidBlendedVs) if 
 // Drawn but never seen: depth-only occlusion meshes (TerrainDepth, VisibilityMeshDraw share this fragment shader) and the sun disc.
 // In the ray scene they cast shadows from nowhere and the sun disc can block the sun itself.
 static const uint64_t kHiddenFs[] = {0x3f130610b7dea335ull, 0xa2356e576d88b590ull};   // TerrainDepth / VisibilityMeshDraw, Sun
-static bool IsHiddenFs(uint64_t fs) { for (uint64_t k : kHiddenFs) if (k == fs) return true; return false; }
+// More of them by name: the game's own shader files are hashed the same way as the shaders it creates, and every fragment shader whose
+// name contains one of the words of cfg hidefs stays out of the ray scene. "NoShadows" is the game's own word for meshes that cast
+// no shadow; clouds, light shafts (DirectionalLighting) and sky decorations are not solid either. A hash shared by several files is
+// hidden only when every one of those names matches.
+struct HiddenSet { std::unordered_set<uint64_t> fs; std::unordered_map<uint64_t, std::string> name; };
+static std::atomic<const HiddenSet*> g_hideSet{nullptr};   // published once per scan, never freed (a few KB)
+static std::atomic<uint32_t> g_hideGen{0};                 // +1 per published scan: the geometry cache starts over
+static std::string g_hideFsCfg = "NoShadows,Cloud,DirectionalLighting,Constellation,MoteAnim";   // cfg hidefs
+static std::string g_hideFsApplied;                        // LoadCfg thread only
+static bool IsHiddenFs(uint64_t fs) {
+    for (uint64_t k : kHiddenFs) if (k == fs) return true;
+    const HiddenSet* s = g_hideSet.load(std::memory_order_acquire);
+    return s && s->fs.count(fs) != 0;
+}
 static float g_matGain = 1.0f;               // cfg matgain: brightness of the material-tinted fallback (1 = same brightness as the old c * 0.5)
 static float g_lodBias = 0.0f;    // cfg: lodbias (negative = sharper textures, e.g. -0.5)
 static float g_giStrength = 0.3f, g_giRange = 30.0f, g_sunSize = 2.5f;  // sun size in degrees (soft shadow penumbra)
@@ -569,6 +582,7 @@ struct DeviceData {
     LevelGpu lvl;                                       // cacheMtx (blasAddr is read when the TLAS is built)
     std::vector<std::pair<uint64_t, LevelGpu>> lvlGrave;   // grounds of earlier levels, freed once no frame in flight can use them
     uint64_t lvlGenSeen = 0;
+    uint32_t hideGenSeen = 0;   // cacheMtx
     bool lvlFailed = false;
     // step 8: trace + composite passes, own result images, per-frame parameter buffers
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
@@ -3322,6 +3336,16 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
             if (isProp) for (const DeviceData::PipeInfo::Bind& bd : pit->second.binds) if (bd.rate) { propIb = bd.binding; propIstride = bd.stride; }
             if (propIb >= 8 || propIstride < 16) isProp = false;
         }
+        if (pit != d->pipes.end() && IsHiddenFs(pit->second.fsHash)) {
+            static std::mutex hm;
+            static std::unordered_set<uint64_t> seen;
+            std::lock_guard<std::mutex> lk(hm);
+            if (seen.insert(pit->second.fsHash).second) {
+                const HiddenSet* hs = g_hideSet.load(std::memory_order_acquire);
+                auto it = hs ? hs->name.find(pit->second.fsHash) : decltype(hs->name.end()){};
+                Logf("rt: drawn but kept out of the ray scene: fs %016llx %s", (unsigned long long)pit->second.fsHash, hs && it != hs->name.end() ? it->second.c_str() : "(built-in list)");
+            }
+        }
         const bool solid = pit != d->pipes.end() && !IsHiddenFs(pit->second.fsHash) &&
                            (pit->second.opaque || (pit->second.depthWrite && g_grass && IsSolidBlended(pit->second.vsHash)));
         if (pit != d->pipes.end() && (solid || (isWater && g_reflOn)) && (!pit->second.instanced || isProp)) {
@@ -3587,6 +3611,63 @@ static void DumpUnitVectors(DeviceData* d, const DeviceData::UboRef& u) {
     }
 }
 
+static void ScanHiddenFs(std::string words) {
+    std::vector<std::string> w;
+    for (size_t a = 0; a <= words.size();) {
+        size_t b = words.find(',', a);
+        if (b == std::string::npos) b = words.size();
+        std::string t = words.substr(a, b - a);
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
+        while (!t.empty() && (t[0] == ' ' || t[0] == '\t')) t.erase(0, 1);
+        if (!t.empty()) w.push_back(t);
+        a = b + 1;
+    }
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring root = exe;
+    root = root.substr(0, root.find_last_of(L"\\/")) + L"\\data\\assets\\";
+    struct Grp { bool all = true; std::string first; int n = 0; };
+    std::unordered_map<uint64_t, Grp> groups;
+    WIN32_FIND_DATAW pk;
+    HANDLE hp = FindFirstFileW((root + L"*").c_str(), &pk);
+    if (hp != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(pk.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || pk.cFileName[0] == L'.') continue;
+            const std::wstring dir = root + pk.cFileName + L"\\Data\\Shaders\\Bin\\";
+            WIN32_FIND_DATAW fd;
+            HANDLE hf = FindFirstFileW((dir + L"*.fs.spv").c_str(), &fd);
+            if (hf == INVALID_HANDLE_VALUE) continue;
+            do {
+                std::vector<uint8_t> data;
+                if (!skylevel::ReadFileAll(dir + fd.cFileName, data)) continue;
+                uint64_t h = 1469598103934665603ull;   // the same FNV-1a over 32-bit words as SkyRT_CreateShaderModule
+                for (size_t i = 0; i + 4 <= data.size(); i += 4) { uint32_t x; memcpy(&x, &data[i], 4); h ^= x; h *= 1099511628211ull; }
+                std::string nm;
+                for (const wchar_t* c = fd.cFileName; *c; ++c) nm += (char)*c;
+                bool match = false;
+                for (const std::string& s : w) if (nm.find(s) != std::string::npos) match = true;
+                Grp& g = groups[h];
+                g.all = g.all && match;
+                if (g.first.empty()) g.first = nm;
+                ++g.n;
+            } while (FindNextFileW(hf, &fd));
+            FindClose(hf);
+        } while (FindNextFileW(hp, &pk));
+        FindClose(hp);
+    }
+    HiddenSet* s = new HiddenSet;
+    std::string list;
+    for (auto& kv : groups)
+        if (kv.second.all && !w.empty()) {
+            s->fs.insert(kv.first);
+            s->name[kv.first] = kv.second.first;
+            if (list.size() < 1500) list += " " + kv.second.first;
+        }
+    g_hideSet.store(s, std::memory_order_release);
+    g_hideGen.fetch_add(1);
+    Logf("rt: hidefs=%s: %zu fragment shaders of %zu stay out of the ray scene:%s", words.c_str(), s->fs.size(), groups.size(), list.c_str());
+}
+
 static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while the game runs
     char path[MAX_PATH];
     ModuleDir(path, sizeof path);
@@ -3678,6 +3759,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "glint")) g_glint = (float)std::max(0.0, std::min(4.0, v));
         else if (!strcmp(key, "dumpshaders")) g_dumpShaders = v != 0.0;
         else if (!strcmp(key, "dyngeo")) g_dynGeo = v != 0.0;
+        else if (!strcmp(key, "hidefs")) { std::string t = sv; while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back(); g_hideFsCfg = t; }
         else if (!strcmp(key, "levelgeo")) g_levelGeo = v != 0.0;
         else if (!strcmp(key, "grass")) g_grass = v != 0.0;
         else if (!strcmp(key, "taa")) g_taa = v != 0.0;
@@ -3702,6 +3784,10 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "matbaked")) g_matBaked = v != 0.0;
         else if (!strcmp(key, "matgain")) g_matGain = (float)std::max(0.0, std::min(8.0, (double)v));
         else if (!strcmp(key, "lodbias")) g_lodBias = (float)std::max(-2.0, std::min(1.0, v));
+    }
+    if (g_hideFsCfg != g_hideFsApplied) {   // (re)scan in the background: about 1200 small files
+        g_hideFsApplied = g_hideFsCfg;
+        std::thread(ScanHiddenFs, g_hideFsCfg).detach();
     }
     if (logIt)
         Logf("rt: settings (SkyRT.cfg): enabled=%d view=%u (%s) | shadows=%d (strength %.2f, sun %.1f deg, %d rays) ao=%d (strength %.2f radius %.2f) gi=%d (strength %.2f range %.0f) hemisphere rays %d | autosun=%d az=%.1f el=%.1f",
@@ -4137,6 +4223,11 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     {
         std::lock_guard<std::mutex> lk(d->cacheMtx);
         const uint64_t fr = d->frames.load();
+        const uint32_t hg = g_hideGen.load();
+        if (hg != d->hideGenSeen) {   // another hidefs list: forget everything cached, the next draws refill it without the hidden shaders
+            if (d->hideGenSeen) { d->geoCache.clear(); d->cacheTris = 0; d->cacheDirty = false; d->cacheForce = true; }
+            d->hideGenSeen = hg;
+        }
         for (size_t i = 0; i < fg.keys.size(); ++i) {
             auto it = d->geoCache.find(fg.keys[i]);
             if (it == d->geoCache.end()) {
