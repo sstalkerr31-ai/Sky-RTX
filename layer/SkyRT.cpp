@@ -98,6 +98,10 @@ static bool IsBakeVs(uint64_t vs) { for (uint64_t k : kMatBakeVs) if (k == vs) r
 // Grass ground is drawn with blending on but writes depth like any solid surface: without it rays fly through the ground.
 static const uint64_t kSolidBlendedVs[] = {0xa179ffcd45e93352ull, 0x56c003f7b5e9b06eull};   // GrassSh, GrassShSkirt
 static bool IsSolidBlended(uint64_t vs) { for (uint64_t k : kSolidBlendedVs) if (k == vs) return true; return false; }
+// Drawn but never seen: depth-only occlusion meshes (TerrainDepth, VisibilityMeshDraw share this fragment shader) and the sun disc.
+// In the ray scene they cast shadows from nowhere and the sun disc can block the sun itself.
+static const uint64_t kHiddenFs[] = {0x3f130610b7dea335ull, 0xa2356e576d88b590ull};   // TerrainDepth / VisibilityMeshDraw, Sun
+static bool IsHiddenFs(uint64_t fs) { for (uint64_t k : kHiddenFs) if (k == fs) return true; return false; }
 static float g_matGain = 1.0f;               // cfg matgain: brightness of the material-tinted fallback (1 = same brightness as the old c * 0.5)
 static float g_lodBias = 0.0f;    // cfg: lodbias (negative = sharper textures, e.g. -0.5)
 static float g_giStrength = 0.3f, g_giRange = 30.0f, g_sunSize = 2.5f;  // sun size in degrees (soft shadow penumbra)
@@ -3300,7 +3304,8 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
             if (isProp) for (const DeviceData::PipeInfo::Bind& bd : pit->second.binds) if (bd.rate) { propIb = bd.binding; propIstride = bd.stride; }
             if (propIb >= 8 || propIstride < 16) isProp = false;
         }
-        const bool solid = pit != d->pipes.end() && (pit->second.opaque || (pit->second.depthWrite && g_grass && IsSolidBlended(pit->second.vsHash)));
+        const bool solid = pit != d->pipes.end() && !IsHiddenFs(pit->second.fsHash) &&
+                           (pit->second.opaque || (pit->second.depthWrite && g_grass && IsSolidBlended(pit->second.vsHash)));
         if (pit != d->pipes.end() && (solid || (isWater && g_reflOn)) && (!pit->second.instanced || isProp)) {
             for (const DeviceData::PipeInfo::Attr& a : pit->second.attrs) {
                 if (a.loc != 0 || a.format != (uint32_t)VK_FORMAT_R32G32B32_SFLOAT) continue;

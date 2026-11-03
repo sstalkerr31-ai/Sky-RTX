@@ -55,7 +55,14 @@ bool frameAt(vec3 wp, out vec3 col) {
     if (u.cam.w > 0.5) ndc.y = -ndc.y;
     vec2 uv = ndc * 0.5 + 0.5;
     if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) return false;
-    col = imageLoad(uFrame, ivec2(uv * vec2(u.misc.xy))).rgb;
+    // bilinear: the water picture is half the frame's size, nearest pixels made the reflection blocky
+    vec2 f = uv * vec2(u.misc.xy) - 0.5;
+    ivec2 i0 = ivec2(floor(f));
+    vec2 w = f - vec2(i0);
+    ivec2 mx = ivec2(u.misc.xy) - 1;
+    vec3 c00 = imageLoad(uFrame, clamp(i0, ivec2(0), mx)).rgb, c10 = imageLoad(uFrame, clamp(i0 + ivec2(1, 0), ivec2(0), mx)).rgb;
+    vec3 c01 = imageLoad(uFrame, clamp(i0 + ivec2(0, 1), ivec2(0), mx)).rgb, c11 = imageLoad(uFrame, clamp(i0 + ivec2(1, 1), ivec2(0), mx)).rgb;
+    col = mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
     return true;
 }
 
