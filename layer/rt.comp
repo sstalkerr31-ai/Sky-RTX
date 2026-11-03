@@ -41,6 +41,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U32
 layout(set = 0, binding = 11, std430) readonly buffer GeoMat { uint geoMat[]; };   // material of every geometry of the static BLAS: [slot * 30000 + geometry index]
 struct MatColor { vec4 c; vec4 pad[15]; };   // 256 bytes: rt_mat.comp writes through a descriptor offset
 layout(set = 0, binding = 12, std430) readonly buffer MatColors { MatColor matColor[]; };
+layout(set = 0, binding = 15, std430) buffer CastHist { uint castHist[]; };   // castprobe: [geometry * 2] hits, [+1] hits closer than 1 m; 30000+ = other instances
 layout(set = 0, binding = 8, rgba16f) uniform image2D uHAp;    // step 22: previous frame accumulated indirect light (read only here)
 layout(set = 0, binding = 9, rgba32f) uniform image2D uHBp;    // previous frame: shadow, depth, sample count
 layout(set = 0, binding = 10, std430) readonly buffer Lights {
@@ -289,7 +290,15 @@ void main() {
             rayQueryEXT rq;
             rayQueryInitializeEXT(rq, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 0.0, dir, 2000.0);
             while (rayQueryProceedEXT(rq)) {}
-            if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) hits += 1.0;
+            if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                hits += 1.0;
+                if ((u.mat.x & 16u) != 0u) {
+                    uint inst = uint(rayQueryGetIntersectionInstanceIdEXT(rq, true));
+                    uint k = inst == 0u ? min(uint(rayQueryGetIntersectionGeometryIndexEXT(rq, true)), 29999u) : 30000u + min(inst, 7u);
+                    atomicAdd(castHist[k * 2u], 1u);
+                    if (rayQueryGetIntersectionTEXT(rq, true) < 1.0) atomicAdd(castHist[k * 2u + 1u], 1u);
+                }
+            }
         }
         vis = 1.0 - hits / float(nS);
     }

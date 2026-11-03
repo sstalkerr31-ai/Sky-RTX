@@ -89,6 +89,7 @@ static int g_bounces = 3;         // step 26: bounces per path in deep mode, 1..
 static int g_ptAdapt = 0;         // cfg ptadapt=1: screenshot mode runs at full quality only while the camera stands still (default 0 = always full)
 static int g_pathTrace = 0;       // step 25: 'path tracing' / screenshot mode: 4x rays per pixel, long accumulation, deeper bounces (cfg pathtrace=0/1, Ctrl+Backspace)
 static int g_grass = 1;           // step 24: grass (non-indexed triangle strips written by the CPU) in the acceleration structure (cfg grass=0/1)
+static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
 static int g_levelGeo = 1;        // the whole level's ground from the game files in the ray scene, also off the screen (cfg levelgeo=0/1)
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
 static int g_aniso = 16;          // step 13: anisotropic filtering forced on every linear sampler (cfg: aniso=0/2/4/8/16)
@@ -115,6 +116,12 @@ static std::atomic<const HiddenSet*> g_hideSet{nullptr};   // published once per
 static std::atomic<uint32_t> g_hideGen{0};                 // +1 per published scan: the geometry cache starts over
 static std::string g_hideFsCfg = "NoShadows,Cloud,DirectionalLighting,Constellation,MoteAnim";   // cfg hidefs
 static std::string g_hideFsApplied;                        // LoadCfg thread only
+static std::string FsName(uint64_t fs) {
+    const HiddenSet* s = g_hideSet.load(std::memory_order_acquire);
+    auto it = s ? s->name.find(fs) : std::unordered_map<uint64_t, std::string>::const_iterator{};
+    if (s && it != s->name.end()) return it->second;
+    char t[24]; snprintf(t, sizeof t, "fs %016llx", (unsigned long long)fs); return t;
+}
 static bool IsHiddenFs(uint64_t fs) {
     for (uint64_t k : kHiddenFs) if (k == fs) return true;
     const HiddenSet* s = g_hideSet.load(std::memory_order_acquire);
@@ -583,6 +590,11 @@ struct DeviceData {
     std::vector<std::pair<uint64_t, LevelGpu>> lvlGrave;   // grounds of earlier levels, freed once no frame in flight can use them
     uint64_t lvlGenSeen = 0;
     uint32_t hideGenSeen = 0;   // cacheMtx
+    std::mutex keyFsMtx;
+    std::unordered_map<GeoKey, uint64_t, GeoKeyHash> keyFs;   // keyFsMtx: fragment shader of every cached geometry (castprobe only)
+    std::vector<GeoKey> slotKeys[8];                           // cacheMtx: geometry order of every AS slot (castprobe only)
+    VkBuffer castBuf = VK_NULL_HANDLE; VkDeviceMemory castMem = VK_NULL_HANDLE; uint32_t* castPtr = nullptr;   // binding 15: shadow-ray hit counts
+    uint64_t castLast = 0;
     bool lvlFailed = false;
     // step 8: trace + composite passes, own result images, per-frame parameter buffers
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
@@ -2652,21 +2664,21 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->paintTried = true;
     g_stage = "EnsurePaintResources";
 
-    VkDescriptorSetLayoutBinding b[15] = {};
-    const VkDescriptorType types[15] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+    VkDescriptorSetLayoutBinding b[16] = {};
+    const VkDescriptorType types[16] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                                        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
-    for (uint32_t i = 0; i < 15; ++i) {
+                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    for (uint32_t i = 0; i < 16; ++i) {
         b[i].binding = i;
         b[i].descriptorType = types[i];
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.bindingCount = 15;
+    dl.bindingCount = 16;
     dl.pBindings = b;
     VkResult r = d->CreateDescriptorSetLayout(d->device, &dl, nullptr, &d->paintDsl);
     if (r != VK_SUCCESS) { Logf("!!! rt: descriptor set layout failed (%d)", (int)r); return false; }
@@ -2689,7 +2701,7 @@ static bool EnsurePaintResources(DeviceData* d) {
 
     VkDescriptorPoolSize ps[5] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 * 8}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32},
                                   {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 32}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32},
-                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 * 4}};
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 * 5}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 32;   // 16 for the trace ring, 16 for the water pass
     pi.poolSizeCount = 5;
@@ -2730,6 +2742,11 @@ static bool EnsurePaintResources(DeviceData* d) {
             !MakeBufEx(d, (VkDeviceSize)kMatMax * kMatStride, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->matColBuf, d->matColMem, da) ||
             d->MapMemory(d->device, d->geoMatMem, 0, VK_WHOLE_SIZE, 0, &gp) != VK_SUCCESS || !gp ||
             d->MapMemory(d->device, d->matColMem, 0, VK_WHOLE_SIZE, 0, &cp) != VK_SUCCESS || !cp) { Logf("!!! rt: material buffers failed"); return false; }
+        void* hp = nullptr;
+        if (!MakeBufEx(d, (VkDeviceSize)(kMaxCacheGeoms + 8) * 2 * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->castBuf, d->castMem, da) ||
+            d->MapMemory(d->device, d->castMem, 0, VK_WHOLE_SIZE, 0, &hp) != VK_SUCCESS || !hp) { Logf("!!! rt: shadow probe buffer failed"); return false; }
+        d->castPtr = (uint32_t*)hp;
+        memset(hp, 0, (size_t)(kMaxCacheGeoms + 8) * 2 * sizeof(uint32_t));
         d->geoMatPtr = (uint32_t*)gp;
         d->matColPtr = (char*)cp;
         memset(gp, 0, (size_t)8 * kMaxCacheGeoms * sizeof(uint32_t));
@@ -2795,17 +2812,17 @@ static bool EnsurePaintResources(DeviceData* d) {
             lw.pBufferInfo = &lbi;
             d->UpdateDescriptorSets(d->device, 1, &lw, 0, nullptr);
         }
-        VkDescriptorBufferInfo mbi[3] = {{d->geoMatBuf, 0, VK_WHOLE_SIZE}, {d->matColBuf, 0, VK_WHOLE_SIZE}, {d->geoVBuf, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet mw[3] = {};
-        for (uint32_t k = 0; k < 3; ++k) {
+        VkDescriptorBufferInfo mbi[4] = {{d->geoMatBuf, 0, VK_WHOLE_SIZE}, {d->matColBuf, 0, VK_WHOLE_SIZE}, {d->geoVBuf, 0, VK_WHOLE_SIZE}, {d->castBuf, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet mw[4] = {};
+        for (uint32_t k = 0; k < 4; ++k) {
             mw[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             mw[k].dstSet = d->paintSets[i];
-            mw[k].dstBinding = 11 + k;
+            mw[k].dstBinding = k < 3 ? 11 + k : 15;
             mw[k].descriptorCount = 1;
             mw[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             mw[k].pBufferInfo = &mbi[k];
         }
-        d->UpdateDescriptorSets(d->device, 3, mw, 0, nullptr);
+        d->UpdateDescriptorSets(d->device, 4, mw, 0, nullptr);
     }
 
     d->paintOk = true;
@@ -3455,6 +3472,7 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         fg.geoms.push_back(g);
         fg.ranges.push_back(rg);
         fg.keys.push_back(GeoKey{st.vb[binding], st.ib, vbase, ibase, c.indexCount, vstride});
+        if (g_castProbe) { std::lock_guard<std::mutex> lk(d->keyFsMtx); d->keyFs[fg.keys.back()] = fsHash; }
         fg.mems.emplace_back(vbi.mem, ibi.mem);
         fg.mats.push_back(matId);
         DeviceData::FrameGeo::Verts fv{};
@@ -3657,10 +3675,10 @@ static void ScanHiddenFs(std::string words) {
     }
     HiddenSet* s = new HiddenSet;
     std::string list;
+    for (auto& kv : groups) s->name[kv.first] = kv.second.first;   // names of all of them, for the logs
     for (auto& kv : groups)
         if (kv.second.all && !w.empty()) {
             s->fs.insert(kv.first);
-            s->name[kv.first] = kv.second.first;
             if (list.size() < 1500) list += " " + kv.second.first;
         }
     g_hideSet.store(s, std::memory_order_release);
@@ -3761,6 +3779,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "dyngeo")) g_dynGeo = v != 0.0;
         else if (!strcmp(key, "hidefs")) { std::string t = sv; while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back(); g_hideFsCfg = t; }
         else if (!strcmp(key, "levelgeo")) g_levelGeo = v != 0.0;
+        else if (!strcmp(key, "castprobe")) g_castProbe = v != 0.0;
         else if (!strcmp(key, "grass")) g_grass = v != 0.0;
         else if (!strcmp(key, "taa")) g_taa = v != 0.0;
         else if (!strcmp(key, "taan")) g_taaN = (float)std::max(1.0, std::min(256.0, v));
@@ -4216,6 +4235,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
     std::vector<uint32_t> geoMats;   // material of every entry of `geoms`
     std::vector<GeoV> geoVs;         // vertex access of every entry of `geoms`
+    std::vector<GeoKey> rebuildKeys; // castprobe: the key of every entry of `geoms`
     uint64_t geoVGenNow = 0;
     uint64_t cacheTrisNow = 0;
     bool rebuild = false;
@@ -4285,6 +4305,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             geoMats.reserve(d->geoCache.size());
             geoVs.reserve(d->geoCache.size());
             for (auto& kv : d->geoCache) { geoms.push_back(kv.second.g); ranges.push_back(kv.second.r); geoMats.push_back(kv.second.mat); geoVs.push_back(kv.second.v); }
+            if (g_castProbe) { rebuildKeys.clear(); for (auto& kv : d->geoCache) rebuildKeys.push_back(kv.first); }
             geoVGenNow = d->geoVGen;
         }
     }
@@ -4316,6 +4337,35 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         set = d->paintSets[ringIdx];
     }
     LevelUpdate(d, cb);
+    if (g_castProbe && d->castPtr && d->frames.load() - d->castLast >= 120) {   // what the sun shadow rays of the last ~2 s ran into
+        d->castLast = d->frames.load();
+        const size_t n = kMaxCacheGeoms + 8;
+        std::vector<std::pair<uint32_t, uint32_t>> top;   // hits, index
+        uint64_t all = 0;
+        for (uint32_t i = 0; i < n; ++i) { const uint32_t c = d->castPtr[i * 2]; if (c) { top.emplace_back(c, i); all += c; } }
+        std::sort(top.begin(), top.end(), [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) { return a.first > b.first; });
+        std::vector<GeoKey> keys;
+        { std::lock_guard<std::mutex> lk(d->cacheMtx); if (d->rtCur >= 0) keys = d->slotKeys[d->rtCur]; }
+        std::string out;
+        for (size_t r = 0; r < top.size() && r < 14; ++r) {
+            const uint32_t i = top[r].second;
+            char t[320];
+            if (i >= kMaxCacheGeoms) {
+                const uint32_t inst = i - (uint32_t)kMaxCacheGeoms;
+                snprintf(t, sizeof t, "\n    %5.1f%%  instance %u (%s)  near<1m %.0f%%", 100.0 * top[r].first / all, inst, inst == 1 ? "level ground or characters" : inst == 2 ? "level ground" : "?", 100.0 * d->castPtr[i * 2 + 1] / top[r].first);
+            } else {
+                uint64_t fs = 0; uint32_t tris = 0, verts = 0;
+                if (i < keys.size()) {
+                    { std::lock_guard<std::mutex> lk(d->keyFsMtx); auto it = d->keyFs.find(keys[i]); if (it != d->keyFs.end()) fs = it->second; }
+                    tris = keys[i].count / 3; verts = keys[i].stride;
+                }
+                snprintf(t, sizeof t, "\n    %5.1f%%  geometry %u: %s, %u tris (vertex stride %u)  near<1m %.0f%%", 100.0 * top[r].first / all, i, fs ? FsName(fs).c_str() : "?", tris, verts, 100.0 * d->castPtr[i * 2 + 1] / top[r].first);
+            }
+            out += t;
+        }
+        if (all) Logf("castprobe: sun shadow ray hits in the last ~2 s: %llu, by what they hit:%s", (unsigned long long)all, out.c_str());
+        memset(d->castPtr, 0, n * 2 * sizeof(uint32_t));
+    }
 
     // ---- (re)build BLAS + TLAS only when the set of geometry changed, otherwise reuse the newest complete slot
     VkAccelerationStructureBuildSizesInfoKHR sz{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
@@ -4419,6 +4469,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         {
             std::lock_guard<std::mutex> lk(d->cacheMtx);
             d->rtCur = idx;
+            if (g_castProbe) d->slotKeys[idx] = rebuildKeys;
         }
         const uint64_t nb = ++d->rtRebuilds;
         if (nb <= 30 || nb % 200 == 0)
@@ -4623,7 +4674,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         default: flagsEff |= 8u; if (lightsOn) flagsEff |= 16u; break;
     }
     const bool matOn = g_matTrack && d->matPipe;
-    par->mat[0] = (matOn && g_matAlbedo.load(std::memory_order_relaxed) ? 1u : 0u) | (matOn && (g_view == 8 || g_view == 10) ? 2u : 0u) | (matOn && g_view == 9 ? 4u : 0u) | (matOn && g_view == 10 ? 8u : 0u);
+    par->mat[0] = (g_castProbe && d->castPtr ? 16u : 0u) | (matOn && g_matAlbedo.load(std::memory_order_relaxed) ? 1u : 0u) | (matOn && (g_view == 8 || g_view == 10) ? 2u : 0u) | (matOn && g_view == 9 ? 4u : 0u) | (matOn && g_view == 10 ? 8u : 0u);
     par->mat[1] = (uint32_t)(slot - d->rtSlots);
     par->mat[2] = (uint32_t)(g_matGain * 256.0f);
     {
