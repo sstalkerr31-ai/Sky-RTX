@@ -3043,7 +3043,7 @@ static int WaterIndex(uint64_t vs, uint64_t fs) {
 }
 static bool IsWaterPair(uint64_t vs, uint64_t fs) { return WaterIndex(vs, fs) >= 0; }
 // ---- step 27: pipeline census (hotkey Ctrl+End): counts every draw of the main pass per shader pair, to find the water / ice / puddle shaders by their hashes
-struct CensusRow { uint64_t draws = 0, items = 0; bool indexed = false, opaque = false, blend = false; uint32_t topo = 0, stride = 0; };
+struct CensusRow { uint64_t draws = 0, items = 0, outside = 0; bool indexed = false, opaque = false, blend = false; uint32_t topo = 0, stride = 0; };
 static std::atomic<int> g_census{0};
 static std::mutex g_censusMtx;
 static std::map<std::pair<uint64_t, uint64_t>, CensusRow> g_censusMap;
@@ -3056,6 +3056,19 @@ static void CensusAdd(DeviceData* d, const DeviceData::CmdState& st, bool indexe
     r.draws++; r.items += items; r.indexed = indexed; r.opaque = pi.opaque; r.blend = pi.blend; r.topo = pi.topology;
     r.stride = pi.binds.empty() ? 0 : pi.binds[0].stride;
 }
+// draws outside the main pass (water, refraction, transparent passes...): the main pass alone never showed any water shader
+static void CensusOther(DeviceData* d, VkCommandBuffer cb, bool indexed) {
+    if (!g_census.load(std::memory_order_relaxed)) return;
+    { std::lock_guard<std::mutex> lk(d->paintMtx); if (d->mainCb.count(cb)) return; }
+    DeviceData::CmdState st{};
+    { std::lock_guard<std::mutex> lk(d->cmdMtx); auto it = d->cmdState.find(cb); if (it == d->cmdState.end()) return; st = it->second; }
+    DeviceData::PipeInfo pi;
+    { std::lock_guard<std::mutex> lk(d->regMtx); auto pit = d->pipes.find(st.pipe); if (pit == d->pipes.end()) return; pi = pit->second; }
+    std::lock_guard<std::mutex> lk(g_censusMtx);
+    CensusRow& r = g_censusMap[{pi.vsHash, pi.fsHash}];
+    r.outside++; r.indexed = indexed; r.opaque = pi.opaque; r.blend = pi.blend; r.topo = pi.topology;
+    r.stride = pi.binds.empty() ? 0 : pi.binds[0].stride;
+}
 static void CensusToggle() {
     if (!g_census.load()) {
         { std::lock_guard<std::mutex> lk(g_censusMtx); g_censusMap.clear(); }
@@ -3066,11 +3079,11 @@ static void CensusToggle() {
     g_census = 0;
     std::vector<std::pair<std::pair<uint64_t, uint64_t>, CensusRow>> rows;
     { std::lock_guard<std::mutex> lk(g_censusMtx); rows.assign(g_censusMap.begin(), g_censusMap.end()); }
-    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
-    Logf("rt: CENSUS done: %zu distinct shader pairs in the main pass", rows.size());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.draws + a.second.outside > b.second.draws + b.second.outside; });
+    Logf("rt: CENSUS done: %zu distinct shader pairs (main pass and all other passes)", rows.size());
     for (const auto& r : rows)
-        Logf("rt: CENSUS vs %016llx fs %016llx | draws %llu items %llu | %s %s topo %u stride %u", (unsigned long long)r.first.first, (unsigned long long)r.first.second,
-             (unsigned long long)r.second.draws, (unsigned long long)r.second.items, r.second.indexed ? "indexed" : "non-indexed",
+        Logf("rt: CENSUS vs %016llx fs %016llx | draws %llu items %llu outside-main %llu | %s %s topo %u stride %u", (unsigned long long)r.first.first, (unsigned long long)r.first.second,
+             (unsigned long long)r.second.draws, (unsigned long long)r.second.items, (unsigned long long)r.second.outside, r.second.indexed ? "indexed" : "non-indexed",
              r.second.opaque ? "opaque" : (r.second.blend ? "blended" : "other"), r.second.topo, r.second.stride);
 }
 
@@ -4826,6 +4839,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDraw(VkCommandBuffer cb, uint32_t ver
     if (!d) return;
     g_cDraw.fetch_add(1, std::memory_order_relaxed);
     TpOnDraw(d, cb);
+    CensusOther(d, cb, false);
     if (g_ppState.load(std::memory_order_relaxed) && PassProbeDraw(d, cb)) return;
     if ((g_probeOn.load(std::memory_order_relaxed) || (g_hide.load(std::memory_order_relaxed) >= 0 || g_hideGroup.load(std::memory_order_relaxed) > 0)) && d->mainCount.load(std::memory_order_relaxed) > 0) {
         bool inMain;
@@ -4916,6 +4930,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDrawIndexed(VkCommandBuffer cb, uint3
     if (!d) return;
     d->drawIndexed.fetch_add(1, std::memory_order_relaxed);
     TpOnDraw(d, cb);
+    CensusOther(d, cb, true);
     if (g_ppState.load(std::memory_order_relaxed) && PassProbeDraw(d, cb)) return;
     if (d->capturing.load(std::memory_order_relaxed)) {
         VkDrawIndexedIndirectCommand c{indexCount, instanceCount, firstIndex, vertexOffset, firstInstance};
@@ -4935,6 +4950,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDrawIndexedIndirect(VkCommandBuffer c
     if (!d) return;
     d->indirectCalls.fetch_add(1, std::memory_order_relaxed);
     TpOnDraw(d, cb);
+    CensusOther(d, cb, true);
     if (g_ppState.load(std::memory_order_relaxed) && PassProbeDraw(d, cb)) return;
     d->indirectSubdraws.fetch_add(drawCount, std::memory_order_relaxed);
     if (d->capturing.load(std::memory_order_relaxed)) {
@@ -4955,6 +4971,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDrawIndexedIndirect(VkCommandBuffer c
 static bool OtherDraw(DeviceData* d, VkCommandBuffer cb, std::atomic<uint64_t>& ctr, const char* what, uint32_t count) {  // true = skip
     ctr.fetch_add(1, std::memory_order_relaxed);
     TpOnDraw(d, cb);
+    CensusOther(d, cb, false);
     if (g_ppState.load(std::memory_order_relaxed) && PassProbeDraw(d, cb)) return true;
     if ((g_probeOn.load(std::memory_order_relaxed) || (g_hide.load(std::memory_order_relaxed) >= 0 || g_hideGroup.load(std::memory_order_relaxed) > 0)) && d->mainCount.load(std::memory_order_relaxed) > 0) {
         bool inMain;
