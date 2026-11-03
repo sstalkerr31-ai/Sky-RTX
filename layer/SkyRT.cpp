@@ -536,6 +536,7 @@ struct DeviceData {
     std::atomic<uint64_t> dynFrames{0}, dynGeomsSum{0}, dynTrisSum{0}, dynSkipped{0}, dynClassified{0};
     std::mutex geoMtx;
     std::unordered_map<VkCommandBuffer, FrameGeo> frameGeo;          // geoMtx
+    FrameGeo waterFg;                                                 // geoMtx: water drawn in its own pass, merged into the next trace pass
     std::atomic<int> mainCount{0};
     bool track = false;                                               // track vertex/index/pipeline binds of every cb
     struct RtSlot {
@@ -3169,9 +3170,15 @@ static void CensusToggle() {
 
 static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer indBuf, VkDeviceSize indOff, uint32_t drawCount,
                      uint32_t stride, const VkDrawIndexedIndirectCommand* direct) {
-    {
-        std::lock_guard<std::mutex> lk(d->paintMtx);
-        if (!d->mainCb.count(cb)) return;
+    bool isMainCb;
+    { std::lock_guard<std::mutex> lk(d->paintMtx); isMainCb = d->mainCb.count(cb) != 0; }
+    if (!isMainCb) {   // outside the main pass only the water is collected: the game draws it in a pass of its own
+        if (!g_reflOn) return;
+        VkPipeline pipe = VK_NULL_HANDLE;
+        { std::lock_guard<std::mutex> lk(d->cmdMtx); auto it = d->cmdState.find(cb); if (it == d->cmdState.end()) return; pipe = it->second.pipe; }
+        std::lock_guard<std::mutex> lk(d->regMtx);
+        auto pit = d->pipes.find(pipe);
+        if (pit == d->pipes.end() || !IsWaterPair(pit->second.vsHash, pit->second.fsHash)) return;
     }
     struct Timer { DeviceData* d; LARGE_INTEGER t0, fq; Timer(DeviceData* dd) : d(dd) { QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); }
                    ~Timer() { LARGE_INTEGER t1; QueryPerformanceCounter(&t1); d->usDraw += (uint64_t)((t1.QuadPart - t0.QuadPart) * 1000000ll / fq.QuadPart); } } timer(d);
@@ -3335,7 +3342,7 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         aa = d->GetBufferDeviceAddress(d->device, &ai);
     }
     std::lock_guard<std::mutex> lk(d->geoMtx);
-    DeviceData::FrameGeo& fg = d->frameGeo[cb];
+    DeviceData::FrameGeo& fg = isMainCb ? d->frameGeo[cb] : d->waterFg;
     fg.draws += indirect ? 1 : 1;
     if (unreadable) { fg.unreadable++; return; }
     if (!bufsOk || !va || !ia) { fg.skipPipe += cmds.size(); return; }
@@ -3877,6 +3884,17 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         std::lock_guard<std::mutex> lk(d->geoMtx);
         auto it = d->frameGeo.find(cb);
         if (it != d->frameGeo.end()) { fg = std::move(it->second); d->frameGeo.erase(it); }
+        DeviceData::FrameGeo& wf = d->waterFg;   // the water from its own pass (static water only: it goes into the cache)
+        if (!wf.keys.empty()) {
+            static std::atomic<int> wl{0};
+            if (wl.fetch_add(1) < 3) Logf("rt: water geometry from its own pass: %zu pieces, %llu triangles (+ %zu CPU-written, not used)", wf.keys.size(), (unsigned long long)wf.tris, wf.dynGeoms.size());
+            for (size_t i = 0; i < wf.keys.size(); ++i) {
+                fg.geoms.push_back(wf.geoms[i]); fg.ranges.push_back(wf.ranges[i]); fg.keys.push_back(wf.keys[i]); fg.mems.push_back(wf.mems[i]);
+                fg.mats.push_back(0); fg.verts.push_back(DeviceData::FrameGeo::Verts{});
+            }
+            fg.tris += wf.tris;
+        }
+        wf = DeviceData::FrameGeo{};
     }
     if (!fg.dynGeoms.empty() && (!g_dynGeo || fg.dynTris > kDynTrisMax)) {   // too much to be characters: treat as ordinary static geometry (cached)
         static std::atomic<int> fl{0};
@@ -5131,7 +5149,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDrawIndexed(VkCommandBuffer cb, uint3
         VkDrawIndexedIndirectCommand c{indexCount, instanceCount, firstIndex, vertexOffset, firstInstance};
         RecordDraw(d, cb, false, VK_NULL_HANDLE, 0, 0, 0, c);
     }
-    if (d->mainCount.load(std::memory_order_relaxed) > 0) {
+    if (d->mainCount.load(std::memory_order_relaxed) > 0 || g_reflOn) {
         VkDrawIndexedIndirectCommand c{indexCount, instanceCount, firstIndex, vertexOffset, firstInstance};
         MainDraw(d, cb, false, VK_NULL_HANDLE, 0, 0, 0, &c);
         if (ShouldHide(d, cb)) return;

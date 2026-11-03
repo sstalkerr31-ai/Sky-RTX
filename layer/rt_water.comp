@@ -88,14 +88,15 @@ void main() {
     float dist = length(toP);
     if (dist < 0.01) return;
     vec3 V = toP / dist;
-    if (V.y > -0.01) return;   // water is always below the eye: anything at or above the horizon (clouds) is not water
-
-    // water is the only thing in this picture that the ray scene does not contain: if a ray from the camera reaches this depth
-    // without hitting anything, the pixel is water; if it hits the world first, it is scenery the game copied in
+    // the water's own geometry is in the ray scene as the only non-opaque geometry: a pixel is water only if the camera ray meets
+    // the water right at this pixel's depth. Clouds, fog and everything else in this picture are left alone.
     rayQueryEXT rc;
-    rayQueryInitializeEXT(rc, uTlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, u.cam.xyz, 0.0, V, dist * 0.985);
-    while (rayQueryProceedEXT(rc)) {}
-    if (rayQueryGetIntersectionTypeEXT(rc, true) != gl_RayQueryCommittedIntersectionNoneEXT) return;
+    rayQueryInitializeEXT(rc, uTlas, gl_RayFlagsCullOpaqueEXT, 0xFF, u.cam.xyz, 0.0, V, dist * 1.06 + 1.0);
+    while (rayQueryProceedEXT(rc)) {
+        if (rayQueryGetIntersectionTypeEXT(rc, false) == gl_RayQueryCandidateIntersectionTriangleEXT) rayQueryConfirmIntersectionEXT(rc);
+    }
+    if (rayQueryGetIntersectionTypeEXT(rc, true) == gl_RayQueryCommittedIntersectionNoneEXT) return;
+    if (abs(rayQueryGetIntersectionTEXT(rc, true) - dist) > max(0.6, dist * 0.04)) return;   // waves move the drawn surface a little
     // and water lies flat
     ivec2 pr = min(p + ivec2(1, 0), sz - 1), pu = min(p + ivec2(0, 1), sz - 1);
     ivec2 pl = max(p - ivec2(1, 0), ivec2(0)), pd = max(p - ivec2(0, 1), ivec2(0));
@@ -114,7 +115,7 @@ void main() {
     if (R.y < 0.0) R.y = -R.y;   // ripples must not send the ray into the water itself
     vec3 refl;
     rayQueryEXT rr;
-    rayQueryInitializeEXT(rr, uTlas, gl_RayFlagsOpaqueEXT, 0xFF, P + N * 0.05, 0.0, R, 3000.0);
+    rayQueryInitializeEXT(rr, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0xFF, P + N * 0.05, 0.0, R, 3000.0);
     while (rayQueryProceedEXT(rr)) {}
     vec3 wc = imageLoad(uWater, p).rgb;
     vec3 sky = skyToward(R, wc);
@@ -125,7 +126,7 @@ void main() {
             if (hm.w > 0.5 && u.sunCol.w > 0.5) {
                 vec3 sl = normalize(u.sun.xyz);
                 rayQueryEXT rs;
-                rayQueryInitializeEXT(rs, uTlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, hp - R * 0.05, 0.0, sl, 2000.0);
+                rayQueryInitializeEXT(rs, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, hp - R * 0.05, 0.0, sl, 2000.0);
                 while (rayQueryProceedEXT(rs)) {}
                 float lit = rayQueryGetIntersectionTypeEXT(rs, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 0.5 : 0.0;   // no normal here: half of N.L on average
                 refl = hm.rgb * (u.sunCol.rgb * lit + u.ambCol.rgb) * (float(u.mat.z) / 256.0);
