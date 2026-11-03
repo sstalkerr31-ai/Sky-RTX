@@ -1429,10 +1429,18 @@ static void ProbeBuffers(DeviceData* d) {
 }
 
 // ============================================================ frame capture
+// water probe: which render pass every command buffer is in, and the images of the last main pass
+struct WaterCbPass { VkRenderPass rp; VkFramebuffer fb; uint32_t w, h; int index; };
+static std::mutex g_cbPassMtx;
+static std::unordered_map<VkCommandBuffer, WaterCbPass> g_waterCbPass;
+static std::unordered_map<VkCommandBuffer, int> g_cbPassCount;   // passes begun in this command buffer since it began
+static std::atomic<VkImage> g_lastMainColor{VK_NULL_HANDLE}, g_lastMainDepth{VK_NULL_HANDLE};
+static std::atomic<VkCommandBuffer> g_lastMainCb{VK_NULL_HANDLE};
 static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_BeginCommandBuffer(VkCommandBuffer cb,
                                                                const VkCommandBufferBeginInfo* pBeginInfo) {
     DeviceData* d = GetDev(Key(cb));
     if (!d) return VK_ERROR_INITIALIZATION_FAILED;
+    { std::lock_guard<std::mutex> lk(g_cbPassMtx); g_cbPassCount.erase(cb); g_waterCbPass.erase(cb); }
     if (d->capturing.load(std::memory_order_relaxed) || d->track) {
         std::lock_guard<std::mutex> lk(d->cmdMtx);
         d->cmdState.erase(cb);
@@ -2188,6 +2196,10 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdBeginRenderPass(VkCommandBuffer cb, c
                                                pBegin->renderArea.extent.height, cb, n, n, true});
     }
     PassProbeBegin(cb, pBegin);
+    if (pBegin) {
+        std::lock_guard<std::mutex> lk(g_cbPassMtx);
+        g_waterCbPass[cb] = WaterCbPass{pBegin->renderPass, pBegin->framebuffer, pBegin->renderArea.extent.width, pBegin->renderArea.extent.height, g_cbPassCount[cb]++};
+    }
     d->CmdBeginRenderPass(cb, pBegin, contents);
     MainPassBegin(d, cb, pBegin);
 }
@@ -2205,6 +2217,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdEndRenderPass(VkCommandBuffer cb) {
             }
         }
     }
+    { std::lock_guard<std::mutex> lk(g_cbPassMtx); g_waterCbPass.erase(cb); }
     d->CmdEndRenderPass(cb);
     MainPassEnd(d, cb);
 }
@@ -3056,6 +3069,51 @@ static void CensusAdd(DeviceData* d, const DeviceData::CmdState& st, bool indexe
     r.draws++; r.items += items; r.indexed = indexed; r.opaque = pi.opaque; r.blend = pi.blend; r.topo = pi.topology;
     r.stride = pi.binds.empty() ? 0 : pi.binds[0].stride;
 }
+// water probe: logs where the water (Ocean / OceanMesh / ice) is drawn: which render pass, which images, which command buffer
+static void WaterPassProbe(DeviceData* d, VkCommandBuffer cb) {
+    static std::atomic<int> logs{0};
+    if (logs.load(std::memory_order_relaxed) >= 4) return;
+    DeviceData::CmdState st{};
+    { std::lock_guard<std::mutex> lk(d->cmdMtx); auto it = d->cmdState.find(cb); if (it == d->cmdState.end()) return; st = it->second; }
+    uint64_t vs = 0, fs = 0;
+    { std::lock_guard<std::mutex> lk(d->regMtx); auto pit = d->pipes.find(st.pipe); if (pit == d->pipes.end()) return; vs = pit->second.vsHash; fs = pit->second.fsHash; }
+    const int wi = WaterIndex(vs, fs);
+    if (wi < 0) return;
+    { std::lock_guard<std::mutex> lk(d->paintMtx); if (d->mainCb.count(cb)) return; }   // the main pass is known: only the other passes are interesting
+    if (logs.fetch_add(1) >= 4) return;
+    WaterCbPass cp{};
+    bool inPass = false;
+    { std::lock_guard<std::mutex> lk(g_cbPassMtx); auto it = g_waterCbPass.find(cb); if (it != g_waterCbPass.end()) { cp = it->second; inPass = true; } }
+    std::string atts;
+    if (inPass) {
+        std::lock_guard<std::mutex> lk(d->regMtx);
+        auto rit = d->rps.find(cp.rp);
+        auto fit = d->fbs.find(cp.fb);
+        const size_t n = rit != d->rps.end() ? rit->second.size() : 0;
+        for (size_t i = 0; i < n; ++i) {
+            const DeviceData::AttInfo& a = rit->second[i];
+            char b[256];
+            VkImage img = VK_NULL_HANDLE;
+            uint32_t iw = 0, ih = 0;
+            if (fit != d->fbs.end() && i < fit->second.views.size()) {
+                auto vit = d->views.find(fit->second.views[i]);
+                if (vit != d->views.end()) {
+                    img = vit->second.image;
+                    auto iit = d->imgs.find(img);
+                    if (iit != d->imgs.end()) { iw = iit->second.w; ih = iit->second.h; }
+                }
+            }
+            const char* same = img && img == g_lastMainColor.load() ? " = MAIN COLOUR" : img && img == g_lastMainDepth.load() ? " = MAIN DEPTH" : "";
+            snprintf(b, sizeof b, " | att%zu %s load %s store %s image %p %ux%u%s", i, FormatName(a.format), LoadOpStr((int)a.loadOp), StoreOpStr((int)a.storeOp), (void*)img, iw, ih, same);
+            atts += b;
+        }
+        if (!n) atts = " | render pass not tracked";
+    } else {
+        atts = " | not inside a render pass (dynamic rendering?)";
+    }
+    Logf("rt: WATER PASS: %s drawn outside the main pass | pass #%d of its command buffer, area %ux%u | same command buffer as the main pass: %s%s",
+         kWaterNames[wi], cp.index, cp.w, cp.h, cb == g_lastMainCb.load() ? "yes" : "no", atts.c_str());
+}
 // draws outside the main pass (water, refraction, transparent passes...): the main pass alone never showed any water shader
 static void CensusOther(DeviceData* d, VkCommandBuffer cb, bool indexed) {
     if (!g_census.load(std::memory_order_relaxed)) return;
@@ -3730,6 +3788,7 @@ static void MainPassBegin(DeviceData* d, VkCommandBuffer cb, const VkRenderPassB
         return;
     }
     std::lock_guard<std::mutex> lk(d->paintMtx);
+    g_lastMainColor = color; g_lastMainDepth = depth; g_lastMainCb = cb;
     if (d->mainCb.emplace(cb, DeviceData::MainCb{color, depth, w, h}).second) d->mainCount++;
     else d->mainCb[cb] = DeviceData::MainCb{color, depth, w, h};
 }
@@ -4840,6 +4899,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDraw(VkCommandBuffer cb, uint32_t ver
     g_cDraw.fetch_add(1, std::memory_order_relaxed);
     TpOnDraw(d, cb);
     CensusOther(d, cb, false);
+    WaterPassProbe(d, cb);
     if (g_ppState.load(std::memory_order_relaxed) && PassProbeDraw(d, cb)) return;
     if ((g_probeOn.load(std::memory_order_relaxed) || (g_hide.load(std::memory_order_relaxed) >= 0 || g_hideGroup.load(std::memory_order_relaxed) > 0)) && d->mainCount.load(std::memory_order_relaxed) > 0) {
         bool inMain;
@@ -4931,6 +4991,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDrawIndexed(VkCommandBuffer cb, uint3
     d->drawIndexed.fetch_add(1, std::memory_order_relaxed);
     TpOnDraw(d, cb);
     CensusOther(d, cb, true);
+    WaterPassProbe(d, cb);
     if (g_ppState.load(std::memory_order_relaxed) && PassProbeDraw(d, cb)) return;
     if (d->capturing.load(std::memory_order_relaxed)) {
         VkDrawIndexedIndirectCommand c{indexCount, instanceCount, firstIndex, vertexOffset, firstInstance};
@@ -4951,6 +5012,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdDrawIndexedIndirect(VkCommandBuffer c
     d->indirectCalls.fetch_add(1, std::memory_order_relaxed);
     TpOnDraw(d, cb);
     CensusOther(d, cb, true);
+    WaterPassProbe(d, cb);
     if (g_ppState.load(std::memory_order_relaxed) && PassProbeDraw(d, cb)) return;
     d->indirectSubdraws.fetch_add(drawCount, std::memory_order_relaxed);
     if (d->capturing.load(std::memory_order_relaxed)) {
@@ -4972,6 +5034,7 @@ static bool OtherDraw(DeviceData* d, VkCommandBuffer cb, std::atomic<uint64_t>& 
     ctr.fetch_add(1, std::memory_order_relaxed);
     TpOnDraw(d, cb);
     CensusOther(d, cb, false);
+    WaterPassProbe(d, cb);
     if (g_ppState.load(std::memory_order_relaxed) && PassProbeDraw(d, cb)) return true;
     if ((g_probeOn.load(std::memory_order_relaxed) || (g_hide.load(std::memory_order_relaxed) >= 0 || g_hideGroup.load(std::memory_order_relaxed) > 0)) && d->mainCount.load(std::memory_order_relaxed) > 0) {
         bool inMain;
