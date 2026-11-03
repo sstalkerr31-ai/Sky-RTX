@@ -39,6 +39,7 @@
 #include "rtdeep_spv.h"  // SPIR-V of rt_deep.comp (generated): trace pass with several bounces (step 26)
 #include "rtlmerge_spv.h"  // SPIR-V of rt_lmerge.comp (generated): persistent light list (step 23)
 #include "rtmat_spv.h"  // SPIR-V of rt_mat.comp (generated): average colour of a material
+#include "rtwater_spv.h"  // SPIR-V of rt_water.comp (generated): reflections on the game's water picture
 #include "rtpf_spv.h"   // SPIR-V of rt.comp with -DPOSFETCH (generated): trace pass for GPUs with position fetch
 
 // ============================================================ config
@@ -561,6 +562,12 @@ struct DeviceData {
     VkImage giImg = VK_NULL_HANDLE, shImg = VK_NULL_HANDLE;
     VkDeviceMemory giMem = VK_NULL_HANDLE, shMem = VK_NULL_HANDLE;
     VkImageView giView = VK_NULL_HANDLE, shView = VK_NULL_HANDLE;
+    VkImage cpImg = VK_NULL_HANDLE; VkDeviceMemory cpMem = VK_NULL_HANDLE; VkImageView cpView = VK_NULL_HANDLE;   // copy of the game's frame (for the water)
+    VkPipeline waterPipe = VK_NULL_HANDLE;
+    VkDescriptorSet waterSets[16] = {};   // a ring as long as the trace pass's: a set is not rewritten while a frame in flight uses it
+    uint32_t waterRing = 0;
+    VkAccelerationStructureKHR lastTlas = VK_NULL_HANDLE;   // the TLAS and parameter buffer of the last trace pass, for the water pass
+    uint32_t lastParRing = 0;
     uint32_t fxW = 0, fxH = 0;
     VkImage hImg[4] = {};            // step 20: history A0,A1 (rgba16f) and B0,B1 (rgba32f), ping-pong
     VkDeviceMemory hMem[4] = {};
@@ -1430,7 +1437,7 @@ static void ProbeBuffers(DeviceData* d) {
 
 // ============================================================ frame capture
 // water probe: which render pass every command buffer is in, and the images of the last main pass
-struct WaterCbPass { VkRenderPass rp; VkFramebuffer fb; uint32_t w, h; int index; };
+struct WaterCbPass { VkRenderPass rp; VkFramebuffer fb; uint32_t w, h; int index; bool hadWater; };
 static std::mutex g_cbPassMtx;
 static std::unordered_map<VkCommandBuffer, WaterCbPass> g_waterCbPass;
 static std::unordered_map<VkCommandBuffer, int> g_cbPassCount;   // passes begun in this command buffer since it began
@@ -2117,6 +2124,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateRenderPass2(VkDevice device, c
 
 static void MainPassBegin(DeviceData* d, VkCommandBuffer cb, const VkRenderPassBeginInfo* pBegin);
 static void MainPassEnd(DeviceData* d, VkCommandBuffer cb);
+static void InjectWater(DeviceData* d, VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb);
 
 // ---- step 11.1 pass probe: Ctrl+Delete collects the render passes that draw, then hides them one by one (find the water pass)
 struct PassProbe { VkRenderPass rp; uint32_t w, h; uint64_t draws; std::string desc; };
@@ -2217,9 +2225,15 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdEndRenderPass(VkCommandBuffer cb) {
             }
         }
     }
-    { std::lock_guard<std::mutex> lk(g_cbPassMtx); g_waterCbPass.erase(cb); }
+    WaterCbPass wp{};
+    {
+        std::lock_guard<std::mutex> lk(g_cbPassMtx);
+        auto it = g_waterCbPass.find(cb);
+        if (it != g_waterCbPass.end()) { wp = it->second; g_waterCbPass.erase(it); }
+    }
     d->CmdEndRenderPass(cb);
     MainPassEnd(d, cb);
+    if (wp.hadWater && g_reflOn && g_enabled) InjectWater(d, cb, wp.rp, wp.fb);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateImageView(VkDevice device, const VkImageViewCreateInfo* pCreateInfo,
@@ -2602,20 +2616,21 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->paintTried = true;
     g_stage = "EnsurePaintResources";
 
-    VkDescriptorSetLayoutBinding b[14] = {};
-    const VkDescriptorType types[14] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+    VkDescriptorSetLayoutBinding b[15] = {};
+    const VkDescriptorType types[15] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                                        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-    for (uint32_t i = 0; i < 14; ++i) {
+                                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    for (uint32_t i = 0; i < 15; ++i) {
         b[i].binding = i;
         b[i].descriptorType = types[i];
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.bindingCount = 14;
+    dl.bindingCount = 15;
     dl.pBindings = b;
     VkResult r = d->CreateDescriptorSetLayout(d->device, &dl, nullptr, &d->paintDsl);
     if (r != VK_SUCCESS) { Logf("!!! rt: descriptor set layout failed (%d)", (int)r); return false; }
@@ -2629,17 +2644,18 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->paintPipe = d->posFetch ? MakeComputePipe(d, kRtPfSpv, sizeof(kRtPfSpv), "trace") : MakeComputePipe(d, kRtSpv, sizeof(kRtSpv), "trace");   // with position fetch the hit normal is real
     d->fxPipe = MakeComputePipe(d, kRtFxSpv, sizeof(kRtFxSpv), "composite");
     if (!d->paintPipe || !d->fxPipe) return false;
-    if (d->posFetch) d->deepPipe = MakeComputePipe(d, kRtDeepSpv, sizeof(kRtDeepSpv), "deep trace");   // optional: without it the deep bounce mode is unavailable
+    if (d->posFetch) d->deepPipe = MakeComputePipe(d, kRtDeepSpv, sizeof(kRtDeepSpv), "deep trace");
+    d->waterPipe = MakeComputePipe(d, kRtWaterSpv, sizeof(kRtWaterSpv), "water reflections");   // optional   // optional: without it the deep bounce mode is unavailable
     Logf("rt: deep bounce mode %s", d->deepPipe ? "available (Ctrl+] on/off, Ctrl+Up/Down = bounces)" : "unavailable (GPU/driver lacks position fetch)");
     d->lightPipe = MakeComputePipe(d, kRtLightSpv, sizeof(kRtLightSpv), "lights");   // optional: without it the emissive light is simply off
     d->lmergePipe = MakeComputePipe(d, kRtLMergeSpv, sizeof(kRtLMergeSpv), "light merge");
     if (!d->lmergePipe) d->lightPipe = VK_NULL_HANDLE;
 
-    VkDescriptorPoolSize ps[5] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 * 7}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16},
-                                  {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16},
-                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 4}};
+    VkDescriptorPoolSize ps[5] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 * 8}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32},
+                                  {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 32}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32},
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 * 4}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pi.maxSets = 16;
+    pi.maxSets = 32;   // 16 for the trace ring, 16 for the water pass
     pi.poolSizeCount = 5;
     pi.pPoolSizes = ps;
     r = d->CreateDescriptorPool(d->device, &pi, nullptr, &d->paintPool);
@@ -2651,6 +2667,7 @@ static bool EnsurePaintResources(DeviceData* d) {
     ai.descriptorSetCount = 16;
     ai.pSetLayouts = layouts;
     r = d->AllocateDescriptorSets(d->device, &ai, d->paintSets);
+    if (r == VK_SUCCESS) { ai.descriptorSetCount = 16; if (d->AllocateDescriptorSets(d->device, &ai, d->waterSets) != VK_SUCCESS) d->waterSets[0] = VK_NULL_HANDLE; }
     if (r != VK_SUCCESS) { Logf("!!! rt: descriptor sets failed (%d)", (int)r); return false; }
 
     {   // step 21: the light list (device local) and a tiny host-visible buffer the header is copied to for the log
@@ -2812,6 +2829,11 @@ static bool EnsureFxImages(DeviceData* d, uint32_t w, uint32_t h) {
     }
     d->giImg = gi; d->giMem = gm; d->giView = gv;
     d->shImg = sh; d->shMem = sm; d->shView = sv;
+    {
+        VkImage ci = VK_NULL_HANDLE; VkDeviceMemory cm = VK_NULL_HANDLE; VkImageView cv = VK_NULL_HANDLE;
+        if (make(VK_FORMAT_R16G16B16A16_SFLOAT, ci, cm, cv)) { d->cpImg = ci; d->cpMem = cm; d->cpView = cv; }
+        else { Logf("!!! rt: could not create the frame copy - water reflections disabled"); d->cpImg = VK_NULL_HANDLE; d->cpView = VK_NULL_HANDLE; }
+    }
     d->fxW = w;
     d->fxH = h;
     Logf("rt: result images ready (%ux%u: RGBA16F bounce+AO, R32F shadow)", w, h);
@@ -3072,7 +3094,6 @@ static void CensusAdd(DeviceData* d, const DeviceData::CmdState& st, bool indexe
 // water probe: logs where the water (Ocean / OceanMesh / ice) is drawn: which render pass, which images, which command buffer
 static void WaterPassProbe(DeviceData* d, VkCommandBuffer cb) {
     static std::atomic<int> logs{0};
-    if (logs.load(std::memory_order_relaxed) >= 4) return;
     DeviceData::CmdState st{};
     { std::lock_guard<std::mutex> lk(d->cmdMtx); auto it = d->cmdState.find(cb); if (it == d->cmdState.end()) return; st = it->second; }
     uint64_t vs = 0, fs = 0;
@@ -3080,6 +3101,7 @@ static void WaterPassProbe(DeviceData* d, VkCommandBuffer cb) {
     const int wi = WaterIndex(vs, fs);
     if (wi < 0) return;
     { std::lock_guard<std::mutex> lk(d->paintMtx); if (d->mainCb.count(cb)) return; }   // the main pass is known: only the other passes are interesting
+    { std::lock_guard<std::mutex> lk(g_cbPassMtx); auto it = g_waterCbPass.find(cb); if (it != g_waterCbPass.end()) it->second.hadWater = true; }   // reflections go in after this pass
     if (logs.fetch_add(1) >= 4) return;
     WaterCbPass cp{};
     bool inPass = false;
@@ -4307,7 +4329,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     par->flags[0] = flagsEff;
     par->flags[1] = (uint32_t)(ptFull ? std::min(32, g_shRays * 4) : g_shRays);
     par->flags[2] = (uint32_t)(ptFull ? std::min(32, g_aoRays * 4) : (deepOn ? std::min(32, g_aoRays * 2) : g_aoRays));   // deep mode: twice the paths
-    par->flags[3] = g_reflOn ? 1u : 0u;
+    par->flags[3] = 0;   // the old in-pass water path took the ground for water; reflections now run after the game's water pass
     par->fx[0] = g_aoStrength; par->fx[1] = g_aoRadius; par->fx[2] = g_giStrength; par->fx[3] = ptFull ? std::max(g_giRange, 100.0f) : g_giRange;
     memcpy(par->pvp, d->prevVp, sizeof par->pvp);
     par->tp[0] = useHist ? 1.0f : 0.0f; par->tp[1] = ptFull ? std::max(g_taaN, 256.0f) : g_taaN; par->tp[2] = useHist ? (ptFull ? std::max(g_giMulti, 0.5f) : g_giMulti) : 0.0f; par->tp[3] = g_lightMax;
@@ -4317,7 +4339,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
 
     {
         std::lock_guard<std::mutex> lk(d->paintMtx);
-        VkDescriptorImageInfo ii[8] = {};
+        VkDescriptorImageInfo ii[9] = {};
         ii[0].imageView = cv;  ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         ii[1].imageView = dv;  ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         ii[2].imageView = giV; ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -4330,25 +4352,27 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         ii[5].imageView = taaOn ? d->hView[2 + hc] : shV;  ii[5].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         ii[6].imageView = taaOn ? d->hView[hp] : giV;      ii[6].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         ii[7].imageView = taaOn ? d->hView[2 + hp] : shV;  ii[7].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkWriteDescriptorSet w[9] = {};
-        const uint32_t bind[9] = {0, 1, 3, 4, 6, 7, 8, 9, 2};
-        const VkDescriptorType wt[9] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        ii[8].imageView = d->cpView ? d->cpView : giV; ii[8].imageLayout = VK_IMAGE_LAYOUT_GENERAL;   // the frame copy (a dummy without it)
+        VkWriteDescriptorSet w[10] = {};
+        const uint32_t bind[10] = {0, 1, 3, 4, 6, 7, 8, 9, 14, 2};
+        const VkDescriptorType wt[10] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR};
-        for (int i = 0; i < 9; ++i) {
+                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR};
+        for (int i = 0; i < 10; ++i) {
             w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w[i].dstSet = set;
             w[i].dstBinding = bind[i];
             w[i].descriptorCount = 1;
             w[i].descriptorType = wt[i];
-            if (i < 8) w[i].pImageInfo = &ii[i]; else w[i].pNext = &asw;
+            if (i < 9) w[i].pImageInfo = &ii[i]; else w[i].pNext = &asw;
         }
-        d->UpdateDescriptorSets(d->device, 9, w, 0, nullptr);
+        d->UpdateDescriptorSets(d->device, 10, w, 0, nullptr);
     }
 
     // the render pass left the color image in SHADER_READ_ONLY and the depth image in GENERAL (see the log)
-    VkImageMemoryBarrier pre[4] = {};
-    for (int i = 0; i < 4; ++i) {
+    VkImageMemoryBarrier pre[5] = {};
+    for (int i = 0; i < 5; ++i) {
         pre[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         pre[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         pre[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -4372,13 +4396,16 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     pre[2].image = giI;
     pre[3] = pre[2];
     pre[3].image = shI;
+    pre[4] = pre[2];
+    pre[4].image = d->cpImg;
+    const uint32_t preN = d->cpImg ? 5u : 4u;
     VkMemoryBarrier hmb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};   // step 22: the trace pass reads the history the previous frame's composite wrote
     hmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     hmb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     d->CmdPipelineBarrier(cb,
                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &hmb, 0, nullptr, 4, pre);
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &hmb, 0, nullptr, preN, pre);
 
     if (matOn) MatAverage(d, cb, fg.mats);
 
@@ -4475,6 +4502,8 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
                           nullptr, 1, &post);
 
+    d->lastTlas = traceTlas;
+    d->lastParRing = ringIdx;
     if (taaOn) {   // this frame's output becomes the next frame's history
         memcpy(d->prevVp, vp, sizeof d->prevVp);
         d->histCur ^= 1u;
@@ -4518,6 +4547,97 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         DumpUnitVectors(d, ubo);
         Logf("rt: controls: Ctrl+Home = ray tracing on/off, Ctrl+End = shader census (debug); everything else in SkyRT.cfg next to the DLL (applied live)");
     }
+}
+
+
+// ---- water reflections: right after the game's water pass, on the picture the water was drawn into (half resolution)
+static void InjectWater(DeviceData* d, VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb) {
+    g_stage = "InjectWater";
+    VkImage col = VK_NULL_HANDLE, dep = VK_NULL_HANDLE;
+    uint32_t colFinal = 0, depFinal = 0, w = 0, h = 0;
+    bool ok = false;
+    static std::atomic<int> logs{0};
+    {
+        std::lock_guard<std::mutex> lk(d->regMtx);
+        auto rit = d->rps.find(rp);
+        auto fit = d->fbs.find(fb);
+        if (rit != d->rps.end() && fit != d->fbs.end() && rit->second.size() == 2 && fit->second.views.size() == 2 &&
+            rit->second[0].format == (uint32_t)VK_FORMAT_R16G16B16A16_SFLOAT && rit->second[1].format == (uint32_t)VK_FORMAT_D32_SFLOAT) {
+            auto v0 = d->views.find(fit->second.views[0]), v1 = d->views.find(fit->second.views[1]);
+            if (v0 != d->views.end() && v1 != d->views.end()) {
+                auto i0 = d->imgs.find(v0->second.image), i1 = d->imgs.find(v1->second.image);
+                if (i0 != d->imgs.end() && i1 != d->imgs.end()) {
+                    col = v0->second.image; dep = v1->second.image;
+                    colFinal = rit->second[0].finalLayout; depFinal = rit->second[1].finalLayout;
+                    w = i0->second.w; h = i0->second.h;
+                    ok = (i0->second.patchedUsage & VK_IMAGE_USAGE_STORAGE_BIT) && (i1->second.patchedUsage & VK_IMAGE_USAGE_SAMPLED_BIT);
+                    if (!ok && logs.fetch_add(1) < 3) Logf("rt: water: its images lack STORAGE / SAMPLED usage - no reflections");
+                }
+            }
+        }
+    }
+    if (!ok) { if (!col && logs.fetch_add(1) < 3) Logf("rt: water: the water pass does not have the expected colour + depth layout - no reflections"); return; }
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkImageView cv = VK_NULL_HANDLE, dv = VK_NULL_HANDLE;
+    VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
+    uint32_t ring = 0;
+    {
+        std::lock_guard<std::mutex> lk(d->paintMtx);
+        if (!d->paintOk || !d->waterPipe || !d->waterSets[0] || !d->cpView || !d->lastTlas) return;
+        cv = GetOwnView(d, col, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT);
+        dv = GetOwnView(d, dep, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
+        if (!cv || !dv) return;
+        set = d->waterSets[d->waterRing++ % 16];
+        tlas = d->lastTlas;
+        ring = d->lastParRing;
+    }
+    VkDescriptorImageInfo ii[3] = {};
+    ii[0].imageView = cv; ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ii[1].imageView = dv; ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ii[2].imageView = d->cpView; ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorBufferInfo bi{d->parBuf[ring], 0, sizeof(FxParams)};
+    VkWriteDescriptorSetAccelerationStructureKHR asw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+    asw.accelerationStructureCount = 1;
+    asw.pAccelerationStructures = &tlas;
+    VkWriteDescriptorSet wr[5] = {};
+    const uint32_t bind[5] = {0, 1, 14, 5, 2};
+    const VkDescriptorType ty[5] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR};
+    for (int i = 0; i < 5; ++i) {
+        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[i].dstSet = set;
+        wr[i].dstBinding = bind[i];
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType = ty[i];
+        if (i < 3) wr[i].pImageInfo = &ii[i];
+        else if (i == 3) wr[i].pBufferInfo = &bi;
+        else wr[i].pNext = &asw;
+    }
+    d->UpdateDescriptorSets(d->device, 5, wr, 0, nullptr);
+    VkImageMemoryBarrier b[2] = {};
+    for (int i = 0; i < 2; ++i) {
+        b[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b[i].srcQueueFamilyIndex = b[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    b[0].image = col; b[0].oldLayout = (VkImageLayout)colFinal; b[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; b[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    b[1].image = dep; b[1].oldLayout = (VkImageLayout)depFinal; b[1].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    b[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT; b[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};   // the frame copy and the TLAS were written earlier (this or an earlier submission)
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 2, b);
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->waterPipe);
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->paintPl, 0, 1, &set, 0, nullptr);
+    d->CmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
+    for (int i = 0; i < 2; ++i) { b[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL; }
+    b[0].newLayout = (VkImageLayout)colFinal; b[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; b[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    b[1].newLayout = (VkImageLayout)depFinal; b[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT; b[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, b);
+    static std::atomic<uint64_t> runs{0};
+    const uint64_t n = ++runs;
+    if (n == 1 || n % 3000 == 0) Logf("rt: water reflections: pass #%llu on the water picture %ux%u", (unsigned long long)n, w, h);
 }
 
 // called after the original vkCmdEndRenderPass
