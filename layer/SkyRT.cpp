@@ -25,7 +25,9 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <set>
 #include <unordered_map>
@@ -41,6 +43,8 @@
 #include "rtmat_spv.h"  // SPIR-V of rt_mat.comp (generated): average colour of a material
 #include "rtwater_spv.h"  // SPIR-V of rt_water.comp (generated): reflections on the game's water picture
 #include "rtpf_spv.h"   // SPIR-V of rt.comp with -DPOSFETCH (generated): trace pass for GPUs with position fetch
+#include "level_terrain.h"   // the ground of the whole level from the game files
+#include "../third_party/meshoptimizer/vertexcodec.cpp"   // its vertex decoder, built into this file
 
 // ============================================================ config
 static const uint32_t kStatsEveryNFrames = 300;   // ~5 sec at 60 fps
@@ -85,6 +89,7 @@ static int g_bounces = 3;         // step 26: bounces per path in deep mode, 1..
 static int g_ptAdapt = 0;         // cfg ptadapt=1: screenshot mode runs at full quality only while the camera stands still (default 0 = always full)
 static int g_pathTrace = 0;       // step 25: 'path tracing' / screenshot mode: 4x rays per pixel, long accumulation, deeper bounces (cfg pathtrace=0/1, Ctrl+Backspace)
 static int g_grass = 1;           // step 24: grass (non-indexed triangle strips written by the CPU) in the acceleration structure (cfg grass=0/1)
+static int g_levelGeo = 1;        // the whole level's ground from the game files in the ray scene, also off the screen (cfg levelgeo=0/1)
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
 static int g_aniso = 16;          // step 13: anisotropic filtering forced on every linear sampler (cfg: aniso=0/2/4/8/16)
 static std::atomic<bool> g_texProbe{false};  // cfg texprobe=1: log which textures every pipeline samples (log only)
@@ -549,10 +554,22 @@ struct DeviceData {
         VkDeviceAddress scratchAddr = 0, instAddr = 0, blasAddr = 0;
         VkAccelerationStructureKHR blas = VK_NULL_HANDLE, tlas = VK_NULL_HANDLE;
         VkDeviceSize blasCap = 0, tlasCap = 0, scratchCap = 0;
+        void* instPtr = nullptr;   // instance 0 = the cache BLAS (written once), instance 1 = the level's ground when there is one
         uint64_t lastUse = 0;  // frame number of the last trace pass that read this slot
         bool ok = false;
     };
     RtSlot rtSlots[8];
+    struct LevelGpu {   // the level's ground: own buffers and BLAS, built once per level
+        uint64_t gen = 0, tris = 0;
+        VkBuffer vb = VK_NULL_HANDLE, ib = VK_NULL_HANDLE, blasBuf = VK_NULL_HANDLE, scratch = VK_NULL_HANDLE;
+        VkDeviceMemory vbMem = VK_NULL_HANDLE, ibMem = VK_NULL_HANDLE, blasMem = VK_NULL_HANDLE, scratchMem = VK_NULL_HANDLE;
+        VkAccelerationStructureKHR blas = VK_NULL_HANDLE;
+        VkDeviceAddress blasAddr = 0;
+    };
+    LevelGpu lvl;                                       // cacheMtx (blasAddr is read when the TLAS is built)
+    std::vector<std::pair<uint64_t, LevelGpu>> lvlGrave;   // grounds of earlier levels, freed once no frame in flight can use them
+    uint64_t lvlGenSeen = 0;
+    bool lvlFailed = false;
     // step 8: trace + composite passes, own result images, per-frame parameter buffers
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
     PFN_vkBindImageMemory BindImageMemory;
@@ -2900,7 +2917,7 @@ static bool EnsureRtSlots(DeviceData* d) {
     tb.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
     tb.geometryCount = 1;
     tb.pGeometries = &tg;
-    const uint32_t one = 1;
+    const uint32_t one = 3;   // the cache BLAS + the level's ground (+ one spare)
     VkAccelerationStructureBuildSizesInfoKHR tsz{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
     d->GetAccelerationStructureBuildSizesKHR(d->device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tb, &one, &tsz);
     const VkDeviceSize tlasCap = (tsz.accelerationStructureSize + 255) & ~255ull;
@@ -2944,6 +2961,7 @@ static bool EnsureRtSlots(DeviceData* d) {
                 inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
                 inst.accelerationStructureReference = sl.blasAddr;
                 memcpy(mp, &inst, sizeof inst);
+                sl.instPtr = mp;
             }
         }
         if (failed) { Logf("!!! rt: slot %d: failed to create %s - no per-frame AS", i, failed); return false; }
@@ -3660,6 +3678,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "glint")) g_glint = (float)std::max(0.0, std::min(4.0, v));
         else if (!strcmp(key, "dumpshaders")) g_dumpShaders = v != 0.0;
         else if (!strcmp(key, "dyngeo")) g_dynGeo = v != 0.0;
+        else if (!strcmp(key, "levelgeo")) g_levelGeo = v != 0.0;
         else if (!strcmp(key, "grass")) g_grass = v != 0.0;
         else if (!strcmp(key, "taa")) g_taa = v != 0.0;
         else if (!strcmp(key, "taan")) g_taaN = (float)std::max(1.0, std::min(256.0, v));
@@ -3841,7 +3860,7 @@ static bool EnsureDynSlots(DeviceData* d) {
     tb.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
     tb.geometryCount = 1;
     tb.pGeometries = &tg;
-    const uint32_t two = 2;
+    const uint32_t two = 3;   // cache + characters + the level's ground
     VkAccelerationStructureBuildSizesInfoKHR tsz{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
     d->GetAccelerationStructureBuildSizesKHR(d->device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tb, &two, &tsz);
     const VkDeviceSize tlasCap = (tsz.accelerationStructureSize + 255) & ~255ull;
@@ -3880,6 +3899,186 @@ static bool EnsureDynSlots(DeviceData* d) {
     d->dynOk = true;
     Logf("rt: 8 dynamic AS slots ready (BLAS %llu MB, scratch %llu MB each)", (unsigned long long)(kDynBlasCap >> 20), (unsigned long long)(kDynScratchCap >> 20));
     return true;
+}
+
+// ---------------------------------------------------------------- the level's ground from the game files
+// Sky.log (next to Sky.exe) says "Level load: <name>" whenever a level starts loading. A background thread follows the log,
+// reads that level's BstBaked.meshes and hands the ground to the render thread, which builds one BLAS for it.
+static struct LevelState {
+    std::mutex mtx;
+    std::wstring name;
+    uint64_t gen = 0;                                   // +1 for every level load
+    std::shared_ptr<skylevel::Terrain> terrain;         // the ground of level `gen`, empty while loading / when it failed
+} g_level;
+
+static void LevelWatch() {
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring root = exe;
+    root = root.substr(0, root.find_last_of(L"\\/"));
+    const std::wstring logPath = root + L"\\Sky.log";
+    uint64_t readTo = 0;
+    std::string carry;
+    for (;;) {
+        Sleep(500);
+        if (!g_levelGeo) continue;
+        HANDLE f = CreateFileW(logPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        LARGE_INTEGER sz{};
+        GetFileSizeEx(f, &sz);
+        if ((uint64_t)sz.QuadPart < readTo) { readTo = 0; carry.clear(); }   // a new log
+        std::string fresh;
+        if ((uint64_t)sz.QuadPart > readTo) {
+            const uint64_t n = std::min<uint64_t>((uint64_t)sz.QuadPart - readTo, 8u << 20);
+            fresh.resize((size_t)n);
+            LARGE_INTEGER at; at.QuadPart = (LONGLONG)readTo;
+            DWORD got = 0;
+            if (SetFilePointerEx(f, at, nullptr, FILE_BEGIN) && ReadFile(f, &fresh[0], (DWORD)n, &got, nullptr)) { fresh.resize(got); readTo += got; }
+            else fresh.clear();
+        }
+        CloseHandle(f);
+        if (fresh.empty()) continue;
+        carry += fresh;
+        std::string level;
+        size_t ls = 0;
+        for (size_t nl; (nl = carry.find('\n', ls)) != std::string::npos; ls = nl + 1) {
+            const size_t k = carry.find("Level load: ", ls);
+            if (k != std::string::npos && k < nl) {
+                level = carry.substr(k + 12, nl - k - 12);
+                while (!level.empty() && (level.back() == '\r' || level.back() == ' ')) level.pop_back();
+            }
+        }
+        carry.erase(0, ls);
+        if (level.empty() || level.size() > 120) continue;
+        const std::wstring wl(level.begin(), level.end());
+        uint64_t gen;
+        {
+            std::lock_guard<std::mutex> lk(g_level.mtx);
+            g_level.name = wl;
+            g_level.terrain.reset();
+            gen = ++g_level.gen;
+        }
+        LARGE_INTEGER fq, t0, t1;
+        QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0);
+        std::wstring file;
+        auto t = std::make_shared<skylevel::Terrain>();
+        std::string err = "level file not found";
+        const bool ok = skylevel::FindLevelFile(root, wl, file) && skylevel::LoadTerrain(file, *t, &err);
+        QueryPerformanceCounter(&t1);
+        if (!ok) { Logf("level: %s - no ground from the files (%s)", level.c_str(), err.c_str()); continue; }
+        Logf("level: %s - ground from the files: %zu triangles, %zu vertices (%u cloud patches left out), %.1f ms, bounds %.0f %.0f %.0f .. %.0f %.0f %.0f",
+             level.c_str(), t->idx.size() / 3, t->pos.size() / 3, t->cloudPatches, (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart,
+             t->mn[0], t->mn[1], t->mn[2], t->mx[0], t->mx[1], t->mx[2]);
+        std::lock_guard<std::mutex> lk(g_level.mtx);
+        if (g_level.gen == gen) g_level.terrain = t;
+    }
+}
+
+static void FreeLevelGpu(DeviceData* d, DeviceData::LevelGpu& g) {
+    if (g.blas) d->DestroyAccelerationStructureKHR(d->device, g.blas, nullptr);
+    for (VkBuffer b : {g.vb, g.ib, g.blasBuf, g.scratch}) if (b) d->DestroyBuffer(d->device, b, nullptr);
+    for (VkDeviceMemory mm : {g.vbMem, g.ibMem, g.blasMem, g.scratchMem}) if (mm) d->FreeMemory(d->device, mm, nullptr);
+    g = DeviceData::LevelGpu{};
+}
+
+// Render thread, inside a trace pass: follows level changes and records the ground's BLAS build into `cb` once per level.
+// The next TLAS rebuild then takes it in (the cache is forced to rebuild).
+static void LevelUpdate(DeviceData* d, VkCommandBuffer cb) {
+    static std::once_flag started;
+    if (g_levelGeo) std::call_once(started, [] { std::thread(LevelWatch).detach(); });
+    const uint64_t fr = d->frames.load();
+    for (size_t i = 0; i < d->lvlGrave.size();) {   // no slot built with an old ground is traced 120 frames later
+        if (fr - d->lvlGrave[i].first > 120) { FreeLevelGpu(d, d->lvlGrave[i].second); d->lvlGrave.erase(d->lvlGrave.begin() + i); }
+        else ++i;
+    }
+    uint64_t gen = 0;
+    std::shared_ptr<skylevel::Terrain> t;
+    {
+        std::lock_guard<std::mutex> lk(g_level.mtx);
+        gen = g_levelGeo ? g_level.gen : 0;
+        t = g_level.terrain;
+    }
+    if (gen != d->lvlGenSeen || (!g_levelGeo && d->lvl.blasAddr)) {   // another level (or switched off): the old ground goes now
+        d->lvlGenSeen = gen;
+        d->lvlFailed = false;
+        std::lock_guard<std::mutex> lk(d->cacheMtx);
+        if (d->lvl.blas) { d->lvlGrave.emplace_back(fr, d->lvl); d->lvl = DeviceData::LevelGpu{}; }
+        d->cacheForce = true;
+    }
+    if (!g_levelGeo || !t || d->lvl.gen == gen || d->lvlFailed) return;
+
+    DeviceData::LevelGpu g;
+    g.gen = gen;
+    const char* failed = nullptr;
+    const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkDeviceSize vbBytes = t->pos.size() * sizeof(float), ibBytes = t->idx.size() * sizeof(uint32_t);
+    VkDeviceAddress vbAddr = 0, ibAddr = 0, dummy = 0, scrAddr = 0;
+    if (!MakeBufEx(d, vbBytes, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, g.vb, g.vbMem, vbAddr)) failed = "vertex buffer";
+    else if (!MakeBufEx(d, ibBytes, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, g.ib, g.ibMem, ibAddr)) failed = "index buffer";
+    else {
+        void* p = nullptr;
+        if (d->MapMemory(d->device, g.vbMem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p) failed = "vertex map";
+        else { memcpy(p, t->pos.data(), (size_t)vbBytes); d->UnmapMemory(d->device, g.vbMem); }
+        if (!failed && (d->MapMemory(d->device, g.ibMem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p)) failed = "index map";
+        else if (!failed) { memcpy(p, t->idx.data(), (size_t)ibBytes); d->UnmapMemory(d->device, g.ibMem); }
+    }
+    VkAccelerationStructureGeometryKHR geo{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    geo.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    geo.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    geo.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    geo.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    geo.geometry.triangles.vertexData.deviceAddress = vbAddr;
+    geo.geometry.triangles.vertexStride = 12;
+    geo.geometry.triangles.maxVertex = (uint32_t)(t->pos.size() / 3) - 1;
+    geo.geometry.triangles.indexType = VK_INDEX_TYPE_UINT32;
+    geo.geometry.triangles.indexData.deviceAddress = ibAddr;
+    VkAccelerationStructureBuildGeometryInfoKHR bi{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    bi.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | (d->posFetch ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR : 0);
+    bi.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    bi.geometryCount = 1;
+    bi.pGeometries = &geo;
+    const uint32_t prims = (uint32_t)(t->idx.size() / 3);
+    VkAccelerationStructureBuildSizesInfoKHR sz{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    if (!failed) {
+        d->GetAccelerationStructureBuildSizesKHR(d->device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &prims, &sz);
+        if (!MakeBufEx(d, sz.accelerationStructureSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, g.blasBuf, g.blasMem, dummy)) failed = "BLAS storage";
+        else if (!MakeBufEx(d, sz.buildScratchSize + d->asScratchAlign, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, g.scratch, g.scratchMem, scrAddr)) failed = "scratch";
+    }
+    if (!failed) {
+        VkAccelerationStructureCreateInfoKHR aci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+        aci.buffer = g.blasBuf; aci.size = sz.accelerationStructureSize; aci.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        if (d->CreateAccelerationStructureKHR(d->device, &aci, nullptr, &g.blas) != VK_SUCCESS) failed = "BLAS object";
+        else {
+            VkAccelerationStructureDeviceAddressInfoKHR ai{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+            ai.accelerationStructure = g.blas;
+            g.blasAddr = d->GetAccelerationStructureDeviceAddressKHR(d->device, &ai);
+            if (!g.blasAddr) failed = "BLAS address";
+        }
+    }
+    if (failed) {
+        Logf("!!! level: the ground's BLAS failed (%s) - this level traces without it", failed);
+        FreeLevelGpu(d, g);
+        d->lvlFailed = true;
+        return;
+    }
+    bi.dstAccelerationStructure = g.blas;
+    bi.scratchData.deviceAddress = (scrAddr + d->asScratchAlign - 1) & ~(d->asScratchAlign - 1);
+    VkAccelerationStructureBuildRangeInfoKHR range{};
+    range.primitiveCount = prims;
+    const VkAccelerationStructureBuildRangeInfoKHR* pr = &range;
+    d->CmdBuildAccelerationStructuresKHR(cb, 1, &bi, &pr);
+    VkMemoryBarrier asb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    asb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    asb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &asb, 0, nullptr, 0, nullptr);
+    g.tris = prims;
+    {
+        std::lock_guard<std::mutex> lk(d->cacheMtx);
+        d->lvl = g;
+        d->cacheForce = true;   // the next TLAS takes the ground in
+    }
+    Logf("level: the ground's BLAS is built: %u triangles, %.2f MB", prims, sz.accelerationStructureSize / 1048576.0);
 }
 
 static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::MainCb& m) {
@@ -4025,6 +4224,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         ringIdx = d->paintRing.fetch_add(1) % 16;
         set = d->paintSets[ringIdx];
     }
+    LevelUpdate(d, cb);
 
     // ---- (re)build BLAS + TLAS only when the set of geometry changed, otherwise reuse the newest complete slot
     VkAccelerationStructureBuildSizesInfoKHR sz{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
@@ -4110,6 +4310,19 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         tb.scratchData.deviceAddress = scratch;
         VkAccelerationStructureBuildRangeInfoKHR trange{};
         trange.primitiveCount = 1;
+        {
+            std::lock_guard<std::mutex> lk(d->cacheMtx);
+            if (d->lvl.blasAddr && slot->instPtr) {   // instance 1: the level's ground (no material table: the shaders treat it like other instances)
+                VkAccelerationStructureInstanceKHR li{};
+                li.transform.matrix[0][0] = li.transform.matrix[1][1] = li.transform.matrix[2][2] = 1.0f;
+                li.instanceCustomIndex = 1;
+                li.mask = 0xFF;
+                li.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+                li.accelerationStructureReference = d->lvl.blasAddr;
+                memcpy((uint8_t*)slot->instPtr + sizeof li, &li, sizeof li);
+                trange.primitiveCount = 2;
+            }
+        }
         const VkAccelerationStructureBuildRangeInfoKHR* pTr = &trange;
         d->CmdBuildAccelerationStructuresKHR(cb, 1, &tb, &pTr);
         {
@@ -4198,14 +4411,19 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 asb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
                 asb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
                 d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &asb, 0, nullptr, 0, nullptr);
-                VkAccelerationStructureInstanceKHR inst[2] = {};
-                for (int k = 0; k < 2; ++k) {
+                VkAccelerationStructureInstanceKHR inst[3] = {};
+                for (int k = 0; k < 3; ++k) {
                     inst[k].transform.matrix[0][0] = inst[k].transform.matrix[1][1] = inst[k].transform.matrix[2][2] = 1.0f;
                     inst[k].mask = 0xFF;
                     inst[k].flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
                 }
                 inst[0].accelerationStructureReference = slot->blasAddr;
                 inst[1].accelerationStructureReference = ds->blasAddr;
+                uint32_t nInst = 2;
+                {
+                    std::lock_guard<std::mutex> lk(d->cacheMtx);
+                    if (d->lvl.blasAddr) { inst[2].accelerationStructureReference = d->lvl.blasAddr; inst[2].instanceCustomIndex = 1; nInst = 3; }
+                }
                 memcpy(ds->instPtr, inst, sizeof inst);
                 VkAccelerationStructureGeometryKHR tg{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
                 tg.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
@@ -4222,7 +4440,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 tb.dstAccelerationStructure = ds->tlas;
                 tb.scratchData.deviceAddress = scr;
                 VkAccelerationStructureBuildRangeInfoKHR trange{};
-                trange.primitiveCount = 2;
+                trange.primitiveCount = nInst;
                 const VkAccelerationStructureBuildRangeInfoKHR* pTr = &trange;
                 d->CmdBuildAccelerationStructuresKHR(cb, 1, &tb, &pTr);
                 {
