@@ -471,43 +471,45 @@ static void DrawBubble(ImVec2 pos, ImVec2 size) {
     ImGui::PopTextWrapPos();
 }
 
-// ============================================================ the "do not press" button: the progress bar drives out of the window
-// The bar shakes, a shot rings out, and the bar itself drives out through the window edge in one piece (a click-through topmost window
-// that looks exactly like it takes over at the same spot, so there is no seam), breaking the edge (cracks inside, glass outside):
-// right monitor = 666%, left monitor = -666% (it went "back"), monitor above = a hook and straight up, one monitor = off the screen.
-// It stays there 5 seconds while Лучик peeks out from behind that monitor's edge, then it drives back the same way.
+// ============================================================ the "do not press" button: the bar shoots out of the window and stays connected
+// The bar stays in the window (full, green) and its end shoots out like a ribbon: the tail never leaves the bar, the head flies on along
+// one path. It breaks the window edge with a shot (cracks inside, glass outside) and goes to another monitor: right = 666%,
+// left = -666% (it went "back"), above = a hook and straight up, one monitor = off the screen. It stays 5 seconds while Лучик peeks out
+// from behind that monitor's edge, then the ribbon reels back in. The ribbon is a click-through topmost window that covers the bar's end,
+// so bar and ribbon read as one piece. The real install keeps running.
 enum PrankWay { WayRight, WayLeft, WayUp, WayNone };
 struct Prank {
     bool on = false;
     double t0 = 0;
     PrankWay way = WayNone;
-    POINT start{}, exit{}, p1{}, up{}, target{};   // screen positions of the bar's top-left corner along the way
+    POINT a{}, e{}, c1{}, up{}, target{};   // centre line of the ribbon (screen): from the bar's end a, via e (or the hook and up), to target
     POINT crack{}, crackClient{};
     POINT clientOrg{};
+    RECT win{};                             // the client area in screen coordinates
     RECT tmon{};
-    float fill = 0.0f;
     int percent = 0, finalPercent = -666;
     bool banged = false;
-    HWND bar = nullptr, shards = nullptr, peek = nullptr;
+    HWND ribbon = nullptr, shards = nullptr, peek = nullptr;
 };
 static Prank g_prank;
+static std::vector<POINT> g_ribbonPts;      // the ribbon's centre line this frame, relative to its window
+static POINT g_ribbonHead{};
 static const int kBarW = 510, kBarH = 30;
 static const double kShake = 0.6, kHoldFor = 5.0;
+static const LONG kHookR = 55;      // radius of the hook for a monitor above
 static double g_bangAt = 0.0;
-static double PrankOut() { return g_prank.way == WayUp ? 2.8 : 2.2; }   // how long the way out takes
+static double PrankOut() { return g_prank.way == WayUp ? 2.6 : 2.0; }
 static double PrankArrive() { return kShake + PrankOut(); }
 static double PrankReturn() { return PrankArrive() + kHoldFor; }
-static double PrankHome() { return PrankReturn() + 1.4; }
+static double PrankHome() { return PrankReturn() + 1.2; }
 static double PrankEnd() { return PrankHome() + 5.2; }
 static double PrankT() { return ImGui::GetTime() - g_prank.t0; }
-static double PrankBreakS() { return g_prank.way == WayUp ? 0.45 : 0.03; }   // where on the way the window edge breaks
-static double PrankBreak() { return g_prank.banged ? g_bangAt : 1e9; }   // when the window edge broke
-static bool PrankBarAway() { return g_prank.on && PrankT() >= kShake && PrankT() < PrankHome(); }
+static double PrankBreak() { return g_prank.banged ? g_bangAt : 1e9; }
+static bool PrankBarFull() { return g_prank.on && PrankT() >= kShake && PrankT() < PrankHome(); }
 static bool PrankLuchikAway() { return g_prank.on && g_prank.banged && PrankT() < PrankHome(); }
 static float PrankShakeX() { return g_prank.on && PrankT() < kShake ? (float)sin(PrankT() * 70.0) * 3.0f : 0.0f; }
 
-// the bar, drawn like the window's own progress bar: dark track, green fill, the percent on top
-static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+static LRESULT CALLBACK RibbonProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
@@ -516,24 +518,29 @@ static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         HBRUSH key = CreateSolidBrush(RGB(255, 0, 255));
         FillRect(dc, &rc, key);
         DeleteObject(key);
-        HPEN none = (HPEN)GetStockObject(NULL_PEN);
-        HGDIOBJ op = SelectObject(dc, none);
-        HBRUSH track = CreateSolidBrush(RGB(43, 54, 84));
-        HGDIOBJ ob = SelectObject(dc, track);
-        RoundRect(dc, 0, 0, rc.right + 1, rc.bottom + 1, 20, 20);
-        const int fw = (int)(rc.right * std::max(0.0f, std::min(1.0f, g_prank.fill)));
-        HBRUSH fillb = CreateSolidBrush(RGB(89, 219, 115));
-        SelectObject(dc, fillb);
-        if (fw > 0) RoundRect(dc, 0, 0, fw + 1, rc.bottom + 1, 20, 20);
-        SelectObject(dc, ob); SelectObject(dc, op);
-        DeleteObject(track); DeleteObject(fillb);
-        HFONT f = CreateFontW(22, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+        if (g_ribbonPts.size() >= 2) {
+            LOGBRUSH lb{BS_SOLID, RGB(89, 219, 115), 0};   // the green of the bar's fill: bar and ribbon are one piece
+            HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_FLAT | PS_JOIN_ROUND, kBarH, &lb, 0, nullptr);
+            HGDIOBJ op = SelectObject(dc, pen);
+            Polyline(dc, g_ribbonPts.data(), (int)g_ribbonPts.size());
+            SelectObject(dc, op);
+            DeleteObject(pen);
+        }
+        // the percent rides on the head
+        wchar_t t[32];
+        swprintf(t, 32, L"%d%%", g_prank.percent);
+        RECT lr{g_ribbonHead.x - 46, g_ribbonHead.y - 14, g_ribbonHead.x + 46, g_ribbonHead.y + 14};
+        HBRUSH lbk = CreateSolidBrush(RGB(30, 36, 60));
+        HPEN lpen = CreatePen(PS_SOLID, 2, RGB(89, 219, 115));
+        HGDIOBJ ob = SelectObject(dc, lbk), op2 = SelectObject(dc, lpen);
+        RoundRect(dc, lr.left, lr.top, lr.right, lr.bottom, 14, 14);
+        SelectObject(dc, ob); SelectObject(dc, op2);
+        DeleteObject(lbk); DeleteObject(lpen);
+        HFONT f = CreateFontW(20, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
         HGDIOBJ of = SelectObject(dc, f);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(240, 244, 255));
-        wchar_t t[32];
-        swprintf(t, 32, L"%d%%", g_prank.percent);
-        DrawTextW(dc, t, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(dc, t, -1, &lr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(dc, of);
         DeleteObject(f);
         EndPaint(h, &ps);
@@ -651,7 +658,7 @@ static void PrankShards(double since) {
     PushPixels(g_prank.shards, g_prank.crack.x - S / 2, g_prank.crack.y - S / 2, S, S, px.data());
 }
 
-// Лучик slides out from behind the edge of the monitor the bar went to; only the part inside that monitor is shown
+// Лучик slides out from behind the edge of the monitor the ribbon went to; only the part inside that monitor is shown
 static void PrankPeek(double t) {
     Prank& p = g_prank;
     const double in0 = PrankArrive() + 0.4, out1 = PrankReturn();
@@ -662,10 +669,10 @@ static void PrankPeek(double t) {
     const RECT& m = p.tmon;
     auto clampY = [&](LONG y) { return std::max<LONG>(m.top, std::min<LONG>(m.bottom - 256, y)); };
     int sx, sy;   // where the whole 256x256 picture would be
-    if (p.way == WayRight) { sx = m.left - 256 + show; sy = clampY(p.target.y + 50); }
-    else if (p.way == WayLeft) { sx = m.right - show; sy = clampY(p.target.y + 50); }
-    else if (p.way == WayUp) { sx = p.target.x + kBarW / 2 - 128; sy = m.bottom - show; }
-    else { sx = m.left - 256 + show; sy = clampY(p.start.y + 50); }
+    if (p.way == WayRight) { sx = m.left - 256 + show; sy = clampY(p.target.y + 40); }
+    else if (p.way == WayLeft) { sx = m.right - show; sy = clampY(p.target.y + 40); }
+    else if (p.way == WayUp) { sx = p.target.x + 60; sy = m.bottom - show; }
+    else { sx = m.left - 256 + show; sy = clampY(p.a.y + 40); }
     const int x0 = std::max<int>(sx, m.left), y0 = std::max<int>(sy, m.top);
     const int x1 = std::min<int>(sx + 256, m.right), y1 = std::min<int>(sy + 256, m.bottom);
     const int w = x1 - x0, h = y1 - y0;
@@ -703,104 +710,132 @@ static void PrankStart(HWND main, POINT barTopLeft) {
     ClientToScreen(main, &tl);
     ClientToScreen(main, &br);
     Prank& p = g_prank;
-    const HWND bar = p.bar, sh = p.shards, pk = p.peek;
+    const HWND rb = p.ribbon, sh = p.shards, pk = p.peek;
     p = Prank{};
-    p.bar = bar; p.shards = sh; p.peek = pk;
-    p.start = barTopLeft;
+    p.ribbon = rb; p.shards = sh; p.peek = pk;
     p.clientOrg = tl;
+    p.win = {tl.x, tl.y, br.x, br.y};
     p.tmon = home;
-    auto centre = [](const RECT& r) { return POINT{(r.left + r.right) / 2 - kBarW / 2, (r.top + r.bottom) / 2 - kBarH / 2}; };
+    auto centre = [](const RECT& r) { return POINT{(r.left + r.right) / 2, (r.top + r.bottom) / 2}; };
     const LONG midY = barTopLeft.y + kBarH / 2;
+    const POINT rightEnd{barTopLeft.x + kBarW - 2, midY}, leftEnd{barTopLeft.x + 2, midY};
     if (up) {
         p.way = WayUp; p.tmon = *up; p.finalPercent = 666; p.target = centre(*up);
-        p.p1 = {barTopLeft.x + 160, barTopLeft.y};
-        p.up = {p.p1.x, tl.y - kBarH - 40};                    // straight up until it is clear of the window
-        p.crack = {std::min<LONG>(p.p1.x + kBarW / 2, br.x - 20), tl.y};
+        p.a = rightEnd;
+        p.c1 = {rightEnd.x - kHookR, midY - kHookR};           // centre of the hook: it stays inside the window
+        p.up = {p.c1.x - kHookR, tl.y - 120};                  // after the hook straight up, out through the top edge
+        p.crack = {p.up.x, tl.y};
     } else if (right) {
         p.way = WayRight; p.tmon = *right; p.finalPercent = 666; p.target = centre(*right);
-        p.exit = {br.x + 40, barTopLeft.y};                    // straight out until it is clear of the window
+        p.a = rightEnd; p.e = {br.x + 160, midY};
         p.crack = {br.x, midY};
     } else if (left) {
         p.way = WayLeft; p.tmon = *left; p.finalPercent = -666; p.target = centre(*left);
-        p.exit = {tl.x - kBarW - 40, barTopLeft.y};
+        p.a = leftEnd; p.e = {tl.x - 160, midY};
         p.crack = {tl.x, midY};
     } else {
         p.way = WayNone; p.finalPercent = -666;
-        p.exit = {tl.x - kBarW - 40, barTopLeft.y};
-        p.target = {home.left - kBarW - 200, barTopLeft.y};    // off the screen, into the minus
+        p.a = leftEnd; p.e = {tl.x - 160, midY};
+        p.target = {home.left - 300, midY};                    // off the screen, into the minus
         p.crack = {tl.x, midY};
     }
     p.crackClient = {p.crack.x - tl.x, p.crack.y - tl.y};
-    if (!p.bar) p.bar = MakeOverlay(L"SkyRTDrivingBar", BarProc);
+    if (!p.ribbon) p.ribbon = MakeOverlay(L"SkyRTRibbon", RibbonProc);
     if (!p.shards) p.shards = MakeOverlay(L"SkyRTShards", DefWindowProcW);
     if (!p.peek) p.peek = MakeOverlay(L"SkyRTPeek", DefWindowProcW);
-    SetLayeredWindowAttributes(p.bar, RGB(255, 0, 255), 0, LWA_COLORKEY);
+    SetLayeredWindowAttributes(p.ribbon, RGB(255, 0, 255), 0, LWA_COLORKEY);
     if (g_shot.empty()) MakeShotSound();
     LoadPeekPixels();
     p.percent = (int)(g_job.progress.load() * 100.0f);
     p.t0 = ImGui::GetTime();
     p.on = true;
 }
-static POINT Lerp(POINT a, POINT b, double k) { return {(LONG)(a.x + (b.x - a.x) * k), (LONG)(a.y + (b.y - a.y) * k)}; }
-static double Smooth(double k) { k = std::max(0.0, std::min(1.0, k)); return k * k * (3.0 - 2.0 * k); }
 static void PrankStop() {
-    for (HWND h : {g_prank.bar, g_prank.shards, g_prank.peek}) if (h) ShowWindow(h, SW_HIDE);
+    for (HWND h : {g_prank.ribbon, g_prank.shards, g_prank.peek}) if (h) ShowWindow(h, SW_HIDE);
     g_prank.on = false;
 }
-// the way out as one continuous path, s = 0 at home .. 1 at the target; the way back is the same path backwards
+static double Smooth(double k) { k = std::max(0.0, std::min(1.0, k)); return k * k * (3.0 - 2.0 * k); }
+static_assert(kHookR > 0, "hook radius");
+// the centre line, s = 0 at the bar's end .. 1 at the target
 static POINT PrankPath(double s) {
     const Prank& p = g_prank;
+    auto lerp = [](POINT a, POINT b, double k) { return POINT{(LONG)(a.x + (b.x - a.x) * k), (LONG)(a.y + (b.y - a.y) * k)}; };
     if (p.way == WayUp) {
-        if (s < 0.15) return Lerp(p.start, p.p1, Smooth(s / 0.15));                       // a little to the right
-        if (s < 0.45) {                                                                   // the hook
-            const double a = (s - 0.15) / 0.30 * 6.2831853, R = 70.0;
-            return {(LONG)(p.p1.x + R * sin(a)), (LONG)(p.p1.y - R + R * cos(a))};
+        const double R = kHookR;
+        const POINT b{p.c1.x, p.a.y};   // the bottom of the hook circle, on the bar
+        if (s < 0.08) return lerp(p.a, b, s / 0.08);   // back along the bar a little
+        if (s < 0.45) {   // the hook: one and a quarter turns, crossing itself, ending on the left side heading up
+            const double f = (s - 0.08) / 0.37 * 2.5 * 3.14159265;
+            return {(LONG)(p.c1.x - R * sin(f)), (LONG)(p.c1.y + R * cos(f))};
         }
-        if (s < 0.75) return Lerp(p.p1, p.up, (s - 0.45) / 0.30);                         // straight up through the top edge
-        return Lerp(p.up, p.target, Smooth((s - 0.75) / 0.25));
+        const POINT hookEnd{p.up.x, p.c1.y};
+        if (s < 0.75) return lerp(hookEnd, p.up, (s - 0.45) / 0.30);
+        const POINT u = p.up;
+        const double k = Smooth((s - 0.75) / 0.25);   // a gentle curve over to the middle of the upper monitor
+        const POINT c{u.x, p.target.y};
+        const double q = 1.0 - k;
+        return {(LONG)(q * q * u.x + 2 * q * k * c.x + k * k * p.target.x), (LONG)(q * q * u.y + 2 * q * k * c.y + k * k * p.target.y)};
     }
-    if (s < 0.5) return Lerp(p.start, p.exit, s / 0.5);                                  // straight out through the side
-    return Lerp(p.exit, p.target, Smooth((s - 0.5) / 0.5));
+    if (s < 0.4) return lerp(p.a, p.e, s / 0.4);   // straight out through the side
+    const double k = Smooth((s - 0.4) / 0.6);
+    const POINT c{p.target.x, p.e.y};             // then a smooth curve to the other monitor
+    const double q = 1.0 - k;
+    return {(LONG)(q * q * p.e.x + 2 * q * k * c.x + k * k * p.target.x), (LONG)(q * q * p.e.y + 2 * q * k * c.y + k * k * p.target.y)};
 }
 static double PrankS(double t) {
     if (t < kShake) return 0.0;
-    if (t < PrankArrive()) return (t - kShake) / PrankOut();
+    if (t < PrankArrive()) { const double k = (t - kShake) / PrankOut(); return 1.0 - (1.0 - k) * (1.0 - k); }
     if (t < PrankReturn()) return 1.0;
-    if (t < PrankHome()) return 1.0 - (t - PrankReturn()) / (PrankHome() - PrankReturn());
+    if (t < PrankHome()) { const double k = (t - PrankReturn()) / (PrankHome() - PrankReturn()); return 1.0 - k * k; }
     return 0.0;
 }
+
 static bool PrankUpdate() {
     if (!g_prank.on) return false;
     const double t = PrankT();
     if (t >= PrankEnd()) { PrankStop(); return false; }
     const double s = PrankS(t);
-    if (!g_prank.banged && t >= kShake && s >= PrankBreakS()) {
-        g_prank.banged = true;
-        PlaySoundW((LPCWSTR)g_shot.data(), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
-        g_prank.crackClient = {g_prank.crack.x - g_prank.clientOrg.x, g_prank.crack.y - g_prank.clientOrg.y};
-        g_bangAt = t;
+    const int real = (int)(g_job.progress.load() * 100.0f);
+    g_prank.percent = (int)(real + (g_prank.finalPercent - real) * std::min(1.0, s / 0.85));
+    if (s <= 0.0) { if (IsWindowVisible(g_prank.ribbon)) ShowWindow(g_prank.ribbon, SW_HIDE); }
+    else {
+        const int n = std::max(2, (int)(s * 240));
+        std::vector<POINT> pts(n + 1);
+        RECT bb{LONG_MAX, LONG_MAX, LONG_MIN, LONG_MIN};
+        const double wob = t >= PrankArrive() && t < PrankReturn() ? sin(t * 3.0) * 6.0 : 0.0;
+        for (int i = 0; i <= n; ++i) {
+            pts[i] = PrankPath(s * i / n);
+            pts[i].y += (LONG)(wob * i / n);   // only the head sways
+            bb.left = std::min(bb.left, pts[i].x); bb.top = std::min(bb.top, pts[i].y);
+            bb.right = std::max(bb.right, pts[i].x); bb.bottom = std::max(bb.bottom, pts[i].y);
+        }
+        InflateRect(&bb, 60, 40);
+        const POINT head = pts.back();
+        if (!g_prank.banged && !PtInRect(&g_prank.win, head)) {   // the head just hit the window edge
+            g_prank.banged = true;
+            g_bangAt = t;
+            PlaySoundW((LPCWSTR)g_shot.data(), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+        }
+        for (POINT& q : pts) { q.x -= bb.left; q.y -= bb.top; }
+        g_ribbonPts = pts;
+        g_ribbonHead = {head.x - bb.left, head.y - bb.top};
+        SetWindowPos(g_prank.ribbon, HWND_TOPMOST, bb.left, bb.top, bb.right - bb.left, bb.bottom - bb.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(g_prank.ribbon, nullptr, FALSE);
+        UpdateWindow(g_prank.ribbon);
+        if (g_autoPrank) {   // test trace: positions only, never a picture of the user's screen
+            wchar_t tmp[MAX_PATH];
+            GetTempPathW(MAX_PATH, tmp);
+            static FILE* tf = _wfopen((std::wstring(tmp) + L"skyrt_prank.txt").c_str(), L"w");
+            RECT pr{};
+            if (IsWindowVisible(g_prank.peek)) GetWindowRect(g_prank.peek, &pr);
+            if (tf) { fprintf(tf, "%.2f tail %ld %ld head %ld %ld %d bang %d peek %ld %ld %ld %ld\n", t, pts[0].x + bb.left, pts[0].y + bb.top, head.x, head.y, g_prank.percent, g_prank.banged ? 1 : 0, pr.left, pr.top, pr.right, pr.bottom); fflush(tf); }
+        }
     }
     if (g_prank.banged) PrankShards(t - g_bangAt);
     PrankPeek(t);
-    const int real = (int)(g_job.progress.load() * 100.0f);
-    g_prank.fill = g_job.progress.load();
-    g_prank.percent = (int)(real + (g_prank.finalPercent - real) * std::min(1.0, s / 0.8));
-    if (t < kShake || t >= PrankHome()) { if (IsWindowVisible(g_prank.bar)) ShowWindow(g_prank.bar, SW_HIDE); return true; }
-    const POINT p = PrankPath(s);
-    const double hold = t >= PrankArrive() && t < PrankReturn() ? sin(t * 3.0) * 6.0 : 0.0;
-    SetWindowPos(g_prank.bar, HWND_TOPMOST, p.x, (LONG)(p.y + hold), kBarW, kBarH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(g_prank.bar, nullptr, FALSE);
-    if (g_autoPrank) {   // test trace: positions only, never a picture of the user's screen
-        wchar_t tmp[MAX_PATH];
-        GetTempPathW(MAX_PATH, tmp);
-        static FILE* tf = _wfopen((std::wstring(tmp) + L"skyrt_prank.txt").c_str(), L"w");
-        RECT pr{};
-        if (IsWindowVisible(g_prank.peek)) GetWindowRect(g_prank.peek, &pr);
-        if (tf) { fprintf(tf, "%.2f bar %ld %ld %d bang %d peek %ld %ld %ld %ld\n", t, p.x, (long)(p.y + hold), g_prank.percent, g_prank.banged ? 1 : 0, pr.left, pr.top, pr.right, pr.bottom); fflush(tf); }
-    }
     return true;
 }
-// inside the window: the hole and the cracks where the bar broke through, healing after it is back
+// inside the window: the hole and the cracks where the ribbon broke through, healing after it is back
 static void PrankDrawInside(ImDrawList* dl) {
     if (!g_prank.on || !g_prank.banged) return;
     const double t = PrankT();
@@ -865,8 +900,7 @@ static void DrawActions(HWND hwnd) {
     } else if (g_screen == ScrInstalling) {
         const float shake = PrankShakeX();   // the bar stays in place; before the shot it shakes
         if (shake != 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + shake);
-        if (PrankBarAway()) ImGui::Dummy(ImVec2(kBarW, kBarH));   // the bar is out driving: its double carries it, seamlessly
-        else ImGui::ProgressBar(g_job.progress.load(), ImVec2(kBarW, kBarH), "");
+        ImGui::ProgressBar(PrankBarFull() ? 1.0f : g_job.progress.load(), ImVec2(kBarW, kBarH), "");   // pulled tight while the ribbon is out
         const ImVec2 barMin = ImVec2(ImGui::GetItemRectMin().x - shake, ImGui::GetItemRectMin().y);
         ImGui::Spacing();
         ImGui::BeginDisabled(g_prank.on);
