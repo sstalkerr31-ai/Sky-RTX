@@ -4614,6 +4614,20 @@ static void InjectWater(DeviceData* d, VkCommandBuffer cb, VkRenderPass rp, VkFr
         else wr[i].pNext = &asw;
     }
     d->UpdateDescriptorSets(d->device, 5, wr, 0, nullptr);
+    {   // the material tables, for reflected surfaces that are off the screen
+        VkDescriptorBufferInfo mb2[2] = {{d->geoMatBuf, 0, VK_WHOLE_SIZE}, {d->matColBuf, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet mw[2] = {};
+        for (uint32_t k = 0; k < 2; ++k) {
+            mw[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            mw[k].dstSet = set;
+            mw[k].dstBinding = 11 + k;
+            mw[k].descriptorCount = 1;
+            mw[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            mw[k].pBufferInfo = &mb2[k];
+        }
+        if (d->geoMatBuf && d->matColBuf) d->UpdateDescriptorSets(d->device, 2, mw, 0, nullptr);
+        else return;
+    }
     VkImageMemoryBarrier b[2] = {};
     for (int i = 0; i < 2; ++i) {
         b[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
