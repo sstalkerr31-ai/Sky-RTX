@@ -61,6 +61,7 @@ static std::string LastError() {
 static std::wstring g_testRoot;   // --root: nothing real is touched
 static bool g_demo = false;       // --demo: no file, registry or game is touched, the steps are only played out
 static bool g_demoInstalled = false;
+static bool g_autoPrank = false;  // --autoprank: demo starts the install and presses "do not press" by itself
 static const wchar_t* kLayerKey = L"SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers";
 static const wchar_t* kTestKey = L"SOFTWARE\\SkyRT_Test\\ImplicitLayers";
 static const wchar_t* kManifest = L"VK_LAYER_SKYRT.json";
@@ -260,7 +261,10 @@ struct Job {
     std::atomic<float> progress{0.0f};
     std::mutex m;
     std::string step, err;
-    void Step(const char* s, float p) { std::lock_guard<std::mutex> l(m); step = s; progress = p; }
+    void Step(const char* s, float p) {
+        { std::lock_guard<std::mutex> l(m); step = s; progress = p; }
+        if (!g_demo && p < 1.0f) Sleep(700);   // the real steps take milliseconds: give people time to read them (and to find the red button)
+    }
 };
 static Job g_job;
 
@@ -465,7 +469,172 @@ static void DrawBubble(ImVec2 pos, ImVec2 size) {
     ImGui::PopTextWrapPos();
 }
 
+// ============================================================ the "do not press" button: the progress bar breaks out of the window
+// A layered, click-through, topmost window carries the bar across the desktop: to a monitor above (with a loop on the way), to a monitor
+// beside, or off the screen when there is only one. Then Лучик laughs and puts everything back. The real install keeps running meanwhile.
+struct Prank {
+    bool on = false;
+    double t0 = 0;
+    POINT start{}, target{}, p1{};
+    int dir = -1;
+    int percent = 0;
+    HWND wnd = nullptr;
+};
+static Prank g_prank;
+static const int kBarW = 510, kBarH = 30;
+static const double kFly = 2.4, kHold = 3.2, kBack = 3.8, kLaugh = 5.8, kDust = 7.0, kEnd = 9.0;
+
+static LRESULT CALLBACK BarProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        HBRUSH key = CreateSolidBrush(RGB(255, 0, 255));
+        FillRect(dc, &rc, key);
+        DeleteObject(key);
+        HBRUSH g = CreateSolidBrush(RGB(89, 219, 115));
+        HPEN pen = CreatePen(PS_SOLID, 2, RGB(30, 90, 40));
+        HGDIOBJ ob = SelectObject(dc, g), op = SelectObject(dc, pen);
+        RoundRect(dc, 1, 1, rc.right - 1, rc.bottom - 1, 18, 18);
+        SelectObject(dc, ob); SelectObject(dc, op);
+        DeleteObject(g); DeleteObject(pen);
+        HFONT f = CreateFontW(22, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+        HGDIOBJ of = SelectObject(dc, f);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(20, 50, 25));
+        wchar_t t[32];
+        swprintf(t, 32, L"%d%%", g_prank.percent);
+        DrawTextW(dc, t, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(dc, of);
+        DeleteObject(f);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static BOOL CALLBACK AddMonitor(HMONITOR, HDC, LPRECT r, LPARAM p) {
+    ((std::vector<RECT>*)p)->push_back(*r);
+    return TRUE;
+}
+static void PrankStart(HWND main, POINT barTopLeft) {
+    std::vector<RECT> mons;
+    EnumDisplayMonitors(nullptr, nullptr, AddMonitor, (LPARAM)&mons);
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(MonitorFromWindow(main, MONITOR_DEFAULTTONEAREST), &mi);
+    const RECT home = mi.rcMonitor;
+    g_prank.start = barTopLeft;
+    const RECT* above = nullptr;
+    const RECT* beside = nullptr;
+    for (const RECT& r : mons) {
+        if (EqualRect(&r, &home)) continue;
+        if (r.bottom <= home.top + 8 && !above) above = &r;
+        else if (!beside) beside = &r;
+    }
+    const int cx = barTopLeft.x + kBarW / 2;
+    if (above) {
+        g_prank.target = {(above->left + above->right) / 2 - kBarW / 2, (above->top + above->bottom) / 2 - kBarH / 2};
+        g_prank.dir = g_prank.target.x + kBarW / 2 >= cx ? 1 : -1;
+    } else if (beside) {
+        g_prank.target = {(beside->left + beside->right) / 2 - kBarW / 2, (beside->top + beside->bottom) / 2 - kBarH / 2};
+        g_prank.dir = g_prank.target.x + kBarW / 2 >= cx ? 1 : -1;
+    } else {   // one monitor: off the edge, into the minus
+        g_prank.dir = -1;
+        g_prank.target = {GetSystemMetrics(SM_XVIRTUALSCREEN) - kBarW - 600, barTopLeft.y};
+    }
+    g_prank.p1 = {barTopLeft.x + g_prank.dir * 450, barTopLeft.y};
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc{sizeof wc};
+        wc.lpfnWndProc = BarProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"SkyRTFlyingBar";
+        RegisterClassExW(&wc);
+        reg = true;
+    }
+    if (!g_prank.wnd)
+        g_prank.wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, L"SkyRTFlyingBar", L"",
+                                      WS_POPUP, barTopLeft.x, barTopLeft.y, kBarW, kBarH, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SetLayeredWindowAttributes(g_prank.wnd, RGB(255, 0, 255), 0, LWA_COLORKEY);
+    g_prank.percent = (int)(g_job.progress.load() * 100.0f);
+    SetWindowPos(g_prank.wnd, HWND_TOPMOST, barTopLeft.x, barTopLeft.y, kBarW, kBarH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    g_prank.t0 = ImGui::GetTime();
+    g_prank.on = true;
+}
+static POINT Lerp(POINT a, POINT b, double k) { return {(LONG)(a.x + (b.x - a.x) * k), (LONG)(a.y + (b.y - a.y) * k)}; }
+static void PrankStop() {
+    if (g_prank.wnd) ShowWindow(g_prank.wnd, SW_HIDE);
+    g_prank.on = false;
+}
+// moves the bar; true while it is out of the window
+static bool PrankUpdate() {
+    if (!g_prank.on) return false;
+    const double t = ImGui::GetTime() - g_prank.t0;
+    if (t >= kEnd) { PrankStop(); return false; }
+    if (t >= kBack) { if (g_prank.wnd && IsWindowVisible(g_prank.wnd)) ShowWindow(g_prank.wnd, SW_HIDE); return false; }
+    POINT p;
+    const int real = (int)(g_job.progress.load() * 100.0f);
+    if (t < kFly) {
+        const double u = t / kFly;
+        if (u < 0.3) {   // speeding up along the window
+            const double k = u / 0.3;
+            p = Lerp(g_prank.start, g_prank.p1, k * k);
+        } else if (u < 0.55) {   // a loop: "abnormal air resistance"
+            const double a = (u - 0.3) / 0.25 * 6.2831853;
+            const double R = 120.0;
+            p = {(LONG)(g_prank.p1.x + g_prank.dir * R * sin(a)), (LONG)(g_prank.p1.y - R + R * cos(a))};
+        } else {   // and away: up, sideways or off the screen
+            const double k = (u - 0.55) / 0.45;
+            p = Lerp(g_prank.p1, g_prank.target, k * k);
+        }
+        g_prank.percent = (int)(real + (-666 - real) * u);
+    } else if (t < kHold) {
+        const double s = sin(t * 40.0) * 6.0;
+        p = {(LONG)(g_prank.target.x + s), g_prank.target.y};
+        g_prank.percent = -666;
+    } else {
+        const double k = (t - kHold) / (kBack - kHold);
+        p = Lerp(g_prank.target, g_prank.start, 1.0 - (1.0 - k) * (1.0 - k));
+        g_prank.percent = (int)(-666 + (real + 666) * k);
+    }
+    SetWindowPos(g_prank.wnd, HWND_TOPMOST, p.x, p.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_prank.wnd, nullptr, FALSE);
+    if (g_autoPrank) {   // test trace: where the bar was, and once a picture of the bar window alone (never the user's screen)
+        wchar_t tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        static FILE* tf = _wfopen((std::wstring(tmp) + L"skyrt_prank.txt").c_str(), L"w");
+        if (tf) { fprintf(tf, "%.2f %ld %ld %d\n", t, p.x, p.y, g_prank.percent); fflush(tf); }
+        static bool shot = false;
+        if (!shot && t > 2.6) {
+            shot = true;
+            UpdateWindow(g_prank.wnd);
+            HDC wdc = GetDC(g_prank.wnd), mdc = CreateCompatibleDC(wdc);
+            HBITMAP bm = CreateCompatibleBitmap(wdc, kBarW, kBarH);
+            HGDIOBJ old = SelectObject(mdc, bm);
+            PrintWindow(g_prank.wnd, mdc, PW_CLIENTONLY);
+            BITMAPINFO bi{};
+            bi.bmiHeader = {sizeof(BITMAPINFOHEADER), kBarW, -kBarH, 1, 32, BI_RGB};
+            std::vector<unsigned char> px(kBarW * kBarH * 4);
+            GetDIBits(mdc, bm, 0, kBarH, px.data(), &bi, DIB_RGB_COLORS);
+            for (size_t i = 0; i < px.size(); i += 4) { std::swap(px[i], px[i + 2]); px[i + 3] = 255; }
+            stbi_write_png(U(std::wstring(tmp) + L"skyrt_prank_bar.png").c_str(), kBarW, kBarH, 4, px.data(), kBarW * 4);
+            SelectObject(mdc, old); DeleteObject(bm); DeleteDC(mdc); ReleaseDC(g_prank.wnd, wdc);
+        }
+    }
+    return true;
+}
+static void PrankConversation() {
+    const double t = ImGui::GetTime() - g_prank.t0;
+    if (t < kFly) Say(Shock, "Ой-ой-ой! Нет-нет-нет! Она сама! Держите её!");
+    else if (t < kBack) Say(Run, "Стой! Вернись! Ты же полоса загрузки, тебе нельзя на улицу!");
+    else if (t < kLaugh) Say(Laugh, "АХАХАХА! Видели бы вы своё лицо! Ой, не могу…");
+    else if (t < kDust) Say(Dust, "Кхм. Извините. Это было непрофессионально.");
+    else Say(Serious, "Установка продолжается в штатном режиме. Или нет…");
+}
+
 static void UpdateConversation() {
+    if (g_prank.on) { PrankConversation(); return; }
     if (g_screen == ScrHello) {
         if (!g_gpuReady) { Say(Think, "Ой, здравствуйте… Секундочку, я посмотрю, что у вас за видеокарта."); return; }
         if (!g_gpu.vulkan) Say(Guilty, "Простите… Я не нашёл Vulkan. Лучи без него не заработают. Обновите, пожалуйста, драйвер видеокарты.");
@@ -491,8 +660,32 @@ static void DrawActions(HWND hwnd) {
         ImGui::EndDisabled();
         if (BigButton("Я случайно нажал, выпустите меня")) PostQuitMessage(0);
     } else if (g_screen == ScrInstalling) {
-        ImGui::ProgressBar(g_job.progress.load(), ImVec2(-1, 30), "");
-        if (g_job.finished) {
+        const bool away = g_prank.on && ImGui::GetTime() - g_prank.t0 < kBack;
+        if (away) {   // an empty slot where the bar used to be
+            const ImVec2 a = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddRect(a, ImVec2(a.x + ImGui::GetContentRegionAvail().x, a.y + kBarH), IM_COL32(200, 80, 80, 255), 10.0f, 0, 2.0f);
+            ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, kBarH));
+        } else {
+            ImGui::ProgressBar(g_job.progress.load(), ImVec2(-1, kBarH), "");
+        }
+        const ImVec2 barMin = ImGui::GetItemRectMin();
+        ImGui::Spacing();
+        ImGui::BeginDisabled(g_prank.on);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.80f, 0.20f, 0.20f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.92f, 0.28f, 0.28f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
+        static bool autoDone = false;   // --autoprank (demo only): presses the button by itself, for testing the animation
+        const bool autoNow = g_autoPrank && !autoDone && g_job.progress.load() > 0.1f;
+        if (autoNow) autoDone = true;
+        if (ImGui::Button("Не нажимать", ImVec2(170, 34)) || autoNow) {
+            POINT p{(LONG)barMin.x, (LONG)barMin.y};
+            ClientToScreen(hwnd, &p);
+            PrankStart(hwnd, p);
+        }
+        ImGui::PopStyleColor(3);
+        ImGui::EndDisabled();
+        if (g_prank.on && (ImGui::IsKeyPressed(ImGuiKey_Escape) || ImGui::IsMouseClicked(ImGuiMouseButton_Right))) PrankStop();   // a way out for anyone in a hurry
+        if (g_job.finished && !g_prank.on) {
             if (g_job.ok) {
                 if (g_removing) Go(ScrRemoved);
                 else { g_gamePath = LoadGamePath(); if (!g_gamePath.empty()) SaveGamePath(g_gamePath); Go(ScrDone); }
@@ -650,6 +843,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     std::thread([] { g_gpu = CheckGpu(); g_gpuReady = true; }).detach();
     g_gamePath = LoadGamePath();
     if (IsCurrent()) g_screen = ScrManage;
+    g_autoPrank = g_demo && HasArg(argc, argv, L"--autoprank");
+    if (g_autoPrank) { g_screen = ScrInstalling; RunJob(DoInstall); }
     if (shotScreen == L"done") g_screen = ScrDone;
     if (shotScreen == L"manage") g_screen = ScrManage;
     if (shotScreen == L"removed") g_screen = ScrRemoved;
@@ -672,6 +867,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(ds);
         ImGui::Begin("##root", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
+        PrankUpdate();
         UpdateConversation();
         if (g_demo && g_demoPose >= 0) g_pose = (Pose)g_demoPose;
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -699,6 +895,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_swap->Present(1, 0);
         if (!shot.empty() && ImGui::GetTime() > 3.5 && g_gpuReady) { SavePng(shot); break; }
+        if (g_autoPrank && g_screen == ScrDone && !g_prank.on) break;
         ++frames;
     }
     ImGui_ImplDX11_Shutdown();
