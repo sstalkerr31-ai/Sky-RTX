@@ -629,6 +629,7 @@ struct DeviceData {
     VkBuffer parBuf[16] = {};
     VkDeviceMemory parMem[16] = {};
     char* parPtr[16] = {};
+    VkBuffer wParBuf[16] = {}; VkDeviceMemory wParMem[16] = {}; char* wParPtr[16] = {}; bool wParTried = false, wParOk = false;   // the water pass's own parameters (its own camera)
     // material step: geometry -> material table (one section per AS slot) and average colours
     VkBuffer geoMatBuf = VK_NULL_HANDLE, matColBuf = VK_NULL_HANDLE;
     VkDeviceMemory geoMatMem = VK_NULL_HANDLE, matColMem = VK_NULL_HANDLE;
@@ -670,6 +671,7 @@ struct DeviceData {
     struct UboRef { VkBuffer buf; VkDeviceSize off; };
     std::unordered_map<VkDescriptorSet, UboRef> setUbo;               // uboMtx
     std::unordered_map<VkCommandBuffer, UboRef> mainUbo;              // uboMtx
+    std::unordered_map<VkCommandBuffer, UboRef> waterUbo;             // uboMtx: frame UBO bound in command buffers outside the main pass (the water pass)
 
     std::atomic<uint64_t> frames{0}, drawIndexed{0}, indirectCalls{0}, indirectSubdraws{0}, submits{0};
     std::atomic<uint64_t> vtxBuf{0}, idxBuf{0}, indBuf{0}, bufPatched{0}, bufPatchFail{0};
@@ -5063,7 +5065,48 @@ static void InjectWater(DeviceData* d, VkCommandBuffer cb, VkRenderPass rp, VkFr
     ii[0].imageView = cv; ii[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[1].imageView = dv; ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ii[2].imageView = d->cpView; ii[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    VkDescriptorBufferInfo bi{d->parBuf[ring], 0, sizeof(FxParams)};
+    // The water picture was drawn with the camera of its own command buffer, which need not be the frame the last trace pass saw:
+    // with the trace pass's camera every water pixel lands in the wrong place while the camera moves and the reflection drops out.
+    // So: the trace pass's parameters (its view-projection still matches the frame copy), with this pass's camera for the water itself.
+    VkBuffer parB = d->parBuf[ring];
+    {
+        std::lock_guard<std::mutex> lk(d->paintMtx);
+        if (!d->wParTried) {
+            d->wParTried = true;
+            d->wParOk = true;
+            for (int i = 0; i < 16 && d->wParOk; ++i) {
+                VkDeviceAddress dummy = 0;
+                void* mp = nullptr;
+                if (!MakeBufEx(d, 512, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->wParBuf[i], d->wParMem[i], dummy) ||
+                    d->MapMemory(d->device, d->wParMem[i], 0, VK_WHOLE_SIZE, 0, &mp) != VK_SUCCESS || !mp) d->wParOk = false;
+                else d->wParPtr[i] = (char*)mp;
+            }
+            if (!d->wParOk) Logf("!!! rt: water parameter buffers failed - the water pass uses the trace pass's camera");
+        }
+    }
+    static std::atomic<uint32_t> wRing{0};
+    DeviceData::UboRef wu{};
+    bool haveWu = false;
+    { std::lock_guard<std::mutex> lk(d->uboMtx); auto it = d->waterUbo.find(cb); if (it != d->waterUbo.end()) { wu = it->second; haveWu = true; } }
+    if (d->wParOk && haveWu) {
+        float vp[16], cam[3], inv[16];
+        if (ReadBufHost(d, wu.buf, wu.off + 224, vp, sizeof vp) && ReadBufHost(d, wu.buf, wu.off + 608, cam, sizeof cam) && FiniteMat(vp, 16) && FiniteMat(cam, 3) && Invert4(vp, inv) && FiniteMat(inv, 16)) {
+            const uint32_t k = wRing.fetch_add(1) % 16;
+            FxParams* wp = (FxParams*)d->wParPtr[k];
+            memcpy(wp, d->parPtr[ring], sizeof(FxParams));
+            memcpy(wp->inv, inv, sizeof inv);   // worldAt: the water's own camera
+            wp->cam[0] = cam[0]; wp->cam[1] = cam[1]; wp->cam[2] = cam[2];
+            parB = d->wParBuf[k];
+            static std::atomic<int> wl{0};
+            const FxParams* tp = (const FxParams*)d->parPtr[ring];
+            const float dc = fabsf(tp->cam[0] - cam[0]) + fabsf(tp->cam[1] - cam[1]) + fabsf(tp->cam[2] - cam[2]);
+            if (dc > 0.001f && wl.fetch_add(1) < 5) Logf("rt: water pass camera differs from the last trace pass by %.3f - using its own", (double)dc);
+        }
+    } else {
+        static std::atomic<int> nl{0};
+        if (nl.fetch_add(1) < 3) Logf("rt: water pass: no frame UBO bound in its command buffer - it uses the trace pass's camera");
+    }
+    VkDescriptorBufferInfo bi{parB, 0, sizeof(FxParams)};
     VkWriteDescriptorSetAccelerationStructureKHR asw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
     asw.accelerationStructureCount = 1;
     asw.pAccelerationStructures = &tlas;
@@ -5205,14 +5248,14 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdBindDescriptorSets(VkCommandBuffer cb
         std::lock_guard<std::mutex> lk(d->uboMtx);
         for (uint32_t i = 0; i < dynCount && d->dynOffsets.size() < 64; ++i) d->dynOffsets.insert(pDyn[i]);
     }
-    if (d->track && d->mainCount.load(std::memory_order_relaxed) > 0 && bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+    if (d->track && bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && (d->mainCount.load(std::memory_order_relaxed) > 0 || g_reflOn)) {
         bool inMain;
         { std::lock_guard<std::mutex> lk(d->paintMtx); inMain = d->mainCb.count(cb) != 0; }
-        if (inMain) {
+        if (inMain || g_reflOn) {
             std::lock_guard<std::mutex> lk(d->uboMtx);
             for (uint32_t i = 0; i < setCount; ++i) {
                 auto it = d->setUbo.find(pSets[i]);
-                if (it != d->setUbo.end()) { d->mainUbo[cb] = it->second; break; }
+                if (it != d->setUbo.end()) { if (inMain) d->mainUbo[cb] = it->second; else d->waterUbo[cb] = it->second; break; }
             }
         }
     }
