@@ -96,6 +96,7 @@ static int g_aniso = 16;          // step 13: anisotropic filtering forced on ev
 static std::atomic<bool> g_texProbe{false};  // cfg texprobe=1: log which textures every pipeline samples (log only)
 static std::atomic<bool> g_matAlbedo{false}; // cfg matalbedo=1: off-screen ray hits use the average colour of their material (Ctrl+F9 on/off)
 static bool g_matTrack = false;              // descriptor tracking for materials, decided at start: set before the game creates its textures
+static bool g_uboTrack = false;              // per-draw UBO (set 0 binding 0) tracking: materials or water, decided at start like g_matTrack
 static bool g_matBaked = true;               // cfg matbaked=0: the trace shader reads no vertices, ambient at the hit stays one shade colour
 static const uint64_t kMatBakeVs[] = {0x80d5b0d5e9f45e34ull,    // RockFaceShMesh: baked light in attributes loc2, loc3
                                       0xa179ffcd45e93352ull,    // GrassSh: the same layout of baked light
@@ -792,7 +793,8 @@ static void TpEarlyCfg() {  // LoadCfg first runs after frame 1, but texprobe ha
     while (fgets(line, sizeof line, f))
     {
         if (sscanf(line, " texprobe = %d", &v) == 1) g_texProbe = v != 0;
-        if (sscanf(line, " matalbedo = %d", &v) == 1) { g_matAlbedo = v != 0; g_matTrack = v != 0; }
+        if (sscanf(line, " matalbedo = %d", &v) == 1) { g_matAlbedo = v != 0; g_matTrack = v != 0; if (v) g_uboTrack = true; }
+        if (sscanf(line, " waterfx = %d", &v) == 1 && v) g_uboTrack = true;
     }
     fclose(f);
 }
@@ -1952,6 +1954,25 @@ static std::mutex g_matMtx;
 static std::map<std::pair<VkImageView, VkImageView>, uint32_t> g_matIds;
 static std::vector<MatEnt> g_mats(1, MatEnt{VK_NULL_HANDLE, VK_NULL_HANDLE, true});   // id 0 = no material
 static std::map<uint32_t, uint32_t> g_matConstIds;   // quantized colour -> id
+
+// Ocean / OceanMesh place every piece with a model matrix at offset 0 of their per-draw UBO (world = M * position):
+// without it all pieces would sit at the origin, on top of each other, and the water test would only work in squares.
+static bool WaterMatrix(VkCommandBuffer cb, DeviceData* d, VkTransformMatrixKHR& xf) {
+    TpUbo u{};
+    {
+        std::lock_guard<std::mutex> lk(g_tpMtx);
+        auto it = g_tpCbUbo.find(cb);
+        if (it == g_tpCbUbo.end()) return false;
+        u = it->second;
+    }
+    float mm[16];
+    if (!ReadBufHost(d, u.buf, u.off, mm, sizeof mm)) return false;
+    for (float v : mm) if (!(fabsf(v) < 1e7f)) return false;   // also NaN
+    if (fabsf(mm[3]) > 1e-4f || fabsf(mm[7]) > 1e-4f || fabsf(mm[11]) > 1e-4f || fabsf(mm[15] - 1.0f) > 1e-3f) return false;   // an affine matrix, column-major
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c) xf.matrix[r][c] = mm[c * 4 + r];
+    return true;
+}
 
 static uint32_t MatConst(DeviceData* d, VkCommandBuffer cb, uint64_t vs, uint32_t off) {
     if (!d->matColPtr) return 0;   // the first frames: the draw comes again
@@ -3430,6 +3451,26 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         g.geometry.triangles.indexData.deviceAddress = ia + ibase;
         VkAccelerationStructureBuildRangeInfoKHR rg{};
         rg.primitiveCount = c.indexCount / 3;
+        if (isWater) {   // every water piece with its own matrix, in the per-frame BLAS
+            static std::atomic<uint64_t> wok{0}, wbad{0};
+            VkTransformMatrixKHR xf{};
+            if (!WaterMatrix(cb, d, xf)) {
+                if (++wbad == 1) Logf("rt: water piece without a readable model matrix (waterfx=1 has to be in SkyRT.cfg when the game starts) - left out");
+                continue;
+            }
+            if (fg.dynGeoms.size() >= kXfCap || fg.propTris + rg.primitiveCount > kPropTrisMax) { fg.skipOther++; continue; }
+            fg.dynGeoms.push_back(g);
+            fg.dynRanges.push_back(rg);
+            fg.dynKeys.push_back(GeoKey{st.vb[binding], st.ib, vbase, ibase, c.indexCount, vstride});
+            fg.dynMems.emplace_back(vbi.mem, ibi.mem);
+            fg.dynXf.push_back(xf);
+            fg.dynProp.push_back(1);
+            fg.propTris += rg.primitiveCount;
+            fg.propGeoms++;
+            const uint64_t n = ++wok;
+            if (n <= 3 || n == 5000) Logf("rt: water piece #%llu placed at %.1f %.1f %.1f (scale x %.2f), %u triangles", (unsigned long long)n, xf.matrix[0][3], xf.matrix[1][3], xf.matrix[2][3], xf.matrix[0][0], rg.primitiveCount);
+            continue;
+        }
         if (isProp) {   // step 18: one geometry per instance, same mesh, transform = position + uniform scale decoded from the instance buffer
             static std::atomic<uint64_t> pn{0}, pbad{0};
             if (c.instanceCount > kInstMaxPerDraw || c.indexCount < kInstMinIdx) { fg.skipOther++; continue; }
@@ -4193,15 +4234,17 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         std::lock_guard<std::mutex> lk(d->geoMtx);
         auto it = d->frameGeo.find(cb);
         if (it != d->frameGeo.end()) { fg = std::move(it->second); d->frameGeo.erase(it); }
-        DeviceData::FrameGeo& wf = d->waterFg;   // the water from its own pass (static water only: it goes into the cache)
-        if (!wf.keys.empty()) {
+        DeviceData::FrameGeo& wf = d->waterFg;   // the water from its own pass: placed pieces, they go into this frame's dynamic BLAS
+        if (!wf.dynGeoms.empty()) {
             static std::atomic<int> wl{0};
-            if (wl.fetch_add(1) < 3) Logf("rt: water geometry from its own pass: %zu pieces, %llu triangles (+ %zu CPU-written, not used)", wf.keys.size(), (unsigned long long)wf.tris, wf.dynGeoms.size());
-            for (size_t i = 0; i < wf.keys.size(); ++i) {
-                fg.geoms.push_back(wf.geoms[i]); fg.ranges.push_back(wf.ranges[i]); fg.keys.push_back(wf.keys[i]); fg.mems.push_back(wf.mems[i]);
-                fg.mats.push_back(0); fg.verts.push_back(DeviceData::FrameGeo::Verts{});
+            if (wl.fetch_add(1) < 3) Logf("rt: water geometry from its own pass: %zu pieces, %llu triangles", wf.dynGeoms.size(), (unsigned long long)wf.propTris);
+            for (size_t i = 0; i < wf.dynGeoms.size(); ++i) {
+                if (fg.dynGeoms.size() >= kXfCap) break;
+                fg.dynGeoms.push_back(wf.dynGeoms[i]); fg.dynRanges.push_back(wf.dynRanges[i]); fg.dynKeys.push_back(wf.dynKeys[i]);
+                fg.dynMems.push_back(wf.dynMems[i]); fg.dynXf.push_back(wf.dynXf[i]); fg.dynProp.push_back(wf.dynProp[i]);
+                fg.propTris += wf.dynRanges[i].primitiveCount;
+                fg.propGeoms++;
             }
-            fg.tris += wf.tris;
         }
         wf = DeviceData::FrameGeo{};
     }
@@ -5109,7 +5152,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_UpdateDescriptorSets(VkDevice device, ui
             }
         }
     }
-    if ((g_texProbe.load(std::memory_order_relaxed) || g_matTrack) && pWrites) TpOnWrite(writeCount, pWrites);
+    if ((g_texProbe.load(std::memory_order_relaxed) || g_uboTrack) && pWrites) TpOnWrite(writeCount, pWrites);
     d->UpdateDescriptorSets(device, writeCount, pWrites, copyCount, pCopies);
 }
 
@@ -5135,7 +5178,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_CmdBindDescriptorSets(VkCommandBuffer cb
             }
         }
     }
-    if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && (g_texProbe.load(std::memory_order_relaxed) || g_matTrack)) TpOnBind(cb, firstSet, setCount, pSets, dynCount, pDyn);
+    if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && (g_texProbe.load(std::memory_order_relaxed) || g_uboTrack)) TpOnBind(cb, firstSet, setCount, pSets, dynCount, pDyn);
     d->CmdBindDescriptorSets(cb, bindPoint, layout, firstSet, setCount, pSets, dynCount, pDyn);
 }
 
