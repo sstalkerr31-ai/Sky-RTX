@@ -41,7 +41,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U32
 layout(set = 0, binding = 11, std430) readonly buffer GeoMat { uint geoMat[]; };   // material of every geometry of the static BLAS: [slot * 30000 + geometry index]
 struct MatColor { vec4 c; vec4 pad[15]; };   // 256 bytes: rt_mat.comp writes through a descriptor offset
 layout(set = 0, binding = 12, std430) readonly buffer MatColors { MatColor matColor[]; };
-layout(set = 0, binding = 15, std430) buffer CastHist { uint castHist[]; };   // castprobe: [geometry * 2] hits, [+1] hits closer than 1 m; 30000+ = other instances
+layout(set = 0, binding = 15, std430) buffer CastHist { uint castHist[]; };   // castprobe: [geometry * 5] hits, [+1] hits closer than 1 m, [+2..4] sum of the hit points (int); 30000+ = other instances
 layout(set = 0, binding = 8, rgba16f) uniform image2D uHAp;    // step 22: previous frame accumulated indirect light (read only here)
 layout(set = 0, binding = 9, rgba32f) uniform image2D uHBp;    // previous frame: shadow, depth, sample count
 layout(set = 0, binding = 10, std430) readonly buffer Lights {
@@ -292,11 +292,16 @@ void main() {
             while (rayQueryProceedEXT(rq)) {}
             if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
                 hits += 1.0;
-                if ((u.mat.x & 16u) != 0u) {
+                if ((u.mat.x & 16u) != 0u && (p.x & 7) == 0 && (p.y & 7) == 0 && i == 0) {   // every 64th pixel, first ray: the buffer is in system memory
                     uint inst = uint(rayQueryGetIntersectionInstanceIdEXT(rq, true));
-                    uint k = inst == 0u ? min(uint(rayQueryGetIntersectionGeometryIndexEXT(rq, true)), 29999u) : 30000u + min(inst, 7u);
-                    atomicAdd(castHist[k * 2u], 1u);
-                    if (rayQueryGetIntersectionTEXT(rq, true) < 1.0) atomicAdd(castHist[k * 2u + 1u], 1u);
+                    uint k = (inst == 0u ? min(uint(rayQueryGetIntersectionGeometryIndexEXT(rq, true)), 29999u) : 30000u + min(inst, 7u)) * 5u;
+                    float th = rayQueryGetIntersectionTEXT(rq, true);
+                    vec3 hp = origin + dir * th;
+                    atomicAdd(castHist[k], 1u);
+                    if (th < 1.0) atomicAdd(castHist[k + 1u], 1u);
+                    atomicAdd(castHist[k + 2u], uint(int(round(hp.x))));
+                    atomicAdd(castHist[k + 3u], uint(int(round(hp.y))));
+                    atomicAdd(castHist[k + 4u], uint(int(round(hp.z))));
                 }
             }
         }

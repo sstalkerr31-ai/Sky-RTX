@@ -2743,10 +2743,10 @@ static bool EnsurePaintResources(DeviceData* d) {
             d->MapMemory(d->device, d->geoMatMem, 0, VK_WHOLE_SIZE, 0, &gp) != VK_SUCCESS || !gp ||
             d->MapMemory(d->device, d->matColMem, 0, VK_WHOLE_SIZE, 0, &cp) != VK_SUCCESS || !cp) { Logf("!!! rt: material buffers failed"); return false; }
         void* hp = nullptr;
-        if (!MakeBufEx(d, (VkDeviceSize)(kMaxCacheGeoms + 8) * 2 * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->castBuf, d->castMem, da) ||
+        if (!MakeBufEx(d, (VkDeviceSize)(kMaxCacheGeoms + 8) * 5 * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->castBuf, d->castMem, da) ||
             d->MapMemory(d->device, d->castMem, 0, VK_WHOLE_SIZE, 0, &hp) != VK_SUCCESS || !hp) { Logf("!!! rt: shadow probe buffer failed"); return false; }
         d->castPtr = (uint32_t*)hp;
-        memset(hp, 0, (size_t)(kMaxCacheGeoms + 8) * 2 * sizeof(uint32_t));
+        memset(hp, 0, (size_t)(kMaxCacheGeoms + 8) * 5 * sizeof(uint32_t));
         d->geoMatPtr = (uint32_t*)gp;
         d->matColPtr = (char*)cp;
         memset(gp, 0, (size_t)8 * kMaxCacheGeoms * sizeof(uint32_t));
@@ -4337,34 +4337,38 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         set = d->paintSets[ringIdx];
     }
     LevelUpdate(d, cb);
-    if (g_castProbe && d->castPtr && d->frames.load() - d->castLast >= 120) {   // what the sun shadow rays of the last ~2 s ran into
+    if (g_castProbe && d->castPtr && d->frames.load() - d->castLast >= 300) {   // what the sun shadow rays of the last ~5 s ran into (every 64th pixel)
         d->castLast = d->frames.load();
         const size_t n = kMaxCacheGeoms + 8;
         std::vector<std::pair<uint32_t, uint32_t>> top;   // hits, index
         uint64_t all = 0;
-        for (uint32_t i = 0; i < n; ++i) { const uint32_t c = d->castPtr[i * 2]; if (c) { top.emplace_back(c, i); all += c; } }
+        for (uint32_t i = 0; i < n; ++i) { const uint32_t c = d->castPtr[i * 5]; if (c) { top.emplace_back(c, i); all += c; } }
         std::sort(top.begin(), top.end(), [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) { return a.first > b.first; });
         std::vector<GeoKey> keys;
         { std::lock_guard<std::mutex> lk(d->cacheMtx); if (d->rtCur >= 0) keys = d->slotKeys[d->rtCur]; }
         std::string out;
         for (size_t r = 0; r < top.size() && r < 14; ++r) {
             const uint32_t i = top[r].second;
-            char t[320];
+            const int32_t* sp = (const int32_t*)&d->castPtr[i * 5 + 2];
+            const double cn = top[r].first;
+            char at[96];
+            snprintf(at, sizeof at, "  avg hit at %.0f %.0f %.0f", sp[0] / cn, sp[1] / cn, sp[2] / cn);
+            char t[400];
             if (i >= kMaxCacheGeoms) {
                 const uint32_t inst = i - (uint32_t)kMaxCacheGeoms;
-                snprintf(t, sizeof t, "\n    %5.1f%%  instance %u (%s)  near<1m %.0f%%", 100.0 * top[r].first / all, inst, inst == 1 ? "level ground or characters" : inst == 2 ? "level ground" : "?", 100.0 * d->castPtr[i * 2 + 1] / top[r].first);
+                snprintf(t, sizeof t, "\n    %5.1f%%  instance %u (%s)  near<1m %.0f%%%s", 100.0 * top[r].first / all, inst, inst == 1 ? "level ground or characters" : inst == 2 ? "level ground" : "?", 100.0 * d->castPtr[i * 5 + 1] / top[r].first, at);
             } else {
                 uint64_t fs = 0; uint32_t tris = 0, verts = 0;
                 if (i < keys.size()) {
                     { std::lock_guard<std::mutex> lk(d->keyFsMtx); auto it = d->keyFs.find(keys[i]); if (it != d->keyFs.end()) fs = it->second; }
                     tris = keys[i].count / 3; verts = keys[i].stride;
                 }
-                snprintf(t, sizeof t, "\n    %5.1f%%  geometry %u: %s, %u tris (vertex stride %u)  near<1m %.0f%%", 100.0 * top[r].first / all, i, fs ? FsName(fs).c_str() : "?", tris, verts, 100.0 * d->castPtr[i * 2 + 1] / top[r].first);
+                snprintf(t, sizeof t, "\n    %5.1f%%  geometry %u: %s, %u tris (vertex stride %u)  near<1m %.0f%%%s", 100.0 * top[r].first / all, i, fs ? FsName(fs).c_str() : "?", tris, verts, 100.0 * d->castPtr[i * 5 + 1] / top[r].first, at);
             }
             out += t;
         }
-        if (all) Logf("castprobe: sun shadow ray hits in the last ~2 s: %llu, by what they hit:%s", (unsigned long long)all, out.c_str());
-        memset(d->castPtr, 0, n * 2 * sizeof(uint32_t));
+        if (all) Logf("castprobe: sun shadow ray hits in the last ~5 s (every 64th pixel): %llu, by what they hit:%s", (unsigned long long)all, out.c_str());
+        memset(d->castPtr, 0, n * 5 * sizeof(uint32_t));
     }
 
     // ---- (re)build BLAS + TLAS only when the set of geometry changed, otherwise reuse the newest complete slot
