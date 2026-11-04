@@ -10,3 +10,7 @@ Level file format (BstBaked.meshes, GEO0 section), used by layer/level_terrain.h
   SkyRT's reader is its own C++ code; no code from those projects is included.
 
 Objects.level.bin (TGCL) layout: Stalker 31's own reverse engineering.
+
+Vulkan headers (third_party/vulkan/include: vulkan/*.h, vk_video/*.h), from the Vulkan SDK 1.4.357
+  Copyright The Khronos Group Inc., Valve Corporation, LunarG, Inc. Apache-2.0 OR MIT (see the SPDX line in each file).
+  Kept here so the layer and the installer build anywhere (also on GitHub) with only Visual Studio.

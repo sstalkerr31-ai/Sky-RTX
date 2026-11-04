@@ -4,6 +4,7 @@
 // --root <dir>    use this folder and a test registry key instead of the real ones
 // --selftest      install, check, uninstall, write the result to stdout-less <root>\selftest.txt
 // --shot <png> <screen>   render one screen to a file and quit
+// --updtest       check GitHub for an update, write the answer to <root or temp>\updtest.txt and quit
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -15,6 +16,8 @@
 #include <d3d11.h>
 #include <mmsystem.h>
 #include <vulkan/vulkan.h>
+#include <winhttp.h>
+#include <bcrypt.h>
 
 #include <atomic>
 #include <cmath>
@@ -333,16 +336,173 @@ static bool DoUninstall(Job& j, std::string& err) {
     j.Step("Готово", 1.0f);
     return true;
 }
-// is the installed layer exactly the one inside this exe? an old copy must not pass for an install
-static bool IsCurrent() {
-    if (g_demo) return g_demoInstalled;
-    if (!IsInstalled() || !FileThere(InstallDir() + L"\\SkyRT_Setup.exe")) return false;
+// ============================================================ updates: GitHub is our server
+// Every push builds the layer and this installer on GitHub (.github/workflows/build.yml) and puts them, with update.json, into one
+// release that is overwritten each time ("latest" from main, "test" from the installer branch). This installer reads update.json
+// once at start; when the layer there differs from the installed one it offers it, never insists. Whatever it downloads is
+// installed only if its SHA-256 matches update.json. SkyRT.cfg is never touched, so settings stay.
+#ifndef SKYRT_CHANNEL
+#define SKYRT_CHANNEL "latest"
+#endif
+#define SKYRT_WIDEN2(x) L##x
+#define SKYRT_WIDEN(x) SKYRT_WIDEN2(x)
+#define SKYRT_CHANNEL_W SKYRT_WIDEN(SKYRT_CHANNEL)
+static const wchar_t* kRepoPath = L"/sstalkerr31-ai/Sky-RTX/releases/download/" SKYRT_CHANNEL_W L"/";
+static std::string Trim(const std::string& s);
+static std::string Sha256(const std::string& data) {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE h = nullptr;
+    unsigned char out[32] = {};
+    std::string hex;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return hex;
+    if (BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0) == 0) {
+        if (BCryptHashData(h, (PUCHAR)data.data(), (ULONG)data.size(), 0) == 0 && BCryptFinishHash(h, out, sizeof out, 0) == 0) {
+            static const char* d = "0123456789abcdef";
+            for (unsigned char c : out) { hex += d[c >> 4]; hex += d[c & 15]; }
+        }
+        BCryptDestroyHash(h);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return hex;
+}
+static std::string EmbeddedLayer() {
     HRSRC r = FindResourceW(nullptr, MAKEINTRESOURCEW(101), MAKEINTRESOURCEW(10));
     HGLOBAL h = r ? LoadResource(nullptr, r) : nullptr;
     const void* p = h ? LockResource(h) : nullptr;
-    if (!p) return false;
+    return p ? std::string((const char*)p, SizeofResource(nullptr, r)) : std::string();
+}
+// GET https://github.com<path>; WinHTTP follows GitHub's redirect to its file storage. Empty on any failure.
+static std::string HttpGet(const std::wstring& path, size_t maxBytes, std::string& err) {
+    std::string body;
+    HINTERNET s = WinHttpOpen(L"SkyRT-Setup", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s) { err = "нет доступа к интернету"; return body; }
+    WinHttpSetTimeouts(s, 8000, 8000, 15000, 30000);
+    HINTERNET c = WinHttpConnect(s, L"github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+    DWORD status = 0, sl = sizeof status;
+    if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr) &&
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &sl, WINHTTP_NO_HEADER_INDEX)) {
+        if (status == 200) {
+            for (;;) {
+                DWORD avail = 0;
+                if (!WinHttpQueryDataAvailable(r, &avail) || !avail) break;
+                if (body.size() + avail > maxBytes) { body.clear(); err = "файл слишком большой"; break; }
+                std::string chunk(avail, '\0');
+                DWORD got = 0;
+                if (!WinHttpReadData(r, &chunk[0], avail, &got)) { body.clear(); err = "связь оборвалась"; break; }
+                body.append(chunk.data(), got);
+            }
+        } else err = status == 404 ? "на GitHub пока нет сборки" : "GitHub ответил " + std::to_string(status);
+    } else if (err.empty()) err = "GitHub не отвечает";
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    WinHttpCloseHandle(s);
+    return body;
+}
+// the value of "key" in a flat JSON object (strings only), with the usual escapes
+static std::string JsonStr(const std::string& j, const char* key) {
+    const std::string k = std::string("\"") + key + "\"";
+    size_t i = j.find(k);
+    if (i == std::string::npos) return "";
+    i = j.find(':', i + k.size());
+    if (i == std::string::npos) return "";
+    i = j.find('"', i);
+    if (i == std::string::npos) return "";
+    std::string out;
+    for (++i; i < j.size() && j[i] != '"'; ++i) {
+        if (j[i] != '\\' || i + 1 >= j.size()) { out += j[i]; continue; }
+        const char e = j[++i];
+        if (e == 'n') out += '\n';
+        else if (e == 't') out += ' ';
+        else if (e == 'r') {}
+        else if (e == 'u' && i + 4 < j.size()) {
+            const unsigned cp = (unsigned)strtoul(j.substr(i + 1, 4).c_str(), nullptr, 16);
+            i += 4;
+            if (cp < 0x80) out += (char)cp;
+            else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 63)); }
+            else { out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 63)); out += (char)(0x80 | (cp & 63)); }
+        } else out += e;
+    }
+    return out;
+}
+struct UpdateInfo {
+    std::atomic<int> state{0};   // 0 checking, 1 nothing new, 2 available, 3 could not check
+    std::string version, commit, notes, dllSha, setupSha, err;   // written before state is set
+};
+static UpdateInfo g_upd;
+static bool g_updLater = false;   // "Потом": quiet until the next start
+static std::wstring StatePath() { return InstallDir() + L"\\update_state.txt"; }   // line 1: SHA-256 of a layer installed by an update, line 2: skipped
+static std::vector<std::string> ReadState() {
+    std::vector<std::string> v;
+    const std::string t = ReadText(StatePath());
+    size_t a = 0;
+    while (a < t.size()) { size_t b = t.find('\n', a); if (b == std::string::npos) b = t.size(); v.push_back(Trim(t.substr(a, b - a))); a = b + 1; }
+    v.resize(2);
+    return v;
+}
+static void WriteState(const std::string& installed, const std::string& skipped) {
+    std::ofstream f(StatePath().c_str(), std::ios::binary | std::ios::trunc);
+    f << installed << "\n" << skipped << "\n";
+}
+static void CheckUpdate() {
+    std::string err;
+    const std::string j = HttpGet(std::wstring(kRepoPath) + L"update.json", 64 * 1024, err);
+    g_upd.version = JsonStr(j, "version");
+    g_upd.commit = JsonStr(j, "commit");
+    g_upd.notes = JsonStr(j, "notes");
+    g_upd.dllSha = JsonStr(j, "dll_sha256");
+    g_upd.setupSha = JsonStr(j, "setup_sha256");
+    if (g_upd.dllSha.size() != 64) { g_upd.err = err.empty() ? "update.json без контрольной суммы" : err; g_upd.state = 3; return; }
+    const std::string have = Sha256(ReadText(InstallDir() + L"\\SkyRT.dll"));
+    const std::vector<std::string> st = ReadState();
+    g_upd.state = (IsInstalled() && have != g_upd.dllSha && st[1] != g_upd.dllSha) ? 2 : 1;
+}
+// download one file of the release, check its SHA-256, put it in place
+static bool FetchVerified(const wchar_t* name, const std::string& sha, size_t maxBytes, const std::wstring& dest, std::string& err) {
+    std::string e;
+    const std::string data = HttpGet(std::wstring(kRepoPath) + name, maxBytes, e);
+    if (data.empty()) { err = "Не скачалось: " + e + "."; return false; }
+    if (Sha256(data) != sha) { err = "Скачанный файл не совпал с контрольной суммой. Я его не поставил."; return false; }
+    const std::wstring tmp = dest + L".new";
+    {
+        std::ofstream f(tmp.c_str(), std::ios::binary | std::ios::trunc);
+        f.write(data.data(), (std::streamsize)data.size());
+        if (!f) { err = "Не смог записать " + U(tmp); return false; }
+    }
+    if (FileThere(dest)) {   // a running exe cannot be overwritten, but it can be renamed
+        const std::wstring old = dest + L".old";
+        DeleteFileW(old.c_str());
+        if (!MoveFileExW(dest.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(tmp.c_str()); err = "Не смог заменить " + U(dest) + ": " + LastError(); return false; }
+    }
+    if (!MoveFileExW(tmp.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING)) { err = "Не смог поставить " + U(dest) + ": " + LastError(); return false; }
+    return true;
+}
+static bool DoUpdate(Job& j, std::string& err) {
+    if (g_demo) { for (int i = 1; i <= 3; ++i) { j.Step("Качаю свежие лучи с GitHub", i / 4.0f); Sleep(900); } j.Step("Готово", 1.0f); return true; }
+    if (GameRunning()) { err = "Игра запущена. Закрой Sky и попробуй ещё раз."; return false; }
+    j.Step("Качаю свежие лучи с GitHub", 0.2f);
+    if (!FetchVerified(L"SkyRT.dll", g_upd.dllSha, 64u << 20, InstallDir() + L"\\SkyRT.dll", err)) return false;
+    WriteState(g_upd.dllSha, ReadState()[1]);
+    if (g_upd.setupSha.size() == 64) {
+        j.Step("Обновляю себя", 0.7f);
+        std::string e2;
+        const std::wstring me = InstallDir() + L"\\SkyRT_Setup.exe";
+        if (Sha256(ReadText(me)) != g_upd.setupSha) FetchVerified(L"SkyRT_Setup.exe", g_upd.setupSha, 64u << 20, me, e2);   // not fatal: the layer is what matters
+    }
+    j.Step("Готово", 1.0f);
+    g_upd.state = 1;
+    return true;
+}
+
+// is the installed layer the one inside this exe, or one an update installed? an old copy must not pass for an install
+static bool IsCurrent() {
+    if (g_demo) return g_demoInstalled;
+    if (!IsInstalled() || !FileThere(InstallDir() + L"\\SkyRT_Setup.exe")) return false;
     const std::string have = ReadText(InstallDir() + L"\\SkyRT.dll");
-    return have.size() == SizeofResource(nullptr, r) && memcmp(have.data(), p, have.size()) == 0;
+    if (have.empty()) return false;
+    if (have == EmbeddedLayer()) return true;
+    const std::string installed = ReadState()[0];
+    return installed.size() == 64 && Sha256(have) == installed;
 }
 template <class F> static void RunJob(F f) {
     g_job.finished = false; g_job.ok = false; g_job.running = true; g_job.progress = 0.0f;
@@ -1031,7 +1191,11 @@ static void UpdateConversation() {
     } else if (g_screen == ScrDone) {
         Say(Joy, g_gamePath.empty() ? "Получилось! Только я не нашёл игру. Покажите мне, где лежит Sky.exe, пожалуйста." : "Получилось! Лучи на месте. Если что-то сломается, я не виноват. Наверное.");
     } else if (g_screen == ScrManage) {
-        Say(Serious, "Лучи уже установлены. Чем могу помочь?");
+        if (g_upd.state == 2 && !g_updLater) {
+            std::string n = g_upd.notes;
+            if (n.size() > 260) { n.resize(260); while (!n.empty() && ((unsigned char)n.back() & 0xC0) == 0x80) n.pop_back(); if (!n.empty()) n.pop_back(); n += "…"; }
+            Say(Joy, "Ой, на GitHub есть свежая версия лучей" + (g_upd.version.empty() ? std::string() : " (" + g_upd.version + ")") + "! Поставить? Настройки не трону." + (n.empty() ? std::string() : "\nЧто нового: " + n));
+        } else Say(Serious, "Лучи уже установлены. Чем могу помочь?");
     } else if (g_screen == ScrRemoved) {
         Say(Cover, "Всё убрал. Мне немножко грустно, но я понимаю.");
     } else if (g_screen == ScrSettings) {
@@ -1076,6 +1240,12 @@ static void DrawActions(HWND hwnd) {
                 Go(ScrError);
             }
         }
+    } else if (g_screen == ScrManage && g_upd.state == 2 && !g_updLater) {
+        if (BigButton("Обновить")) { g_removing = false; Go(ScrInstalling); RunJob(DoUpdate); }
+        const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        if (BigButton("Потом", half)) g_updLater = true;
+        ImGui::SameLine();
+        if (BigButton("Не напоминать об этой", half)) { if (!g_demo) WriteState(ReadState()[0], g_upd.dllSha); g_updLater = true; }
     } else if (g_screen == ScrDone || g_screen == ScrManage) {
         ImGui::BeginDisabled(g_gamePath.empty());
         if (BigButton("Играть с лучами")) {
@@ -1175,6 +1345,22 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         g_demo = HasArg(argc, argv, L"--demo") || name.find(L"demo") != std::wstring::npos;
     }
     if (HasArg(argc, argv, L"--selftest")) return SelfTest();
+    if (HasArg(argc, argv, L"--updtest")) {   // test: what would the update check say (and download + verify the layer into the test root)
+        CheckUpdate();
+        std::string out = "channel " SKYRT_CHANNEL "\nstate " + std::to_string(g_upd.state.load()) + "\nversion " + g_upd.version + "\ncommit " + g_upd.commit + "\ndll " + g_upd.dllSha +
+                          "\nsetup " + g_upd.setupSha + "\nerr " + g_upd.err + "\nnotes " + g_upd.notes + "\n";
+        if (!g_testRoot.empty() && g_upd.dllSha.size() == 64) {
+            SHCreateDirectoryExW(nullptr, InstallDir().c_str(), nullptr);
+            std::string e;
+            const bool ok = FetchVerified(L"SkyRT.dll", g_upd.dllSha, 64u << 20, InstallDir() + L"\\SkyRT.dll", e);
+            out += std::string("download ") + (ok ? "ok" : "failed: " + e) + "\n";
+        }
+        wchar_t tmp[MAX_PATH] = {};
+        GetTempPathW(MAX_PATH, tmp);
+        std::ofstream f(((g_testRoot.empty() ? std::wstring(tmp) : g_testRoot + L"\\") + L"updtest.txt").c_str(), std::ios::binary);
+        f << out;
+        return g_upd.state == 3 ? 1 : 0;
+    }
     if (HasArg(argc, argv, L"--settest")) {   // test: load the cfg, change one value, save
         LoadSettings();
         for (int i = 0; i < kSetCount; ++i) if (!strcmp(skyrt::kSettings[i].key, "gistrength")) g_set[i] = 0.5f;
@@ -1234,6 +1420,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     for (int i = 0; i < PoseCount; ++i) spr[i] = LoadSprite(201 + i);
 
     std::thread([] { g_gpu = CheckGpu(); g_gpuReady = true; }).detach();
+    DeleteFileW((InstallDir() + L"\\SkyRT_Setup.exe.old").c_str());   // left by a self-update
+    if (!g_demo) std::thread(CheckUpdate).detach();
     g_gamePath = LoadGamePath();
     if (IsCurrent()) g_screen = ScrManage;
     g_autoPrank = g_demo && HasArg(argc, argv, L"--autoprank");

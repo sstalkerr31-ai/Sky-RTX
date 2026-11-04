@@ -1,0 +1,72 @@
+# Every push builds the layer and the installer and puts them into one release that is overwritten each time.
+# The installer reads update.json from there and offers the new layer (it never insists). No hand-made releases needed.
+#   main      -> release "latest" (what players get)
+#   installer -> release "test"   (pre-release, for trying things first)
+name: build
+
+on:
+  push:
+    branches: [main, installer]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      CHANNEL: ${{ github.ref_name == 'main' && 'latest' || 'test' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 30
+
+      - name: Build the layer and the installer
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSDIR=%%i
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
+          set SKYRT_CHANNEL=%CHANNEL%
+          call installer\build.bat
+
+      - name: Publish to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $b = 'installer/build'
+          $ver = (Select-String -Path layer/skyrt_version.h -Pattern 'SKYRT_VERSION_STR "([^"]+)"').Matches[0].Groups[1].Value
+          $notes = (git log -8 --no-merges --format='- %s') -join "`n"
+          $info = [ordered]@{
+            version      = "$ver.$env:GITHUB_RUN_NUMBER"
+            channel      = $env:CHANNEL
+            commit       = $env:GITHUB_SHA
+            built        = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm') + ' UTC'
+            dll_sha256   = (Get-FileHash "$b/SkyRT.dll" -Algorithm SHA256).Hash.ToLower()
+            setup_sha256 = (Get-FileHash "$b/SkyRT_Setup.exe" -Algorithm SHA256).Hash.ToLower()
+            notes        = $notes
+          }
+          $info | ConvertTo-Json | Set-Content -Path "$b/update.json" -Encoding utf8NoBOM
+          Get-Content "$b/update.json"
+
+          # move the tag to this commit, create the release once, then replace its files
+          git tag -f $env:CHANNEL $env:GITHUB_SHA
+          git push -f origin "refs/tags/$($env:CHANNEL)"
+          $title = if ($env:CHANNEL -eq 'latest') { 'SkyRT (latest build)' } else { 'SkyRT (test build)' }
+          gh release view $env:CHANNEL *> $null
+          if ($LASTEXITCODE -ne 0) {
+            $pre = if ($env:CHANNEL -eq 'latest') { @() } else { @('--prerelease') }
+            gh release create $env:CHANNEL --title $title --notes 'Built automatically on every push.' @pre
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          gh release upload $env:CHANNEL "$b/SkyRT.dll" "$b/SkyRT_Setup.exe" "$b/update.json" --clobber
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $body = "Built automatically from $($env:GITHUB_SHA.Substring(0,7)) ($($info.built)). Download SkyRT_Setup.exe.`n`nRecent changes:`n$notes"
+          gh release edit $env:CHANNEL --title $title --notes $body
+          exit 0
