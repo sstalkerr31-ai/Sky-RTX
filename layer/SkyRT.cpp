@@ -70,6 +70,8 @@ static std::atomic<uint64_t> g_heapLive[16], g_heapPeak[16], g_allocFails{0}, g_
 static uint64_t g_heapSize[16] = {};
 static uint32_t g_heapCount = 0;
 static bool g_reflOn = false;                         // step 9: ray traced water
+static float g_waterF0 = 0.25f;      // cfg waterf0: how much the water reflects looking straight down (real water 0.02, a mirror 1)
+static bool g_waterDebug = false;    // cfg waterdebug=1: the water shows only the reflection
 static float g_reflStrength = 0.5f, g_glint = 1.0f;
 static int g_dumpShaders = 1;    // step 15: write every SPIR-V module to SkyRT_shaders\<fnv>.spv (cfg dumpshaders=0/1)
 static int g_instGeo = 1;         // step 18: instanced props (few instances, known layout) -> baked into the per-frame dynamic BLAS with per-instance transforms (cfg instgeo=0/1)
@@ -2681,6 +2683,7 @@ struct FxParams {
     uint32_t lvl[4]; // the level ground's buffers: x,y = index buffer address (lo, hi), z,w = vertex positions; 0 = none
     float grassCol[4];   // the game's grass colour (per-draw colour of GrassSh), w = 1 when known
     float rockCol[4];    // the game's rock colour (per-draw colour of RockFaceSh / RockFaceShMesh), w = 1 when known
+    float wat[4];        // water: x = base reflectivity (cfg waterf0), y = 1: show only the reflection (cfg waterdebug)
 };
 static_assert(sizeof(FxParams) <= 512, "the parameter buffers are 512 bytes");
 static const uint32_t kLightMax = 256, kLightBufBytes = 16 + 256 * 32 + 64 * 48;   // header, candidates (2 x vec4), 64 persistent lights (3 x vec4)
@@ -3849,6 +3852,8 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "sunsize")) g_sunSize = (float)std::max(0.0, std::min(10.0, v));
         else if (!strcmp(key, "shrays")) g_shRays = (int)std::max(1.0, std::min(32.0, v));
         else if (!strcmp(key, "waterfx")) g_reflOn = v != 0.0;
+        else if (!strcmp(key, "waterf0")) g_waterF0 = (float)std::max(0.0, std::min(1.0, v));
+        else if (!strcmp(key, "waterdebug")) g_waterDebug = v != 0.0;
         else if (!strcmp(key, "waterrefl")) g_reflStrength = (float)std::max(0.0, std::min(1.0, v));
         else if (!strcmp(key, "glint")) g_glint = (float)std::max(0.0, std::min(4.0, v));
         else if (!strcmp(key, "dumpshaders")) g_dumpShaders = v != 0.0;
@@ -4787,6 +4792,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             memcpy(par->grassCol, g_grassCol, sizeof g_grassCol);
             memcpy(par->rockCol, g_rockCol, sizeof g_rockCol);
         }
+        par->wat[0] = g_waterF0; par->wat[1] = g_waterDebug ? 1.0f : 0.0f; par->wat[2] = par->wat[3] = 0.0f;
         static std::atomic<uint64_t> cn{0};
         if (matOn && cn.fetch_add(1) % 1800 == 0) Logf("rt: hit lighting: sun colour %.3f %.3f %.3f, shade %.3f %.3f %.3f, sky %.3f %.3f %.3f (%s), vertex reads %s", (double)sc[0], (double)sc[1], (double)sc[2], (double)ac[0], (double)ac[1], (double)ac[2], (double)kc[0], (double)kc[1], (double)kc[2], ok ? "read" : "NOT readable", par->mat[3] ? "on" : "off");
     }

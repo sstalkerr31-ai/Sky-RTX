@@ -32,6 +32,7 @@ layout(set = 0, binding = 5, std140) uniform Params {
     uvec4 lvl;      // the level ground's index buffer (x,y) and vertex positions (z,w); 0 = none
     vec4 grassCol;  // the game's grass and rock colours, w = 1 when known
     vec4 rockCol;
+    vec4 wat;       // x = base reflectivity (straight down), y = 1: show only the reflection (debug)
 } u;
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U32 { uint v; };
 uint read32(uvec2 a, uint off) {
@@ -208,8 +209,10 @@ void main() {
         refl = sky;   // skyToward already tried the screen first
     }
     float cosv = max(dot(-V, N), 0.0);
-    float F = 0.02 + 0.98 * pow(1.0 - cosv, 5.0);
-    float k = clamp(F * u.fx2.y * 2.0, 0.0, 0.9) * edge;
+    float F0 = clamp(u.wat.x, 0.0, 1.0);
+    float F = F0 + (1.0 - F0) * pow(1.0 - cosv, 5.0);
+    float k = clamp(F * u.fx2.y * 2.0, 0.0, 0.95) * edge;
+    if (u.wat.y > 0.5) k = 1.0;   // debug: only the reflection
     vec3 outc = mix(wc, refl, k);
     if (any(isnan(outc)) || any(isinf(outc))) return;
     imageStore(uWater, p, vec4(outc, imageLoad(uWater, p).a));
