@@ -545,6 +545,7 @@ struct DeviceData {
         uint64_t dynTris = 0;
         std::vector<VkTransformMatrixKHR> dynXf;   // step 18: per dyn geometry transform (identity for characters)
         std::vector<uint8_t> dynProp;              // step 18: 1 = instanced prop (transform used)
+        std::vector<std::pair<VkBuffer, VkDeviceSize>> dynUbo;   // water pass only: where each piece's matrix is, read when the next frame is traced
         uint64_t propTris = 0;
         uint32_t propGeoms = 0;
     };
@@ -1957,16 +1958,19 @@ static std::map<uint32_t, uint32_t> g_matConstIds;   // quantized colour -> id
 
 // Ocean / OceanMesh place every piece with a model matrix at offset 0 of their per-draw UBO (world = M * position):
 // without it all pieces would sit at the origin, on top of each other, and the water test would only work in squares.
-static bool WaterMatrix(VkCommandBuffer cb, DeviceData* d, VkTransformMatrixKHR& xf) {
-    TpUbo u{};
-    {
-        std::lock_guard<std::mutex> lk(g_tpMtx);
-        auto it = g_tpCbUbo.find(cb);
-        if (it == g_tpCbUbo.end()) return false;
-        u = it->second;
-    }
+// The game fills that UBO after it records the draw (before it submits), so reading it at record time gives last frame's data, and
+// while the camera moves the slots shift: pieces land in the wrong place and the reflection drops out. The water pass is read one
+// frame later, when it has been submitted.
+static bool WaterUbo(VkCommandBuffer cb, std::pair<VkBuffer, VkDeviceSize>& out) {
+    std::lock_guard<std::mutex> lk(g_tpMtx);
+    auto it = g_tpCbUbo.find(cb);
+    if (it == g_tpCbUbo.end()) return false;
+    out = {it->second.buf, it->second.off};
+    return true;
+}
+static bool WaterMatrixAt(DeviceData* d, const std::pair<VkBuffer, VkDeviceSize>& u, VkTransformMatrixKHR& xf) {
     float mm[16];
-    if (!ReadBufHost(d, u.buf, u.off, mm, sizeof mm)) return false;
+    if (!u.first || !ReadBufHost(d, u.first, u.second, mm, sizeof mm)) return false;
     for (float v : mm) if (!(fabsf(v) < 1e7f)) return false;   // also NaN
     if (fabsf(mm[3]) > 1e-4f || fabsf(mm[7]) > 1e-4f || fabsf(mm[11]) > 1e-4f || fabsf(mm[15] - 1.0f) > 1e-3f) return false;   // an affine matrix, column-major
     for (int r = 0; r < 3; ++r)
@@ -3469,8 +3473,9 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         rg.primitiveCount = c.indexCount / 3;
         if (isWater) {   // every water piece with its own matrix, in the per-frame BLAS
             static std::atomic<uint64_t> wok{0}, wbad{0};
-            VkTransformMatrixKHR xf{};
-            if (!WaterMatrix(cb, d, xf)) {
+            VkTransformMatrixKHR xf{{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}};
+            std::pair<VkBuffer, VkDeviceSize> ub{};
+            if (!WaterUbo(cb, ub) || (isMainCb && !WaterMatrixAt(d, ub, xf))) {   // water inside the main pass is read now: it has no later chance
                 if (++wbad == 1) Logf("rt: water piece without a readable model matrix (waterfx=1 has to be in SkyRT.cfg when the game starts) - left out");
                 continue;
             }
@@ -3481,10 +3486,10 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
             fg.dynMems.emplace_back(vbi.mem, ibi.mem);
             fg.dynXf.push_back(xf);
             fg.dynProp.push_back(1);
+            if (!isMainCb) fg.dynUbo.push_back(ub);
             fg.propTris += rg.primitiveCount;
             fg.propGeoms++;
-            const uint64_t n = ++wok;
-            if (n <= 3 || n == 5000) Logf("rt: water piece #%llu placed at %.1f %.1f %.1f (scale x %.2f), %u triangles", (unsigned long long)n, xf.matrix[0][3], xf.matrix[1][3], xf.matrix[2][3], xf.matrix[0][0], rg.primitiveCount);
+            ++wok;
             continue;
         }
         if (isProp) {   // step 18: one geometry per instance, same mesh, transform = position + uniform scale decoded from the instance buffer
@@ -4256,10 +4261,15 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         if (!wf.dynGeoms.empty()) {
             static std::atomic<int> wl{0};
             if (wl.fetch_add(1) < 3) Logf("rt: water geometry from its own pass: %zu pieces, %llu triangles", wf.dynGeoms.size(), (unsigned long long)wf.propTris);
+            static std::atomic<uint64_t> placed{0}, unread{0};
             for (size_t i = 0; i < wf.dynGeoms.size(); ++i) {
                 if (fg.dynGeoms.size() >= kXfCap) break;
+                VkTransformMatrixKHR xf{};
+                if (i >= wf.dynUbo.size() || !WaterMatrixAt(d, wf.dynUbo[i], xf)) { ++unread; continue; }
+                const uint64_t n = ++placed;
+                if (n <= 3 || n % 100000 == 0) Logf("rt: water piece #%llu placed at %.1f %.1f %.1f (scale x %.2f), %u triangles | unreadable so far %llu", (unsigned long long)n, xf.matrix[0][3], xf.matrix[1][3], xf.matrix[2][3], xf.matrix[0][0], wf.dynRanges[i].primitiveCount, (unsigned long long)unread.load());
                 fg.dynGeoms.push_back(wf.dynGeoms[i]); fg.dynRanges.push_back(wf.dynRanges[i]); fg.dynKeys.push_back(wf.dynKeys[i]);
-                fg.dynMems.push_back(wf.dynMems[i]); fg.dynXf.push_back(wf.dynXf[i]); fg.dynProp.push_back(wf.dynProp[i]);
+                fg.dynMems.push_back(wf.dynMems[i]); fg.dynXf.push_back(xf); fg.dynProp.push_back(wf.dynProp[i]);
                 fg.propTris += wf.dynRanges[i].primitiveCount;
                 fg.propGeoms++;
             }
