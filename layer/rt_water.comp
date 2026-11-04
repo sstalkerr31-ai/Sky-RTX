@@ -50,7 +50,7 @@ vec3 groundNormal(uint prim) {
     float l = length(n);
     return l > 1e-12 ? n / l : vec3(0.0, 1.0, 0.0);
 }
-layout(set = 0, binding = 14, rgba16f) uniform readonly image2D uFrame;   // the frame as the game drew it, full resolution
+layout(set = 0, binding = 14, rgba16f) uniform readonly image2D uFrame;   // the frame as the game drew it, full resolution; alpha = its depth
 layout(set = 0, binding = 11, std430) readonly buffer GeoMat { uint geoMat[]; };   // the material tables of the trace pass
 struct MatColor { vec4 c; vec4 pad[15]; };
 layout(set = 0, binding = 12, std430) readonly buffer MatColors { MatColor matColor[]; };
@@ -77,6 +77,11 @@ bool frameAt(vec3 wp, out vec3 col) {
     if (u.cam.w > 0.5) ndc.y = -ndc.y;
     vec2 uv = ndc * 0.5 + 0.5;
     if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) return false;
+    // only if that point is what the frame really shows there: something nearer (a character in front of the sky, say) must not
+    // be mirrored instead. Reverse-Z: a larger depth is nearer; the frame copy keeps the depth in alpha.
+    float zh = clip.z / clip.w;
+    float zs = imageLoad(uFrame, clamp(ivec2(uv * vec2(u.misc.xy)), ivec2(0), ivec2(u.misc.xy) - 1)).a;
+    if (zs > zh * 1.03 + 1e-7) return false;
     // bilinear: the water picture is half the frame's size, nearest pixels made the reflection blocky
     vec2 f = uv * vec2(u.misc.xy) - 0.5;
     ivec2 i0 = ivec2(floor(f));
