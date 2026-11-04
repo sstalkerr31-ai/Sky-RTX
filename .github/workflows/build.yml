@@ -40,6 +40,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false   # a non-zero exit code is checked by hand below
+          $ErrorActionPreference = 'Continue'
           $b = 'installer/build'
           $ver = (Select-String -Path layer/skyrt_version.h -Pattern 'SKYRT_VERSION_STR "([^"]+)"').Matches[0].Groups[1].Value
           $notes = (git log -8 --no-merges --format='- %s') -join "`n"
@@ -59,8 +61,8 @@ jobs:
           git tag -f $env:CHANNEL $env:GITHUB_SHA
           git push -f origin "refs/tags/$($env:CHANNEL)"
           $title = if ($env:CHANNEL -eq 'latest') { 'SkyRT (latest build)' } else { 'SkyRT (test build)' }
-          gh release view $env:CHANNEL *> $null
-          if ($LASTEXITCODE -ne 0) {
+          $have = (gh release list --limit 100 --json tagName | ConvertFrom-Json).tagName
+          if ($have -notcontains $env:CHANNEL) {
             $pre = if ($env:CHANNEL -eq 'latest') { @() } else { @('--prerelease') }
             gh release create $env:CHANNEL --title $title --notes 'Built automatically on every push.' @pre
             if ($LASTEXITCODE -ne 0) { exit 1 }
