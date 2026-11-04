@@ -498,6 +498,7 @@ struct DeviceData {
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
     PFN_vkCmdPushConstants CmdPushConstants;
     PFN_vkCmdDispatch CmdDispatch;
+    PFN_vkCmdClearColorImage CmdClearColorImage;
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
     PFN_vkCmdFillBuffer CmdFillBuffer;
     PFN_vkCmdCopyBuffer CmdCopyBuffer;
@@ -613,6 +614,8 @@ struct DeviceData {
     VkDeviceMemory giMem = VK_NULL_HANDLE, shMem = VK_NULL_HANDLE;
     VkImageView giView = VK_NULL_HANDLE, shView = VK_NULL_HANDLE;
     VkImage cpImg = VK_NULL_HANDLE; VkDeviceMemory cpMem = VK_NULL_HANDLE; VkImageView cpView = VK_NULL_HANDLE;   // copy of the game's frame (for the water)
+    VkImage domeImg = VK_NULL_HANDLE; VkDeviceMemory domeMem = VK_NULL_HANDLE; VkImageView domeView = VK_NULL_HANDLE;   // the sky seen so far, all around (equirectangular, alpha = seen)
+    uint64_t domeGen = ~0ull;   // the level the sky panorama belongs to; another level clears it
     VkPipeline waterPipe = VK_NULL_HANDLE;
     VkDescriptorSet waterSets[16] = {};   // a ring as long as the trace pass's: a set is not rewritten while a frame in flight uses it
     uint32_t waterRing = 0;
@@ -1055,6 +1058,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
     LOADD(CmdBindDescriptorSets);
     LOADD(CmdPushConstants);
     LOADD(CmdDispatch);
+    LOADD(CmdClearColorImage);
     LOADD(CmdPipelineBarrier);
     LOADD(CmdFillBuffer);
     LOADD(CmdCopyBuffer);
@@ -2707,21 +2711,21 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->paintTried = true;
     g_stage = "EnsurePaintResources";
 
-    VkDescriptorSetLayoutBinding b[16] = {};
-    const VkDescriptorType types[16] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+    VkDescriptorSetLayoutBinding b[17] = {};
+    const VkDescriptorType types[17] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                                        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-    for (uint32_t i = 0; i < 16; ++i) {
+                                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    for (uint32_t i = 0; i < 17; ++i) {
         b[i].binding = i;
         b[i].descriptorType = types[i];
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.bindingCount = 16;
+    dl.bindingCount = 17;
     dl.pBindings = b;
     VkResult r = d->CreateDescriptorSetLayout(d->device, &dl, nullptr, &d->paintDsl);
     if (r != VK_SUCCESS) { Logf("!!! rt: descriptor set layout failed (%d)", (int)r); return false; }
@@ -2742,7 +2746,7 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->lmergePipe = MakeComputePipe(d, kRtLMergeSpv, sizeof(kRtLMergeSpv), "light merge");
     if (!d->lmergePipe) d->lightPipe = VK_NULL_HANDLE;
 
-    VkDescriptorPoolSize ps[5] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 * 8}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32},
+    VkDescriptorPoolSize ps[5] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 * 10}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32},
                                   {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 32}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32},
                                   {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 * 5}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -2877,16 +2881,18 @@ static bool EnsurePaintResources(DeviceData* d) {
 static bool EnsureFxImages(DeviceData* d, uint32_t w, uint32_t h) {
     if (d->giImg && d->fxW == w && d->fxH == h) return true;
     if (d->giImg) Logf("rt: resolution changed to %ux%u - allocating new result images (old ones are leaked on purpose)", w, h);
+    uint32_t mw = w, mh = h;
+    VkImageUsageFlags mu = VK_IMAGE_USAGE_STORAGE_BIT;
     auto make = [&](VkFormat fmt, VkImage& img, VkDeviceMemory& mem, VkImageView& view) -> bool {
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.imageType = VK_IMAGE_TYPE_2D;
         ci.format = fmt;
-        ci.extent = {w, h, 1};
+        ci.extent = {mw, mh, 1};
         ci.mipLevels = 1;
         ci.arrayLayers = 1;
         ci.samples = VK_SAMPLE_COUNT_1_BIT;
         ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ci.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        ci.usage = mu;
         ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (d->CreateImage(d->device, &ci, nullptr, &img) != VK_SUCCESS) return false;
@@ -2929,6 +2935,12 @@ static bool EnsureFxImages(DeviceData* d, uint32_t w, uint32_t h) {
         VkImage ci = VK_NULL_HANDLE; VkDeviceMemory cm = VK_NULL_HANDLE; VkImageView cv = VK_NULL_HANDLE;
         if (make(VK_FORMAT_R16G16B16A16_SFLOAT, ci, cm, cv)) { d->cpImg = ci; d->cpMem = cm; d->cpView = cv; }
         else { Logf("!!! rt: could not create the frame copy - water reflections disabled"); d->cpImg = VK_NULL_HANDLE; d->cpView = VK_NULL_HANDLE; }
+    }
+    if (!d->domeImg) {   // the sky panorama: 1024 x 512 around the camera, kept across frames
+        mw = 1024; mh = 512; mu = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkImage di = VK_NULL_HANDLE; VkDeviceMemory dm = VK_NULL_HANDLE; VkImageView dv = VK_NULL_HANDLE;
+        if (make(VK_FORMAT_R16G16B16A16_SFLOAT, di, dm, dv)) { d->domeImg = di; d->domeMem = dm; d->domeView = dv; d->domeGen = ~0ull; }
+        else Logf("!!! rt: could not create the sky panorama - the water reflects only the sky on the screen");
     }
     d->fxW = w;
     d->fxH = h;
@@ -4751,7 +4763,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         default: flagsEff |= 8u; if (lightsOn) flagsEff |= 16u; break;
     }
     const bool matOn = g_matTrack && d->matPipe;
-    par->mat[0] = (g_castProbe && d->castPtr ? 16u : 0u) | (matOn && g_matAlbedo.load(std::memory_order_relaxed) ? 1u : 0u) | (matOn && (g_view == 8 || g_view == 10) ? 2u : 0u) | (matOn && g_view == 9 ? 4u : 0u) | (matOn && g_view == 10 ? 8u : 0u);
+    par->mat[0] = (d->domeView ? 32u : 0u) | (g_castProbe && d->castPtr ? 16u : 0u) | (matOn && g_matAlbedo.load(std::memory_order_relaxed) ? 1u : 0u) | (matOn && (g_view == 8 || g_view == 10) ? 2u : 0u) | (matOn && g_view == 9 ? 4u : 0u) | (matOn && g_view == 10 ? 8u : 0u);
     par->mat[1] = (uint32_t)(slot - d->rtSlots);
     par->mat[2] = (uint32_t)(g_matGain * 256.0f);
     {
@@ -4823,21 +4835,22 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         ii[6].imageView = taaOn ? d->hView[hp] : giV;      ii[6].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         ii[7].imageView = taaOn ? d->hView[2 + hp] : shV;  ii[7].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         ii[8].imageView = d->cpView ? d->cpView : giV; ii[8].imageLayout = VK_IMAGE_LAYOUT_GENERAL;   // the frame copy (a dummy without it)
-        VkWriteDescriptorSet w[10] = {};
-        const uint32_t bind[10] = {0, 1, 3, 4, 6, 7, 8, 9, 14, 2};
-        const VkDescriptorType wt[10] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        VkDescriptorImageInfo domeI{VK_NULL_HANDLE, d->domeView ? d->domeView : giV, VK_IMAGE_LAYOUT_GENERAL};   // the sky panorama (a dummy without it)
+        VkWriteDescriptorSet w[11] = {};
+        const uint32_t bind[11] = {0, 1, 3, 4, 6, 7, 8, 9, 14, 2, 16};
+        const VkDescriptorType wt[11] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR};
-        for (int i = 0; i < 10; ++i) {
+                                        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+        for (int i = 0; i < 11; ++i) {
             w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w[i].dstSet = set;
             w[i].dstBinding = bind[i];
             w[i].descriptorCount = 1;
             w[i].descriptorType = wt[i];
-            if (i < 9) w[i].pImageInfo = &ii[i]; else w[i].pNext = &asw;
+            if (i < 9) w[i].pImageInfo = &ii[i]; else if (i == 9) w[i].pNext = &asw; else w[i].pImageInfo = &domeI;
         }
-        d->UpdateDescriptorSets(d->device, 10, w, 0, nullptr);
+        d->UpdateDescriptorSets(d->device, 11, w, 0, nullptr);
     }
 
     // the render pass left the color image in SHADER_READ_ONLY and the depth image in GENERAL (see the log)
@@ -4869,6 +4882,26 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     pre[4] = pre[2];
     pre[4].image = d->cpImg;
     const uint32_t preN = d->cpImg ? 5u : 4u;
+    if (d->domeImg && d->domeGen != d->lvlGenSeen) {   // a new level (or the first frame): forget the old sky
+        d->domeGen = d->lvlGenSeen;
+        VkImageMemoryBarrier db{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        db.image = d->domeImg;
+        db.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        db.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        db.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        db.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &db);
+        const VkClearColorValue zero{};
+        d->CmdClearColorImage(cb, d->domeImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &db.subresourceRange);
+        db.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        db.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        db.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        db.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &db);
+        Logf("rt: sky panorama cleared (level change or first frame)");
+    }
     VkMemoryBarrier hmb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};   // step 22: the trace pass reads the history the previous frame's composite wrote
     hmb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     hmb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -5110,6 +5143,11 @@ static void InjectWater(DeviceData* d, VkCommandBuffer cb, VkRenderPass rp, VkFr
     VkWriteDescriptorSetAccelerationStructureKHR asw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
     asw.accelerationStructureCount = 1;
     asw.pAccelerationStructures = &tlas;
+    if (!d->domeView) return;
+    VkDescriptorImageInfo domeW{VK_NULL_HANDLE, d->domeView, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet dw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    dw.dstSet = set; dw.dstBinding = 16; dw.descriptorCount = 1; dw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; dw.pImageInfo = &domeW;
+    d->UpdateDescriptorSets(d->device, 1, &dw, 0, nullptr);
     VkWriteDescriptorSet wr[5] = {};
     const uint32_t bind[5] = {0, 1, 14, 5, 2};
     const VkDescriptorType ty[5] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
