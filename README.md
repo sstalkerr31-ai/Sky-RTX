@@ -64,17 +64,19 @@ NVIDIA RTX Remix does not apply: it targets DirectX 8/9 fixed-function games. If
 
 **Requirements:** Windows 10/11 · an NVIDIA RTX GPU with up-to-date drivers (tested only on an RTX 5070 Ti; any GPU exposing `VK_KHR_ray_query` + `VK_KHR_acceleration_structure` should work in theory) · *Sky: Children of the Light* for PC.
 
-1. **Download** the latest `SkyRT-x.y.z.zip` from the [Releases](../../releases) page and unpack it anywhere.
-   *(No release yet? See [Build from source](#-build-from-source).)*
-2. **Run `SkyRT_Panel.exe`** → tab **Game** → press **Install ray tracing**. This copies the layer to `%LOCALAPPDATA%\SkyRT` and registers it for your Windows user. Admin rights are not needed. After this you can delete the unpacked folder.
-3. **Set the path to `Sky.exe`** (button *Browse*) and press **▶ Play with rays**.
+1. **Download `SkyRT_Setup.exe`** from the [latest build](../../releases/tag/latest). It is one file: installer, settings and launcher.
+2. **Run it** and let Лучик, the little helper, install the rays. The layer goes to `%LOCALAPPDATA%\SkyRT` and is registered for your Windows user only; no admin rights. A desktop shortcut is made.
+3. **Press "Играть с лучами"** (Play with rays). If the game is not found, point the installer to `Sky.exe` once.
 
 That's it. In game press **Ctrl+Home** to compare with/without rays.
 
-> The layer loads only for the game process started with the panel's *Play with rays* button (it sets `SKYRT_ENABLE=1` for that process). Other Vulkan programs are not affected.
-> If you must start the game through another launcher (Steam, a custom launcher), set the environment variable `SKYRT_ENABLE=1` for that launcher.
+**Updates come by themselves.** Every change pushed to this repository is built by GitHub and published to the [latest build](../../releases/tag/latest). When you open the installer it checks once; if there is something new, Лучик offers it (Update / Later / Don't remind me about this one). It never insists, installs only a file whose SHA-256 matches, and never touches your settings (`SkyRT.cfg`). No internet, no problem: it just keeps what you have.
 
-**Uninstall:** open the panel → **Uninstall**. Then delete `%LOCALAPPDATA%\SkyRT` if you want to remove the files too.
+> The layer loads only for the game started with "Play with rays" (it sets `SKYRT_ENABLE=1` for that process). Other Vulkan programs are not affected.
+> To start through Steam, the installer copies a launch option for you: Sky → Properties → Launch options.
+
+**Settings** are in the installer ("Настройки"); every change is applied live while the game runs.
+**Uninstall:** open the installer → "Удалить".
 
 ## 🎛️ The control panel
 
@@ -164,20 +166,18 @@ Check the panel: *Vulkan layer* must say *installed*, and the game must be start
 
 ## 🛠️ Build from source
 
-Requirements: Visual Studio (C++ x64) · [Vulkan SDK](https://vulkan.lunarg.com/) · Python 3.8+ (for the panel).
+Requirements: Visual Studio (C++ x64). The Vulkan headers are in `third_party/vulkan`, so the Vulkan SDK is only needed to recompile shaders.
 
 ```bat
 :: open "x64 Native Tools Command Prompt for VS", then:
-cd layer
-build.bat                       :: -> SkyRT.dll
-cd ..\panel
-build_panel.bat                 :: -> dist\SkyRT_Panel.exe  (installs PyQt5 + PyInstaller)
-cd ..
-powershell -ExecutionPolicy Bypass -File release\package_release.ps1 -Version 0.20.0   :: -> dist\SkyRT-0.20.0.zip
+installer\build.bat             :: -> installer\build\SkyRT.dll and SkyRT_Setup.exe (the layer is inside the exe)
 ```
 
-Run the panel from source: `pip install PyQt5` then `python panel\skyrt_panel.py` (put `SkyRT.dll` and `VK_LAYER_SKYRT.json` next to it).
-Manual install without the panel: `layer\install.ps1` registers the layer (`-Uninstall` removes it; `-Machine` from an admin shell writes to HKLM).
+`set SKYRT_CHANNEL=test` before building makes the installer look at the `test` release for updates (default `latest`).
+GitHub does the same on every push (`.github/workflows/build.yml`): `main` → release **latest**, `installer` → pre-release **test**, each with `SkyRT.dll`, `SkyRT_Setup.exe` and `update.json` (SHA-256 of both). No hand-made releases.
+Builds are reproducible (`/Brepro`), so the installer can tell whether an install is current.
+Installer test switches: `--root <dir> --selftest` (install/check/remove in a test folder), `--updtest` (ask GitHub, write the answer to `updtest.txt`), `--demo`.
+Manual install without the installer: `layer\install.ps1` registers the layer (`-Uninstall` removes it). The old Python panel (`panel/`) still works but is no longer developed.
 
 After editing a `.comp` shader: `glslangValidator -V --target-env vulkan1.2 layer\rt_fx.comp -o rtfx.spv`, then `python tools\spv2h.py rtfx.spv layer\rtfx_spv.h kRtFxSpv rt_fx.comp`.
 
