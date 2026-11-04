@@ -69,8 +69,9 @@ jobs:
           $title = if ($env:CHANNEL -eq 'latest') { 'SkyRT (latest build)' } else { 'SkyRT (test build)' }
           $have = (Run 'list releases' { gh release list --limit 100 --json tagName }) | ConvertFrom-Json | ForEach-Object { $_.tagName }
           if ($have -notcontains $env:CHANNEL) {
-            $pre = if ($env:CHANNEL -eq 'latest') { @() } else { @('--prerelease') }
-            Run 'create release' { gh release create $env:CHANNEL --title $title --notes 'Built automatically on every push.' @pre } | Out-Null
+            $ca = @('release', 'create', $env:CHANNEL, '--title', $title, '--notes', 'Built automatically on every push.')
+            if ($env:CHANNEL -ne 'latest') { $ca += '--prerelease' }
+            Run 'create release' { gh @ca } | Out-Null
           }
           Run 'upload' { gh release upload $env:CHANNEL "$b/SkyRT.dll" "$b/SkyRT_Setup.exe" "$b/update.json" --clobber } | Out-Null
           $body = "Built automatically from $($env:GITHUB_SHA.Substring(0,7)) ($($info.built)). Download SkyRT_Setup.exe.`n`nRecent changes:`n$notes"
