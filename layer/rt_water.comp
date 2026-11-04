@@ -83,8 +83,8 @@ bool frameAt(vec3 wp, out vec3 col) {
     // be mirrored instead. Reverse-Z: a larger depth is nearer; the frame copy keeps the depth in alpha.
     float zh = clip.z / clip.w;
     float zs = imageLoad(uFrame, clamp(ivec2(uv * vec2(u.misc.xy)), ivec2(0), ivec2(u.misc.xy) - 1)).a;
-    // the game's sky sphere sits at a finite distance: whatever is farther than 600 m along this view ray does not hide anything
-    vec4 cf = u.vp * vec4(u.cam.xyz + normalize(wp - u.cam.xyz) * 600.0, 1.0);
+    // the game's sky sphere sits at a finite distance: whatever is farther than 150 m along this view ray (far background) does not hide anything
+    vec4 cf = u.vp * vec4(u.cam.xyz + normalize(wp - u.cam.xyz) * 150.0, 1.0);
     float zfar = cf.w > 1e-5 ? cf.z / cf.w : 0.0;
     if (zs > max(zh * 1.03 + 1e-7, zfar)) return false;
     // bilinear: the water picture is half the frame's size, nearest pixels made the reflection blocky

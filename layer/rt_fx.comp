@@ -59,8 +59,8 @@ void main() {
     imageStore(uFrameCopy, p, vec4(imageLoad(uColor, p).rgb, texelFetch(uDepth, p, 0).r));   // alpha = depth: the water pass checks what is really visible there
     uint mode = u.misc.z;
     float z = texelFetch(uDepth, p, 0).r;
-    // the sky: nothing drawn, or the game's sky sphere, which is drawn at a finite distance (anything beyond 600 m counts as sky)
-    if ((u.mat.x & 32u) != 0u && ((p.x | p.y) & 1) == 0 && (z <= 0.0 || length(worldAt(p, z) - u.cam.xyz) > 600.0)) {
+    // the sky: nothing drawn, or the game's sky sphere, which is drawn at a finite distance (anything beyond 150 m counts: far background, the direction to it hardly changes)
+    if ((u.mat.x & 32u) != 0u && ((p.x | p.y) & 1) == 0 && (z <= 0.0 || length(worldAt(p, z) - u.cam.xyz) > 150.0)) {
         {   // remember it in the panorama (every 4th pixel is plenty for 1024 x 512)
             vec3 dir = normalize(worldAt(p, 1e-4) - u.cam.xyz);
             vec2 duv = vec2(atan(dir.z, dir.x) * 0.15915494 + 0.5, acos(clamp(dir.y, -1.0, 1.0)) * 0.31830989);
