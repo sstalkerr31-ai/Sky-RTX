@@ -1,4 +1,4 @@
-// SkyRT.cpp - implicit Vulkan layer, step 1.
+﻿// SkyRT.cpp - implicit Vulkan layer, step 1.
 //   * console + log file (flushed every line) + crash log (exception, module+offset, stack)
 //   * enables ray_query / acceleration_structure on the game's VkDevice (with automatic fallback)
 //   * patches vertex/index/indirect buffers and memory so they get a device address (needed for BLAS)
@@ -585,7 +585,7 @@ struct DeviceData {
         VkBuffer vb = VK_NULL_HANDLE, ib = VK_NULL_HANDLE, blasBuf = VK_NULL_HANDLE, scratch = VK_NULL_HANDLE;
         VkDeviceMemory vbMem = VK_NULL_HANDLE, ibMem = VK_NULL_HANDLE, blasMem = VK_NULL_HANDLE, scratchMem = VK_NULL_HANDLE;
         VkAccelerationStructureKHR blas = VK_NULL_HANDLE;
-        VkDeviceAddress blasAddr = 0;
+        VkDeviceAddress blasAddr = 0, vbAddr = 0, ibAddr = 0;
     };
     LevelGpu lvl;                                       // cacheMtx (blasAddr is read when the TLAS is built)
     std::vector<std::pair<uint64_t, LevelGpu>> lvlGrave;   // grounds of earlier levels, freed once no frame in flight can use them
@@ -1974,6 +1974,10 @@ static bool WaterMatrix(VkCommandBuffer cb, DeviceData* d, VkTransformMatrixKHR&
     return true;
 }
 
+static bool FiniteMat(const float* m, int n);
+static std::mutex g_terrColMtx;
+static float g_grassCol[4] = {}, g_rockCol[4] = {};   // g_terrColMtx: what the level ground off the screen is painted with
+
 static uint32_t MatConst(DeviceData* d, VkCommandBuffer cb, uint64_t vs, uint32_t off) {
     if (!d->matColPtr) return 0;   // the first frames: the draw comes again
     TpUbo u{};
@@ -1985,6 +1989,14 @@ static uint32_t MatConst(DeviceData* d, VkCommandBuffer cb, uint64_t vs, uint32_
     }
     float c[3] = {};
     if (!ReadBufHost(d, u.buf, u.off + off, c, sizeof c)) return 0;
+    if (FiniteMat(c, 3) && c[0] >= 0.0f && c[1] >= 0.0f && c[2] >= 0.0f && c[0] + c[1] + c[2] < 24.0f) {
+        const bool grass = vs == 0xa179ffcd45e93352ull || vs == 0x56c003f7b5e9b06eull, rock = vs == 0x17a63a0f3447fc7cull || vs == 0x80d5b0d5e9f45e34ull;
+        if (grass || rock) {
+            std::lock_guard<std::mutex> lk(g_terrColMtx);
+            float* t = grass ? g_grassCol : g_rockCol;
+            t[0] = c[0]; t[1] = c[1]; t[2] = c[2]; t[3] = 1.0f;
+        }
+    }
     uint32_t key = 0;
     for (float v : c) {
         if (!(v >= 0.0f && v <= 8.0f)) return 0;   // also catches NaN
@@ -2656,7 +2668,11 @@ struct FxParams {
     float sunCol[4]; // the game's sun colour (frame UBO +912), w = 1 when it could be read
     float ambCol[4]; // the game's shade colour (frame UBO +944)
     float skyCol[4]; // the game's global ambient (frame UBO +1184)
+    uint32_t lvl[4]; // the level ground's buffers: x,y = index buffer address (lo, hi), z,w = vertex positions; 0 = none
+    float grassCol[4];   // the game's grass colour (per-draw colour of GrassSh), w = 1 when known
+    float rockCol[4];    // the game's rock colour (per-draw colour of RockFaceSh / RockFaceShMesh), w = 1 when known
 };
+static_assert(sizeof(FxParams) <= 512, "the parameter buffers are 512 bytes");
 static const uint32_t kLightMax = 256, kLightBufBytes = 16 + 256 * 32 + 64 * 48;   // header, candidates (2 x vec4), 64 persistent lights (3 x vec4)
 
 static VkPipeline MakeComputePipe(DeviceData* d, const uint32_t* code, size_t bytes, const char* what, VkPipelineLayout layout = VK_NULL_HANDLE) {
@@ -4219,6 +4235,8 @@ static void LevelUpdate(DeviceData* d, VkCommandBuffer cb) {
     asb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &asb, 0, nullptr, 0, nullptr);
     g.tris = prims;
+    g.vbAddr = vbAddr;
+    g.ibAddr = ibAddr;
     {
         std::lock_guard<std::mutex> lk(d->cacheMtx);
         d->lvl = g;
@@ -4735,6 +4753,16 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         par->sunCol[0] = sc[0]; par->sunCol[1] = sc[1]; par->sunCol[2] = sc[2]; par->sunCol[3] = ok ? 1.0f : 0.0f;
         par->ambCol[0] = ac[0]; par->ambCol[1] = ac[1]; par->ambCol[2] = ac[2]; par->ambCol[3] = 0.0f;
         par->skyCol[0] = kc[0]; par->skyCol[1] = kc[1]; par->skyCol[2] = kc[2]; par->skyCol[3] = 0.0f;
+        {
+            std::lock_guard<std::mutex> lk(d->cacheMtx);
+            const VkDeviceAddress ia = d->lvl.blasAddr ? d->lvl.ibAddr : 0, va = d->lvl.blasAddr ? d->lvl.vbAddr : 0;
+            par->lvl[0] = (uint32_t)ia; par->lvl[1] = (uint32_t)(ia >> 32); par->lvl[2] = (uint32_t)va; par->lvl[3] = (uint32_t)(va >> 32);
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_terrColMtx);
+            memcpy(par->grassCol, g_grassCol, sizeof g_grassCol);
+            memcpy(par->rockCol, g_rockCol, sizeof g_rockCol);
+        }
         static std::atomic<uint64_t> cn{0};
         if (matOn && cn.fetch_add(1) % 1800 == 0) Logf("rt: hit lighting: sun colour %.3f %.3f %.3f, shade %.3f %.3f %.3f, sky %.3f %.3f %.3f (%s), vertex reads %s", (double)sc[0], (double)sc[1], (double)sc[2], (double)ac[0], (double)ac[1], (double)ac[2], (double)kc[0], (double)kc[1], (double)kc[2], ok ? "read" : "NOT readable", par->mat[3] ? "on" : "off");
     }

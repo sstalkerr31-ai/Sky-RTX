@@ -1,6 +1,8 @@
 #version 460
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 // SkyRT water reflections. Runs right after the game's own water pass, on the half-resolution picture the water was drawn into
 // (the game later scales it up and lays it over the frame, so the reflections come along). For every water pixel one ray goes along the
 // mirrored view direction; what it sees is read back from a copy of the frame and mixed in by Fresnel: strong at a glancing angle,
@@ -27,7 +29,27 @@ layout(set = 0, binding = 5, std140) uniform Params {
     vec4 sunCol;
     vec4 ambCol;
     vec4 skyCol;
+    uvec4 lvl;      // the level ground's index buffer (x,y) and vertex positions (z,w); 0 = none
+    vec4 grassCol;  // the game's grass and rock colours, w = 1 when known
+    vec4 rockCol;
 } u;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U32 { uint v; };
+uint read32(uvec2 a, uint off) {
+    uint carry;
+    uint lo = uaddCarry(a.x, off, carry);
+    return U32(uvec2(lo, a.y + carry)).v;
+}
+// normal of a triangle of the level ground (read from its own buffers)
+vec3 groundNormal(uint prim) {
+    vec3 v[3];
+    for (uint k = 0u; k < 3u; ++k) {
+        uint vi = read32(u.lvl.xy, (prim * 3u + k) * 4u);
+        v[k] = vec3(uintBitsToFloat(read32(u.lvl.zw, vi * 12u)), uintBitsToFloat(read32(u.lvl.zw, vi * 12u + 4u)), uintBitsToFloat(read32(u.lvl.zw, vi * 12u + 8u)));
+    }
+    vec3 n = cross(v[1] - v[0], v[2] - v[0]);
+    float l = length(n);
+    return l > 1e-12 ? n / l : vec3(0.0, 1.0, 0.0);
+}
 layout(set = 0, binding = 14, rgba16f) uniform readonly image2D uFrame;   // the frame as the game drew it, full resolution
 layout(set = 0, binding = 11, std430) readonly buffer GeoMat { uint geoMat[]; };   // the material tables of the trace pass
 struct MatColor { vec4 c; vec4 pad[15]; };
@@ -130,7 +152,21 @@ void main() {
         vec3 hp = P + N * 0.05 + R * rayQueryGetIntersectionTEXT(rr, true);
         if (!frameAt(hp, refl)) {   // something off the screen: light its material like the trace pass does, else a darker horizon
             vec4 hm = hitMaterial(rayQueryGetIntersectionInstanceIdEXT(rr, true), rayQueryGetIntersectionGeometryIndexEXT(rr, true));
-            if (hm.w > 0.5 && u.sunCol.w > 0.5) {
+            bool ground = rayQueryGetIntersectionInstanceCustomIndexEXT(rr, true) == 1 && u.lvl.z != 0u && u.grassCol.w > 0.5 && u.rockCol.w > 0.5;
+            if (ground && u.sunCol.w > 0.5) {   // the level ground from the game files: grass on the flat, rock on the steep, lit by the sun
+                vec3 gn = groundNormal(uint(rayQueryGetIntersectionPrimitiveIndexEXT(rr, true)));
+                if (dot(gn, R) > 0.0) gn = -gn;
+                vec3 alb = mix(u.rockCol.rgb, u.grassCol.rgb, smoothstep(0.55, 0.8, abs(gn.y)));
+                vec3 sl = normalize(u.sun.xyz);
+                float nl = max(dot(gn, sl), 0.0);
+                if (nl > 0.0) {
+                    rayQueryEXT rs;
+                    rayQueryInitializeEXT(rs, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, hp + gn * 0.1, 0.0, sl, 2000.0);
+                    while (rayQueryProceedEXT(rs)) {}
+                    if (rayQueryGetIntersectionTypeEXT(rs, true) != gl_RayQueryCommittedIntersectionNoneEXT) nl = 0.0;
+                }
+                refl = alb * (u.sunCol.rgb * nl + u.ambCol.rgb + u.skyCol.rgb) * (float(u.mat.z) / 256.0);
+            } else if (hm.w > 0.5 && u.sunCol.w > 0.5) {
                 vec3 sl = normalize(u.sun.xyz);
                 rayQueryEXT rs;
                 rayQueryInitializeEXT(rs, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, hp - R * 0.05, 0.0, sl, 2000.0);
