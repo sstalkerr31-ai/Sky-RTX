@@ -57,18 +57,22 @@ jobs:
           $info | ConvertTo-Json | Set-Content -Path "$b/update.json" -Encoding utf8NoBOM
           Get-Content "$b/update.json"
 
+          # every command's own output goes into a public annotation when it fails (logs need a sign-in, annotations do not)
+          function Run([string]$what, [scriptblock]$cmd) {
+            $out = & $cmd 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error title=$what::$($out.Trim() -replace "`r?`n", ' | ')"; exit 1 }
+            return $out
+          }
           # move the tag to this commit, create the release once, then replace its files
-          git tag -f $env:CHANNEL $env:GITHUB_SHA
-          git push -f origin "refs/tags/$($env:CHANNEL)"
+          Run 'tag' { git tag -f $env:CHANNEL $env:GITHUB_SHA } | Out-Null
+          Run 'push tag' { git push -f origin "refs/tags/$($env:CHANNEL)" } | Out-Null
           $title = if ($env:CHANNEL -eq 'latest') { 'SkyRT (latest build)' } else { 'SkyRT (test build)' }
-          $have = (gh release list --limit 100 --json tagName | ConvertFrom-Json).tagName
+          $have = (Run 'list releases' { gh release list --limit 100 --json tagName }) | ConvertFrom-Json | ForEach-Object { $_.tagName }
           if ($have -notcontains $env:CHANNEL) {
             $pre = if ($env:CHANNEL -eq 'latest') { @() } else { @('--prerelease') }
-            gh release create $env:CHANNEL --title $title --notes 'Built automatically on every push.' @pre
-            if ($LASTEXITCODE -ne 0) { exit 1 }
+            Run 'create release' { gh release create $env:CHANNEL --title $title --notes 'Built automatically on every push.' @pre } | Out-Null
           }
-          gh release upload $env:CHANNEL "$b/SkyRT.dll" "$b/SkyRT_Setup.exe" "$b/update.json" --clobber
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Run 'upload' { gh release upload $env:CHANNEL "$b/SkyRT.dll" "$b/SkyRT_Setup.exe" "$b/update.json" --clobber } | Out-Null
           $body = "Built automatically from $($env:GITHUB_SHA.Substring(0,7)) ($($info.built)). Download SkyRT_Setup.exe.`n`nRecent changes:`n$notes"
-          gh release edit $env:CHANNEL --title $title --notes $body
+          Run 'edit release' { gh release edit $env:CHANNEL --title $title --notes $body } | Out-Null
           exit 0
