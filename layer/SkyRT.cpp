@@ -43,6 +43,7 @@
 #include "rtmat_spv.h"  // SPIR-V of rt_mat.comp (generated): average colour of a material
 #include "rtwater_spv.h"  // SPIR-V of rt_water.comp (generated): reflections on the game's water picture
 #include "rtpf_spv.h"   // SPIR-V of rt.comp with -DPOSFETCH (generated): trace pass for GPUs with position fetch
+#include "skyrt_version.h"     // SKYRT_VERSION_STR; SKYRT_BUILD comes from the build (GitHub: run number + commit)
 #include "level_terrain.h"   // the ground of the whole level from the game files
 #include "../third_party/meshoptimizer/vertexcodec.cpp"   // its vertex decoder, built into this file
 
@@ -304,7 +305,7 @@ static void LogInit() {
 
         char exe[MAX_PATH] = {};
         GetModuleFileNameA(nullptr, exe, MAX_PATH);
-        Logf("=== SkyRT layer loaded === pid=%lu exe=%s", GetCurrentProcessId(), exe);
+        Logf("=== SkyRT layer loaded === version %s (build %s) pid=%lu exe=%s", SKYRT_VERSION_STR, SKYRT_BUILD, GetCurrentProcessId(), exe);
         Logf("log file: %s", g_logPath);
         Logf("mode: %s", g_logOnly ? "LOG ONLY (game calls are not modified)" : "FULL (RT patching enabled)");
         Logf("if this log has no 'clean shutdown' line at the end, the game crashed or was killed");

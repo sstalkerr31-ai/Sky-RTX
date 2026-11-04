@@ -10,11 +10,12 @@ if errorlevel 1 (
 cd /d "%~dp0"
 if not exist build mkdir build
 if "%SKYRT_CHANNEL%"=="" set SKYRT_CHANNEL=latest
+if "%SKYRT_BUILD%"=="" set SKYRT_BUILD=local
 set VKI=..\third_party\vulkan\include
 
 rem the layer goes inside the exe; /MT so it needs no Visual C++ runtime on the player's PC
 rem /Brepro: no build time inside the file, so the same code gives the same bytes and the installer can tell an install is current
-cl /nologo /LD /MT /O2 /std:c++17 /EHsc /W3 /Brepro /I%VKI% ..\layer\SkyRT.cpp /Fo:build\SkyRT.obj /Fe:build\SkyRT.dll /link /Brepro user32.lib
+cl /nologo /LD /MT /O2 /std:c++17 /EHsc /W3 /Brepro /DSKYRT_BUILD=\"%SKYRT_BUILD%\" /I%VKI% ..\layer\SkyRT.cpp /Fo:build\SkyRT.obj /Fe:build\SkyRT.dll /link /Brepro user32.lib
 if errorlevel 1 exit /b 1
 
 rc /nologo /fo build\app.res app.rc
