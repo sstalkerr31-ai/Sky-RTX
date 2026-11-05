@@ -245,9 +245,11 @@ void main() {
                 refl = sky * 0.5;
             }
         }
-        if (dbg.g > 0.5) {   // off the screen (yellow / green): keep it within the scene's brightness
-            float lr = dot(refl, vec3(0.2126, 0.7152, 0.0722)), ls = max(dot(sky, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
-            if (lr > ls * 1.2) refl *= ls * 1.2 / lr;
+        if (dbg.g > 0.5) {   // off the screen (yellow / green): its stand-in colour is lit by the game's sun / shade values, which can be far
+            // brighter than the picture (a cave ceiling at night). The surface's own brightness is the best clue to the scene's: stay near it.
+            const vec3 lum = vec3(0.2126, 0.7152, 0.0722);
+            float lr = dot(refl, lum), lw = max(dot(wc, lum), 1e-4);
+            if (lr > lw * 1.5) refl *= lw * 1.5 / lr;
         }
     } else {
         refl = sky;   // skyToward already tried the screen first
