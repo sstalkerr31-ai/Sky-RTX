@@ -218,6 +218,23 @@ void main() {
     if (z <= 0.0) return;
 
     vec3 P = worldAt(p, z);
+    if ((u.mat.x & 16u) != 0u && p == sz / 2) {   // castprobe: what the camera looks at in the middle of the screen
+        vec3 cd = P - u.cam.xyz;
+        float cl = length(cd);
+        rayQueryEXT ra;
+        rayQueryInitializeEXT(ra, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0xFF, u.cam.xyz, 0.0, cd / max(cl, 1e-4), cl * 1.05 + 0.5);
+        while (rayQueryProceedEXT(ra)) {}
+        uint b = 30008u * 5u;
+        if (rayQueryGetIntersectionTypeEXT(ra, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            castHist[b + 1u] = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(ra, true));
+            castHist[b + 2u] = uint(rayQueryGetIntersectionInstanceIdEXT(ra, true));
+            castHist[b + 3u] = uint(rayQueryGetIntersectionGeometryIndexEXT(ra, true));
+            castHist[b + 4u] = uint(rayQueryGetIntersectionPrimitiveIndexEXT(ra, true));
+            castHist[b + 5u] = floatBitsToUint(rayQueryGetIntersectionTEXT(ra, true));
+            castHist[b + 6u] = floatBitsToUint(cl);
+            castHist[b] = 1u;
+        } else castHist[b] = 2u;
+    }
     if ((u.mat.x & 2u) != 0u) {   // view=8: what the rays know about the surface in this pixel (black = no material)
         vec3 vd = P - u.cam.xyz;
         float vl = length(vd);

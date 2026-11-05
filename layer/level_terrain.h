@@ -17,6 +17,7 @@ struct Terrain {
     uint32_t version = 0;
     std::vector<float> pos;          // xyz per vertex, game space
     std::vector<uint32_t> color;     // RGBA8 baked vertex colour per vertex
+    std::vector<uint32_t> matIds, matWeights;   // per vertex: 4 terrain material ids (bytes) and their weights (bytes, sum 255)
     std::vector<uint32_t> idx;       // triangles of the terrain patches only
     uint32_t patches = 0, cloudPatches = 0;
     float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
@@ -81,8 +82,12 @@ inline bool LoadTerrain(const std::wstring& path, Terrain& t, std::string* err =
     if (meshopt_decodeVertexBuffer(vb.data(), vcount, 36, g + vbAt, vbSize) != 0) return fail("vertex decode failed");
     t.pos.resize(size_t(vcount) * 3);
     t.color.resize(vcount);
+    t.matIds.resize(vcount);
+    t.matWeights.resize(vcount);
     for (uint32_t v = 0; v < vcount; ++v) {
         memcpy(&t.pos[size_t(v) * 3], vb.data() + size_t(v) * 36, 12);
+        memcpy(&t.matIds[v], vb.data() + size_t(v) * 36 + 16, 4);
+        memcpy(&t.matWeights[v], vb.data() + size_t(v) * 36 + 20, 4);
         memcpy(&t.color[v], vb.data() + size_t(v) * 36 + 24, 4);
     }
 

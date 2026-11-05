@@ -2815,10 +2815,10 @@ static bool EnsurePaintResources(DeviceData* d) {
             d->MapMemory(d->device, d->geoMatMem, 0, VK_WHOLE_SIZE, 0, &gp) != VK_SUCCESS || !gp ||
             d->MapMemory(d->device, d->matColMem, 0, VK_WHOLE_SIZE, 0, &cp) != VK_SUCCESS || !cp) { Logf("!!! rt: material buffers failed"); return false; }
         void* hp = nullptr;
-        if (!MakeBufEx(d, (VkDeviceSize)(kMaxCacheGeoms + 8) * 5 * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->castBuf, d->castMem, da) ||
+        if (!MakeBufEx(d, (VkDeviceSize)((kMaxCacheGeoms + 8) * 5 + 8) * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->castBuf, d->castMem, da) ||
             d->MapMemory(d->device, d->castMem, 0, VK_WHOLE_SIZE, 0, &hp) != VK_SUCCESS || !hp) { Logf("!!! rt: shadow probe buffer failed"); return false; }
         d->castPtr = (uint32_t*)hp;
-        memset(hp, 0, (size_t)(kMaxCacheGeoms + 8) * 5 * sizeof(uint32_t));
+        memset(hp, 0, (size_t)((kMaxCacheGeoms + 8) * 5 + 8) * sizeof(uint32_t));
         d->geoMatPtr = (uint32_t*)gp;
         d->matColPtr = (char*)cp;
         memset(gp, 0, (size_t)8 * kMaxCacheGeoms * sizeof(uint32_t));
@@ -4532,7 +4532,41 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             out += t;
         }
         if (all) Logf("castprobe: sun shadow ray hits in the last ~5 s (every 64th pixel): %llu, by what they hit:%s", (unsigned long long)all, out.c_str());
-        memset(d->castPtr, 0, n * 5 * sizeof(uint32_t));
+        {   // what the middle of the screen is: level ground (its terrain materials) or a cached geometry (its shader)
+            const uint32_t* c = d->castPtr + n * 5;
+            float ct = 0.0f, cl = 0.0f;
+            memcpy(&ct, &c[5], 4); memcpy(&cl, &c[6], 4);
+            if (c[0] == 2) Logf("aim: the middle of the screen hits nothing in the ray scene");
+            else if (c[0] == 1 && c[1] == 1) {
+                std::shared_ptr<skylevel::Terrain> t;
+                { std::lock_guard<std::mutex> lk(g_level.mtx); t = g_level.terrain; }
+                std::string m;
+                if (t && (size_t)c[4] * 3 + 2 < t->idx.size() && !t->matIds.empty()) {
+                    for (int k = 0; k < 3; ++k) {
+                        const uint32_t v = t->idx[(size_t)c[4] * 3 + k];
+                        const uint32_t ids = t->matIds[v], ws = t->matWeights[v];
+                        char s[96];
+                        snprintf(s, sizeof s, " v%d[%u:%u %u:%u %u:%u %u:%u]", k, ids & 255, ws & 255, (ids >> 8) & 255, (ws >> 8) & 255, (ids >> 16) & 255, (ws >> 16) & 255, ids >> 24, ws >> 24);
+                        m += s;
+                    }
+                    const float* a = &t->pos[(size_t)t->idx[(size_t)c[4] * 3] * 3];
+                    char s[64]; snprintf(s, sizeof s, " | at %.0f %.0f %.0f", a[0], a[1], a[2]); m += s;
+                }
+                Logf("aim: level ground triangle %u, %.1f m away (pixel %.1f m), material id:weight per vertex:%s", c[4], (double)ct, (double)cl, m.c_str());
+            } else if (c[0] == 1) {
+                uint64_t fs = 0; uint32_t tris = 0, stride = 0;
+                if (c[2] == 0) {
+                    std::vector<GeoKey> keys;
+                    { std::lock_guard<std::mutex> lk(d->cacheMtx); if (d->rtCur >= 0) keys = d->slotKeys[d->rtCur]; }
+                    if (c[3] < keys.size()) {
+                        tris = keys[c[3]].count / 3; stride = keys[c[3]].stride;
+                        std::lock_guard<std::mutex> lk(d->keyFsMtx); auto it = d->keyFs.find(keys[c[3]]); if (it != d->keyFs.end()) fs = it->second;
+                    }
+                }
+                Logf("aim: %s geometry %u, %.1f m away (pixel %.1f m): %s, %u tris, vertex stride %u", c[2] == 0 ? "cached" : "dynamic", c[3], (double)ct, (double)cl, fs ? FsName(fs).c_str() : "?", tris, stride);
+            }
+        }
+        memset(d->castPtr, 0, (n * 5 + 8) * sizeof(uint32_t));
     }
 
     // ---- (re)build BLAS + TLAS only when the set of geometry changed, otherwise reuse the newest complete slot
