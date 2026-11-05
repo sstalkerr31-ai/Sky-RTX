@@ -1,6 +1,7 @@
 // levelprobe: loads a level's terrain with the layer's own reader and prints what the ray scene would get.
 //   levelprobe <game folder> <level> [x y z]   (x y z: a point to check, e.g. "Starting avatar at" from Sky.log)
 #include "../../layer/level_terrain.h"
+#include "../../layer/level_models.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,16 @@ int wmain(int argc, wchar_t** argv) {
     printf("%ls: v%u verts=%zu tris=%zu patches %u (clouds left out: %u), %.1f ms\n", argv[2], t.version, t.pos.size() / 3,
            t.idx.size() / 3, t.patches, t.cloudPatches, 1000.0 * double(t1.QuadPart - t0.QuadPart) / double(f.QuadPart));
     printf("  min %.1f %.1f %.1f  max %.1f %.1f %.1f\n", t.mn[0], t.mn[1], t.mn[2], t.mx[0], t.mx[1], t.mx[2]);
+    {
+        LARGE_INTEGER m0, m1; QueryPerformanceCounter(&m0);
+        skylevel::Models md;
+        std::string me;
+        const bool mok = skylevel::LoadModels(argv[1], argv[2], md, &me);
+        QueryPerformanceCounter(&m1);
+        printf("models: %s placed %u, %zu tris, %zu verts, %.1f ms | skipped: hidden %u, disabled %u, shader %u, skinned %u, missing %u, broken %u\n", mok ? "ok" : me.c_str(),
+               md.placed, md.idx.size() / 3, md.pos.size() / 3, 1000.0 * double(m1.QuadPart - m0.QuadPart) / double(f.QuadPart), md.skippedHidden, md.skippedDisabled, md.skippedShader, md.skippedBones, md.missing, md.broken);
+        if (mok) printf("  bounds %.1f %.1f %.1f .. %.1f %.1f %.1f\n", md.mn[0], md.mn[1], md.mn[2], md.mx[0], md.mx[1], md.mx[2]);
+    }
     if (argc >= 6) {
         const float x = float(_wtof(argv[3])), y = float(_wtof(argv[4])), z = float(_wtof(argv[5]));
         // the terrain height under the point: highest triangle below it, or nearest above
