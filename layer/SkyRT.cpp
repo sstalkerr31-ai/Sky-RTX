@@ -97,7 +97,7 @@ static bool g_iceOn = true;               // cfg icefx: reflections on ice (leve
 static std::string g_iceMats = "22";      // cfg icemats: terrain material ids that are ice (22 = the Valley's rink)
 static float g_iceF0 = 0.15f, g_iceRefl = 0.5f;   // cfg icef0 / icerefl
 static std::string g_snowMats = "35";     // cfg snowmats: terrain material ids that are snow (35 = the Valley's)
-static float g_sparkle = 1.0f, g_sparkDens = 0.08f;   // cfg sparkle (strength, 0 = off) / sparkdens (share of crystals that can flash)
+static float g_sparkle = 3.0f, g_sparkDens = 0.08f;   // cfg sparkle (strength, 0 = off) / sparkdens (share of crystals that can flash)
 static std::atomic<bool> g_fpsOn{false};   // FPS counter in the corner (Ctrl+F, cfg fps=1)
 static int g_fpsCfg = -1;                 // last fps= value read from SkyRT.cfg (a change there switches the counter)
 static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
