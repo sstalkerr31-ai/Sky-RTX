@@ -92,6 +92,8 @@ static int g_bounces = 3;         // step 26: bounces per path in deep mode, 1..
 static int g_ptAdapt = 0;         // cfg ptadapt=1: screenshot mode runs at full quality only while the camera stands still (default 0 = always full)
 static int g_pathTrace = 0;       // step 25: 'path tracing' / screenshot mode: 4x rays per pixel, long accumulation, deeper bounces (cfg pathtrace=0/1, Ctrl+Backspace)
 static int g_grass = 1;           // step 24: grass (non-indexed triangle strips written by the CPU) in the acceleration structure (cfg grass=0/1)
+static std::atomic<bool> g_fpsOn{false};   // FPS counter in the corner (Ctrl+F, cfg fps=1)
+static int g_fpsCfg = -1;                 // last fps= value read from SkyRT.cfg (a change there switches the counter)
 static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
 static int g_levelGeo = 1;        // the whole level's ground from the game files in the ray scene, also off the screen (cfg levelgeo=0/1)
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
@@ -503,6 +505,19 @@ struct DeviceData {
     PFN_vkCmdDispatch CmdDispatch;
     PFN_vkCmdClearColorImage CmdClearColorImage;
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
+    PFN_vkGetSwapchainImagesKHR GetSwapchainImagesKHR;   // FPS counter
+    PFN_vkCreateSemaphore CreateSemaphore;
+    PFN_vkResetFences ResetFences;
+    PFN_vkGetFenceStatus GetFenceStatus;
+    PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
+    struct SwapInfo { VkFormat format; VkExtent2D extent; std::vector<VkImage> images; bool transfer; };
+    std::unordered_map<VkSwapchainKHR, SwapInfo> swaps;   // hudMtx
+    struct HudSlot { VkCommandBuffer cb = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; VkSemaphore sem = VK_NULL_HANDLE; VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; uint8_t* ptr = nullptr; };
+    HudSlot hud[4];
+    VkCommandPool hudPool = VK_NULL_HANDLE;
+    uint32_t hudNext = 0;
+    bool hudTried = false, hudOk = false;
+    std::mutex hudMtx;
     PFN_vkCmdFillBuffer CmdFillBuffer;
     PFN_vkCmdCopyBuffer CmdCopyBuffer;
     PFN_vkDestroyImageView DestroyImageView;
@@ -1063,6 +1078,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
     LOADD(CmdDispatch);
     LOADD(CmdClearColorImage);
     LOADD(CmdPipelineBarrier);
+    LOADD(CreateSwapchainKHR);
+    LOADD(GetSwapchainImagesKHR);
+    LOADD(CreateSemaphore);
+    LOADD(ResetFences);
+    LOADD(GetFenceStatus);
+    LOADD(CmdCopyBufferToImage);
     LOADD(CmdFillBuffer);
     LOADD(CmdCopyBuffer);
     LOADD(DestroyImageView);
@@ -3862,6 +3883,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "hidefs")) { std::string t = sv; while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back(); g_hideFsCfg = t; }
         else if (!strcmp(key, "levelgeo")) g_levelGeo = v != 0.0;
         else if (!strcmp(key, "castprobe")) g_castProbe = v != 0.0;
+        else if (!strcmp(key, "fps")) { const int fv = v != 0.0 ? 1 : 0; if (fv != g_fpsCfg) { g_fpsCfg = fv; g_fpsOn = fv != 0; } }
         else if (!strcmp(key, "grass")) g_grass = v != 0.0;
         else if (!strcmp(key, "taa")) g_taa = v != 0.0;
         else if (!strcmp(key, "taan")) g_taaN = (float)std::max(1.0, std::min(256.0, v));
@@ -3929,6 +3951,12 @@ static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = shader
     if (pd && !pdWas) ProbeKey(false);
     if (pu && !puWas) ProbeKey(true);
     puWas = pu;
+    {   // Ctrl+F = FPS counter on/off
+        static bool fWas = false;
+        const bool fk = ctrl && (GetAsyncKeyState('F') & 0x8000) != 0;
+        if (fk && !fWas) { g_fpsOn = !g_fpsOn.load(); Logf("rt: KEY Ctrl+F -> FPS counter %s", g_fpsOn.load() ? "ON" : "off"); }
+        fWas = fk;
+    }
     {   // Ctrl+F9 = material colours on/off (compare with the old fallback)
         static bool f9Was = false;
         const bool f9 = ctrl && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
@@ -5510,11 +5538,169 @@ static void FinishCapture(DeviceData* d) {
 }
 
 // ============================================================ frame / submit / draws
+// ---------------------------------------------------------------- FPS counter
+// Drawn into the finished frame right before it is shown (like an overlay program), so the game's TAA and bloom never touch it and it
+// works with the rays on or off. The swapchain is asked for TRANSFER_DST at creation; one small copy per frame puts the picture in.
+static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* ci, const VkAllocationCallbacks* a, VkSwapchainKHR* sc) {
+    DeviceData* d = GetDev(Key(device));
+    if (!d) return VK_ERROR_INITIALIZATION_FAILED;
+    VkSwapchainCreateInfoKHR c = *ci;
+    c.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    bool transfer = true;
+    VkResult r = d->CreateSwapchainKHR(device, &c, a, sc);
+    if (r != VK_SUCCESS) { transfer = (ci->imageUsage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0; r = d->CreateSwapchainKHR(device, ci, a, sc); }
+    if (r == VK_SUCCESS && d->GetSwapchainImagesKHR) {
+        uint32_t n = 0;
+        d->GetSwapchainImagesKHR(device, *sc, &n, nullptr);
+        std::vector<VkImage> im(n);
+        if (n) d->GetSwapchainImagesKHR(device, *sc, &n, im.data());
+        std::lock_guard<std::mutex> lk(d->hudMtx);
+        d->swaps[*sc] = DeviceData::SwapInfo{ci->imageFormat, ci->imageExtent, im, transfer};
+        Logf("rt: swapchain %ux%u format %d, %u images%s", ci->imageExtent.width, ci->imageExtent.height, (int)ci->imageFormat, n, transfer ? "" : " (no copy usage: no FPS counter)");
+    }
+    return r;
+}
+
+// 3x5 pixel font: rows top to bottom, 3 bits each (bit 2 = left)
+static uint16_t HudGlyph(char ch) {
+    switch (ch) {
+        case '0': return 0x7B6F; case '1': return 0x2C97; case '2': return 0x73E7; case '3': return 0x73CF; case '4': return 0x5BC9;
+        case '5': return 0x79CF; case '6': return 0x79EF; case '7': return 0x7249; case '8': return 0x7BEF; case '9': return 0x7BCF;
+        case 'F': return 0x79A4; case 'P': return 0x7BE4; case 'S': return 0x79CF; case 'M': return 0x5FED; case 'R': return 0x7BF5;
+        case 'T': return 0x7492; case 'O': return 0x7B6F; case 'N': return 0x6B6D; case '.': return 0x0002; default: return 0;
+    }
+}
+
+// a semaphore the present has to wait for instead of the game's, or null when nothing was drawn
+static VkSemaphore DrawHud(DeviceData* d, VkQueue queue, const VkPresentInfoKHR* pi, double fps, double ms) {
+    if (pi->swapchainCount != 1 || !pi->pImageIndices || !d->CmdCopyBufferToImage || !d->CreateSemaphore || !d->setLoaderData) return VK_NULL_HANDLE;
+    DeviceData::SwapInfo sw;
+    {
+        std::lock_guard<std::mutex> lk(d->hudMtx);
+        auto it = d->swaps.find(pi->pSwapchains[0]);
+        if (it == d->swaps.end()) return VK_NULL_HANDLE;
+        sw = it->second;
+    }
+    const bool bgra = sw.format == VK_FORMAT_B8G8R8A8_UNORM || sw.format == VK_FORMAT_B8G8R8A8_SRGB;
+    const bool rgba = sw.format == VK_FORMAT_R8G8B8A8_UNORM || sw.format == VK_FORMAT_R8G8B8A8_SRGB;
+    if (!sw.transfer || (!bgra && !rgba) || pi->pImageIndices[0] >= sw.images.size()) {
+        static std::atomic<int> nl{0};
+        if (nl.fetch_add(1) == 0) Logf("rt: FPS counter: this swapchain (format %d) cannot take it", (int)sw.format);
+        return VK_NULL_HANDLE;
+    }
+    std::lock_guard<std::mutex> lk(d->hudMtx);
+    if (!d->hudTried) {
+        d->hudTried = true;
+        uint32_t family = 0;
+        { std::lock_guard<std::mutex> rl(d->regMtx); auto it = d->queueFamily.find(queue); if (it != d->queueFamily.end()) family = it->second; }
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = family;
+        bool ok = d->CreateCommandPool(d->device, &pci, nullptr, &d->hudPool) == VK_SUCCESS;
+        for (int i = 0; i < 4 && ok; ++i) {
+            DeviceData::HudSlot& s = d->hud[i];
+            VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            cai.commandPool = d->hudPool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+            VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+            VkDeviceAddress dummy = 0;
+            void* mp = nullptr;
+            ok = d->AllocateCommandBuffers(d->device, &cai, &s.cb) == VK_SUCCESS && d->setLoaderData(d->device, s.cb) == VK_SUCCESS &&
+                 d->CreateFence(d->device, &fci, nullptr, &s.fence) == VK_SUCCESS && d->CreateSemaphore(d->device, &sci, nullptr, &s.sem) == VK_SUCCESS &&
+                 MakeBufEx(d, 256 * 40 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, s.buf, s.mem, dummy) &&
+                 d->MapMemory(d->device, s.mem, 0, VK_WHOLE_SIZE, 0, &mp) == VK_SUCCESS && mp;
+            s.ptr = (uint8_t*)mp;
+        }
+        d->hudOk = ok;
+        Logf(ok ? "rt: FPS counter ready" : "!!! rt: FPS counter could not get its resources");
+    }
+    if (!d->hudOk) return VK_NULL_HANDLE;
+    DeviceData::HudSlot& s = d->hud[d->hudNext % 4];
+    if (d->GetFenceStatus(d->device, s.fence) != VK_SUCCESS) return VK_NULL_HANDLE;   // still in flight: skip one frame rather than wait
+    ++d->hudNext;
+    d->ResetFences(d->device, 1, &s.fence);
+
+    // the picture: "75 FPS 13.3 MS" (+ " RT OFF" with the rays off), white on dark, font scaled 4x
+    char txt[40];
+    snprintf(txt, sizeof txt, "%d FPS %.1f MS%s", (int)(fps + 0.5), ms, g_enabled ? "" : " RT OFF");
+    const int scale = 4, pad = 6, cw = 4 * scale;
+    const int W = std::min<int>(256, pad * 2 + (int)strlen(txt) * cw), H = pad * 2 + 5 * scale;
+    const uint32_t w = std::min<uint32_t>((uint32_t)W, sw.extent.width > 24 ? sw.extent.width - 16 : 0), h = std::min<uint32_t>((uint32_t)H, sw.extent.height > 24 ? sw.extent.height - 16 : 0);
+    if (!w || !h) return VK_NULL_HANDLE;
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            bool on = false;
+            const int gx = (int)x - pad, gy = (int)y - pad;
+            if (gx >= 0 && gy >= 0 && gy < 5 * scale) {
+                const int ci = gx / cw, cx = (gx % cw) / scale, cy = gy / scale;
+                if (ci < (int)strlen(txt) && cx < 3) on = (HudGlyph(txt[ci]) >> ((4 - cy) * 3 + (2 - cx))) & 1;
+            }
+            uint8_t* px = s.ptr + ((size_t)y * w + x) * 4;
+            const uint8_t r = on ? 255 : 16, g = on ? 255 : 18, b = on ? (g_enabled ? 160 : 255) : 24;   // yellowish with the rays, white without
+            px[0] = bgra ? b : r; px[1] = g; px[2] = bgra ? r : b; px[3] = 255;
+        }
+
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    d->BeginCommandBuffer(s.cb, &bi);
+    VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ib.image = sw.images[pi->pImageIndices[0]];
+    ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    ib.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    ib.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    d->CmdPipelineBarrier(s.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
+    VkBufferImageCopy rg{};
+    rg.bufferRowLength = w;
+    rg.bufferImageHeight = h;
+    rg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    rg.imageOffset = {12, 12, 0};
+    rg.imageExtent = {w, h, 1};
+    d->CmdCopyBufferToImage(s.cb, s.buf, ib.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
+    ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    ib.dstAccessMask = 0;
+    ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    ib.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    d->CmdPipelineBarrier(s.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
+    d->EndCommandBuffer(s.cb);
+    std::vector<VkPipelineStageFlags> stages(pi->waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.waitSemaphoreCount = pi->waitSemaphoreCount;
+    si.pWaitSemaphores = pi->pWaitSemaphores;
+    si.pWaitDstStageMask = stages.data();
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &s.cb;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &s.sem;
+    if (d->QueueSubmit(queue, 1, &si, s.fence) != VK_SUCCESS) {
+        static std::atomic<int> el{0};
+        if (el.fetch_add(1) < 3) Logf("!!! rt: FPS counter submit failed");
+        return VK_NULL_HANDLE;   // the fence stays unsignalled: this slot is retired
+    }
+    return s.sem;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
     DeviceData* d = GetDev(Key(queue));
     if (!d) return VK_ERROR_INITIALIZATION_FAILED;
     g_stage = "vkQueuePresentKHR";
-    VkResult r = d->QueuePresentKHR(queue, pPresentInfo);
+    static double hudFps = 0.0, hudMs = 0.0;
+    {   // FPS for the counter: frames and time over the last half second
+        static LARGE_INTEGER fq = {}, t0 = {};
+        static int n = 0;
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        if (!fq.QuadPart) { QueryPerformanceFrequency(&fq); t0 = now; }
+        ++n;
+        const double dt = (double)(now.QuadPart - t0.QuadPart) / (double)fq.QuadPart;
+        if (dt >= 0.5) { hudFps = n / dt; hudMs = dt * 1000.0 / n; n = 0; t0 = now; }
+    }
+    VkPresentInfoKHR pinfo = *pPresentInfo;
+    VkSemaphore hudSem = (g_fpsOn.load(std::memory_order_relaxed) && pPresentInfo) ? DrawHud(d, queue, pPresentInfo, hudFps, hudMs) : VK_NULL_HANDLE;
+    if (hudSem) { pinfo.waitSemaphoreCount = 1; pinfo.pWaitSemaphores = &hudSem; }
+    VkResult r = d->QueuePresentKHR(queue, &pinfo);
     uint64_t f = ++d->frames;
     TpFrame(f);
     d->presentQueue = queue;
@@ -5802,6 +5988,7 @@ extern "C" __declspec(dllexport) VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL SkyRT_
     HOOKD(CreateBuffer);
     HOOKD(AllocateMemory);
     HOOKD(QueuePresentKHR);
+    HOOKD(CreateSwapchainKHR);
     HOOKD(QueueSubmit);
     HOOKD(CmdDraw);
     HOOKD(CmdDrawIndexed);
