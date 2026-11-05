@@ -4628,6 +4628,14 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 }
             }
             ++(hasXf ? xfMoved : xfPlain);
+            {   // recorded last frame: the game may have destroyed its buffers / memory since (a level change) - such a draw must not be built
+                std::lock_guard<std::mutex> rk(d->regMtx);
+                const DeviceData::FrameGeo::Verts& fv0 = pg.verts[i];
+                auto bufOk = [&](VkBuffer b) { return !b || d->bufs.count(b) != 0; };
+                auto memOk = [&](VkDeviceMemory mm) { return !mm || d->mems.count(mm) != 0; };
+                const bool alive = bufOk(pg.keys[i].vb) && bufOk(pg.keys[i].ib) && bufOk(fv0.ab) && memOk(pg.mems[i].first) && memOk(pg.mems[i].second) && memOk(fv0.am);
+                if (!alive) { static std::atomic<uint64_t> gone{0}; if (++gone % 1000 == 1) Logf("rt: a draw of last frame lost its buffers before it reached the cache (level change) - skipped (%llu so far)", (unsigned long long)gone.load()); continue; }
+            }
             auto it = d->geoCache.find(pg.keys[i]);
             if (it == d->geoCache.end()) {
                 const DeviceData::FrameGeo::Verts& fv = pg.verts[i];
