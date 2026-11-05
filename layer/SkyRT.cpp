@@ -3216,6 +3216,11 @@ struct CensusRow { uint64_t draws = 0, items = 0, outside = 0; bool indexed = fa
 static std::atomic<int> g_census{0};
 static std::mutex g_censusMtx;
 static std::map<std::pair<uint64_t, uint64_t>, CensusRow> g_censusMap;
+// The census also records the per-draw material block (set 0, binding 0) of the snow / terrain shaders: ice and snow are drawn by the
+// same SnowSh, so only these values can tell them apart. One line per distinct block at the end of the census.
+struct CensusMatRow { uint64_t draws = 0, tris = 0; float v[16] = {}; };
+static std::map<std::pair<uint64_t, uint64_t>, CensusMatRow> g_censusMat;   // g_censusMtx: (fs, hash of the block)
+static void CensusMat(DeviceData* d, VkCommandBuffer cb, uint64_t fs, uint64_t tris);
 static void CensusAdd(DeviceData* d, const DeviceData::CmdState& st, bool indexed, uint64_t items) {
     if (!g_census.load(std::memory_order_relaxed)) return;
     DeviceData::PipeInfo pi;
@@ -3283,9 +3288,33 @@ static void CensusOther(DeviceData* d, VkCommandBuffer cb, bool indexed) {
     r.outside++; r.indexed = indexed; r.opaque = pi.opaque; r.blend = pi.blend; r.topo = pi.topology;
     r.stride = pi.binds.empty() ? 0 : pi.binds[0].stride;
 }
+static void CensusMat(DeviceData* d, VkCommandBuffer cb, uint64_t fs, uint64_t tris) {
+    // SnowSh, SnowShSkirt, SnowMeshSh, SnowMesh, RockFaceRainSh (the rink's neighbour), SandSh / GrassSh families
+    static const uint64_t kFs[] = {0xaba7fcaeb02adb7aull, 0xf60dd8cd004611b9ull, 0x57a67d434c6dfa8bull, 0xec1deb840e4167f7ull};
+    bool want = false;
+    for (uint64_t k : kFs) if (k == fs) want = true;
+    if (!want) return;
+    TpUbo u{};
+    {
+        std::lock_guard<std::mutex> lk(g_tpMtx);
+        auto it = g_tpCbUbo.find(cb);
+        if (it == g_tpCbUbo.end()) return;
+        u = it->second;
+    }
+    float v[16];
+    if (!ReadBufHost(d, u.buf, u.off, v, sizeof v)) return;
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < 16; ++i) { uint32_t x; memcpy(&x, &v[i], 4); h ^= x; h *= 1099511628211ull; }
+    std::lock_guard<std::mutex> lk(g_censusMtx);
+    CensusMatRow& r = g_censusMat[{fs, h}];
+    r.draws++;
+    r.tris += tris;
+    memcpy(r.v, v, sizeof v);
+}
+
 static void CensusToggle() {
     if (!g_census.load()) {
-        { std::lock_guard<std::mutex> lk(g_censusMtx); g_censusMap.clear(); }
+        { std::lock_guard<std::mutex> lk(g_censusMtx); g_censusMap.clear(); g_censusMat.clear(); }
         g_census = 1;
         Logf("rt: KEY Ctrl+End -> census RECORDING (stand where the water / ice is, press Ctrl+End again after a few seconds)");
         return;
@@ -3299,6 +3328,15 @@ static void CensusToggle() {
         Logf("rt: CENSUS vs %016llx fs %016llx | draws %llu items %llu outside-main %llu | %s %s topo %u stride %u", (unsigned long long)r.first.first, (unsigned long long)r.first.second,
              (unsigned long long)r.second.draws, (unsigned long long)r.second.items, (unsigned long long)r.second.outside, r.second.indexed ? "indexed" : "non-indexed",
              r.second.opaque ? "opaque" : (r.second.blend ? "blended" : "other"), r.second.topo, r.second.stride);
+    std::vector<std::pair<std::pair<uint64_t, uint64_t>, CensusMatRow>> mats;
+    { std::lock_guard<std::mutex> lk(g_censusMtx); mats.assign(g_censusMat.begin(), g_censusMat.end()); }
+    std::sort(mats.begin(), mats.end(), [](const auto& a, const auto& b) { return a.second.tris > b.second.tris; });
+    Logf("rt: CENSUS materials of the snow shaders: %zu distinct per-draw blocks (set 0 binding 0, first 16 floats)", mats.size());
+    for (const auto& r : mats) {
+        std::string vals;
+        for (int i = 0; i < 16; ++i) { char t[24]; snprintf(t, sizeof t, " %.3f", (double)r.second.v[i]); vals += t; }
+        Logf("rt: CENSUS MAT fs %016llx | draws %llu tris %llu |%s", (unsigned long long)r.first.first, (unsigned long long)r.second.draws, (unsigned long long)r.second.tris, vals.c_str());
+    }
 }
 
 static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer indBuf, VkDeviceSize indOff, uint32_t drawCount,
@@ -3331,6 +3369,13 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         cmds.push_back(*direct);
     }
     CensusAdd(d, st, true, cmds.size());
+    if (g_census.load(std::memory_order_relaxed)) {
+        uint64_t fs = 0;
+        { std::lock_guard<std::mutex> lk(d->regMtx); auto pit = d->pipes.find(st.pipe); if (pit != d->pipes.end()) fs = pit->second.fsHash; }
+        uint64_t tris = 0;
+        for (const VkDrawIndexedIndirectCommand& c : cmds) tris += c.indexCount / 3;
+        CensusMat(d, cb, fs, tris);
+    }
 
     ProbeBlended(d, st, cmds);
     {   // step 15: print the full vertex layout of every pipeline the first time the main pass uses it (skinned characters have joint indices / weights / instance data)
