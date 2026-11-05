@@ -117,7 +117,9 @@ Everything the panel changes lives in `%LOCALAPPDATA%\SkyRT\SkyRT.cfg` (plain `k
 | `matgain` | 0–8 | Brightness of light from a hit surface (default 1) |
 | `matbaked` | 0/1 | Read baked light from vertices at the ray hit (default 1, works only with materials on). Set 0 if the game crashes with `DEVICE_LOST` while materials are on |
 | `texprobe` | 0/1 | Log only: which textures every shader pair samples. Set before the game starts |
-| `waterfx` · `waterrefl` · `glint` | 0/1 · strength · 0/1 | Experimental water and ice: reflections on/off, reflection strength, sun glints |
+| `waterfx` · `waterrefl` · `glint` | 0/1 · strength · 0/1 | Experimental water: reflections on/off (needs a game restart), reflection strength, sun glints |
+| `waterf0` | 0..1 | How mirror-like the water is looking straight down (real water 0.02, default 0.25) |
+| `icefx` · `icerefl` · `icef0` · `icemats` | 0/1 · strength · 0..1 · ids | Reflections on ice: the level ground whose terrain material is ice (`icemats`, 22 = the Valley rink) and flat slabs right above it |
 | `aniso` · `lodbias` | 0–16 · −2…1 | Anisotropic filtering, texture sharpness shift (**applied on the next game start**) |
 | `autosun` · `az` · `el` | 0/1 · 0–360° · 1–89° | Take the sun from the game, or set it manually |
 | `view` | 0–10 | Debug views. 0 = normal, 5 = bounce light only, 8 = material colour of every pixel (black = no material), 9 = bounce light with every ray that uses a material painted red, 10 = baked light read from the vertices (black = no vertex data) |
@@ -129,6 +131,7 @@ More rays = less noise, more GPU work. Sky is usually CPU-bound, so the GPU norm
 | Keys | Action |
 |---|---|
 | **Ctrl+Home** | Ray tracing on/off (compare with the original picture) |
+| **Ctrl+F** | FPS counter on/off (top left; also `fps=1` in the cfg or the installer) |
 | **Ctrl+End** | Debug: shader census. Press once to start recording the main pass, press again to print every shader pair with draw counts to the log (used to find the water / ice shaders). The old debug views are selected with `view=N` in the cfg |
 | **Ctrl+]** | Deep bounce mode on/off (very heavy) |
 | **Ctrl+Up / Ctrl+Down** | Bounces +1 / -1 (1..8) in deep mode |
