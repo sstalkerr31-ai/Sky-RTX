@@ -96,6 +96,8 @@ static int g_grass = 1;           // step 24: grass (non-indexed triangle strips
 static bool g_iceOn = true;               // cfg icefx: reflections on ice (level ground whose terrain material is ice)
 static std::string g_iceMats = "22";      // cfg icemats: terrain material ids that are ice (22 = the Valley's rink)
 static float g_iceF0 = 0.15f, g_iceRefl = 0.5f;   // cfg icef0 / icerefl
+static std::string g_snowMats = "35";     // cfg snowmats: terrain material ids that are snow (35 = the Valley's)
+static float g_sparkle = 1.0f, g_sparkDens = 0.08f;   // cfg sparkle (strength, 0 = off) / sparkdens (share of crystals that can flash)
 static std::atomic<bool> g_fpsOn{false};   // FPS counter in the corner (Ctrl+F, cfg fps=1)
 static int g_fpsCfg = -1;                 // last fps= value read from SkyRT.cfg (a change there switches the counter)
 static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
@@ -610,7 +612,8 @@ struct DeviceData {
         VkDeviceMemory vbMem = VK_NULL_HANDLE, ibMem = VK_NULL_HANDLE, blasMem = VK_NULL_HANDLE, scratchMem = VK_NULL_HANDLE;
         VkAccelerationStructureKHR blas = VK_NULL_HANDLE;
         VkDeviceAddress blasAddr = 0, vbAddr = 0, ibAddr = 0;
-        VkBuffer iceBuf = VK_NULL_HANDLE; VkDeviceMemory iceMem = VK_NULL_HANDLE; VkDeviceAddress iceAddr = 0;   // per triangle: how much of it is ice (byte)
+        VkBuffer iceBuf = VK_NULL_HANDLE; VkDeviceMemory iceMem = VK_NULL_HANDLE; VkDeviceAddress iceAddr = 0;   // per triangle: how much of it is ice, how much snow (2 bytes)
+        bool hasIce = false, hasSnow = false;
     };
     LevelGpu lvl;                                       // cacheMtx (blasAddr is read when the TLAS is built)
     std::vector<std::pair<uint64_t, LevelGpu>> lvlGrave;   // grounds of earlier levels, freed once no frame in flight can use them
@@ -2712,7 +2715,8 @@ struct FxParams {
     float grassCol[4];   // the game's grass colour (per-draw colour of GrassSh), w = 1 when known
     float rockCol[4];    // the game's rock colour (per-draw colour of RockFaceSh / RockFaceShMesh), w = 1 when known
     float wat[4];        // water: x = base reflectivity (cfg waterf0), y = 1: show only the reflection (cfg waterdebug); z, w = ice reflectivity / strength
-    uint32_t ice[4];     // x,y = per-triangle ice weight table of the level ground (address lo, hi), z = triangles, w = 1 on
+    uint32_t ice[4];     // x,y = per-triangle table of the level ground (address lo, hi): 2 bytes each, ice and snow weight; z = triangles; w = bit0 ice, bit1 sparkles
+    float spark[4];      // snow sparkles: x = strength, y = share of crystals, z = crystal size (m)
 };
 static_assert(sizeof(FxParams) <= 512, "the parameter buffers are 512 bytes");
 static const uint32_t kLightMax = 256, kLightBufBytes = 16 + 256 * 32 + 64 * 48;   // header, candidates (2 x vec4), 64 persistent lights (3 x vec4)
@@ -3937,6 +3941,9 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "levelgeo")) g_levelGeo = v != 0.0;
         else if (!strcmp(key, "castprobe")) g_castProbe = v != 0.0;
         else if (!strcmp(key, "icefx")) g_iceOn = v != 0.0;
+        else if (!strcmp(key, "sparkle")) g_sparkle = (float)std::max(0.0, std::min(8.0, v));
+        else if (!strcmp(key, "sparkdens")) g_sparkDens = (float)std::max(0.0, std::min(1.0, v));
+        else if (!strcmp(key, "snowmats")) { std::string s = sv; while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back(); g_snowMats = s; }
         else if (!strcmp(key, "icef0")) g_iceF0 = (float)std::max(0.0, std::min(1.0, v));
         else if (!strcmp(key, "icerefl")) g_iceRefl = (float)std::max(0.0, std::min(1.0, v));
         else if (!strcmp(key, "icemats")) { std::string s = sv; while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back(); g_iceMats = s; }
@@ -4347,32 +4354,44 @@ static void LevelUpdate(DeviceData* d, VkCommandBuffer cb) {
     g.tris = prims;
     g.vbAddr = vbAddr;
     g.ibAddr = ibAddr;
-    {   // ice: per triangle, the share of the ice materials (cfg icemats) in its three vertices
-        bool isIce[256] = {};
-        for (size_t a = 0; a <= g_iceMats.size();) {
-            size_t b = g_iceMats.find(',', a);
-            if (b == std::string::npos) b = g_iceMats.size();
-            const int id = atoi(g_iceMats.substr(a, b - a).c_str());
-            if (id > 0 && id < 256) isIce[id] = true;
-            a = b + 1;
-        }
-        std::vector<uint8_t> w((prims + 3) & ~3u, 0);
-        uint32_t iceTris = 0;
+    {   // ice and snow: per triangle, the share of the ice materials (cfg icemats) and of the snow materials (cfg snowmats) in its three vertices
+        auto parse = [](const std::string& list, bool* out) {
+            for (size_t a = 0; a <= list.size();) {
+                size_t b = list.find(',', a);
+                if (b == std::string::npos) b = list.size();
+                const int id = atoi(list.substr(a, b - a).c_str());
+                if (id > 0 && id < 256) out[id] = true;
+                a = b + 1;
+            }
+        };
+        bool isIce[256] = {}, isSnow[256] = {};
+        parse(g_iceMats, isIce);
+        parse(g_snowMats, isSnow);
+        std::vector<uint8_t> w(((size_t)prims * 2 + 3) & ~(size_t)3, 0);
+        uint32_t iceTris = 0, snowTris = 0;
         for (uint32_t tr = 0; tr < prims && !t->matIds.empty(); ++tr) {
-            uint32_t s = 0;
+            uint32_t si = 0, ss = 0;
             for (int k = 0; k < 3; ++k) {
                 const uint32_t v = t->idx[(size_t)tr * 3 + k], ids = t->matIds[v], ws = t->matWeights[v];
-                for (int j = 0; j < 4; ++j) if (isIce[(ids >> (j * 8)) & 255]) s += (ws >> (j * 8)) & 255;
+                for (int j = 0; j < 4; ++j) {
+                    const uint32_t id = (ids >> (j * 8)) & 255, wt = (ws >> (j * 8)) & 255;
+                    if (isIce[id]) si += wt;
+                    if (isSnow[id]) ss += wt;
+                }
             }
-            w[tr] = (uint8_t)std::min<uint32_t>(255, s / 3);
-            if (w[tr] >= 77) ++iceTris;
+            w[(size_t)tr * 2] = (uint8_t)std::min<uint32_t>(255, si / 3);
+            w[(size_t)tr * 2 + 1] = (uint8_t)std::min<uint32_t>(255, ss / 3);
+            if (w[(size_t)tr * 2] >= 77) ++iceTris;
+            if (w[(size_t)tr * 2 + 1] >= 128) ++snowTris;
         }
         void* ip = nullptr;
-        if (iceTris && MakeBufEx(d, w.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, g.iceBuf, g.iceMem, g.iceAddr) &&
+        if ((iceTris || snowTris) && MakeBufEx(d, w.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, g.iceBuf, g.iceMem, g.iceAddr) &&
             d->MapMemory(d->device, g.iceMem, 0, VK_WHOLE_SIZE, 0, &ip) == VK_SUCCESS && ip) {
             memcpy(ip, w.data(), w.size());
             d->UnmapMemory(d->device, g.iceMem);
-            Logf("level: ice (materials %s) on %u of %u ground triangles", g_iceMats.c_str(), iceTris, prims);
+            g.hasIce = iceTris > 0;
+            g.hasSnow = snowTris > 0;
+            Logf("level: of %u ground triangles, ice (materials %s) %u, snow (materials %s) %u", prims, g_iceMats.c_str(), iceTris, g_snowMats.c_str(), snowTris);
         } else g.iceAddr = 0;
     }
     {
@@ -4944,8 +4963,10 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         {
             std::lock_guard<std::mutex> lk(d->cacheMtx);
             const VkDeviceAddress ia = d->lvl.blasAddr ? d->lvl.iceAddr : 0;
-            par->ice[0] = (uint32_t)ia; par->ice[1] = (uint32_t)(ia >> 32); par->ice[2] = ia ? (uint32_t)d->lvl.tris : 0u; par->ice[3] = (ia && g_iceOn) ? 1u : 0u;
+            par->ice[0] = (uint32_t)ia; par->ice[1] = (uint32_t)(ia >> 32); par->ice[2] = ia ? (uint32_t)d->lvl.tris : 0u;
+            par->ice[3] = ia ? ((g_iceOn && d->lvl.hasIce) ? 1u : 0u) | ((g_sparkle > 0.0f && d->lvl.hasSnow) ? 2u : 0u) : 0u;
         }
+        par->spark[0] = g_sparkle; par->spark[1] = g_sparkDens; par->spark[2] = 0.025f; par->spark[3] = 0.0f;
         static std::atomic<uint64_t> cn{0};
         if (matOn && cn.fetch_add(1) % 1800 == 0) Logf("rt: hit lighting: sun colour %.3f %.3f %.3f, shade %.3f %.3f %.3f, sky %.3f %.3f %.3f (%s), vertex reads %s", (double)sc[0], (double)sc[1], (double)sc[2], (double)ac[0], (double)ac[1], (double)ac[2], (double)kc[0], (double)kc[1], (double)kc[2], ok ? "read" : "NOT readable", par->mat[3] ? "on" : "off");
     }
@@ -5150,7 +5171,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     // ---- pass 2: denoise + composite into the game's color image
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->fxPipe);
     d->CmdDispatch(cb, (m.w + 7) / 8, (m.h + 7) / 8, 1);
-    if (d->icePipe && par->ice[3]) {   // pass 3: ice reflections on the finished picture (it reads the frame copy the composite just wrote)
+    if (d->icePipe && par->ice[3]) {   // pass 3: ice reflections and snow sparkles on the finished picture (it reads the frame copy the composite just wrote)
         VkMemoryBarrier ib{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         ib.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;

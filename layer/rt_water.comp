@@ -35,8 +35,17 @@ layout(set = 0, binding = 5, std140) uniform Params {
     vec4 grassCol;  // the game's grass and rock colours, w = 1 when known
     vec4 rockCol;
     vec4 wat;       // x = base reflectivity (straight down), y = 1: show only the reflection (debug); z, w = the same and the strength for ice
-    uvec4 ice;      // x,y = per-triangle ice weight of the level ground (bytes), z = triangles, w = 1 on
+    uvec4 ice;      // x,y = per-triangle table of the level ground (2 bytes: ice, snow weight), z = triangles, w = bit0 ice, bit1 sparkles
+    vec4 spark;     // snow sparkles: x = strength, y = share of crystals, z = crystal size (m)
 } u;
+
+uint hash3(uvec3 v) {   // a small integer hash (PCG-like)
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v.x ^ v.y ^ v.z;
+}
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U32 { uint v; };
 uint read32(uvec2 a, uint off) {
     uint carry;
@@ -163,6 +172,7 @@ void main() {
     // ice: the camera ray, looking only at the level ground (instance mask 2), must meet it at this pixel's depth on a triangle
     // whose terrain material is ice
     if (u.ice.w == 0u || u.ice.z == 0u || u.lvl.z == 0u) return;
+    if (z <= 0.0) return;
     rayQueryEXT rc;
     rayQueryInitializeEXT(rc, uTlas, gl_RayFlagsOpaqueEXT, 0x02, u.cam.xyz, 0.0, V, dist + 8.0 / max(abs(V.y), 0.1));
     while (rayQueryProceedEXT(rc)) {}
@@ -182,8 +192,36 @@ void main() {
     if (!onGround && !lid) return;   // something else (a character, a wall) is in front
     uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rc, true));
     if (prim >= u.ice.z) return;
-    float iceW = float((read32(u.ice.xy, prim & ~3u) >> ((prim & 3u) * 8u)) & 255u) / 255.0;
-    if (iceW < 0.3) return;
+    uint pair = (read32(u.ice.xy, (prim * 2u) & ~3u) >> (((prim * 2u) & 2u) * 8u)) & 0xFFFFu;
+    float iceW = float(pair & 255u) / 255.0, snowW = float(pair >> 8) / 255.0;
+    if ((u.ice.w & 1u) == 0u) iceW = 0.0;
+    if (iceW < 0.3) {
+        // snow sparkles: every crystal-sized cell holds one tilted facet; it flashes when the sun, the facet and the eye line up
+        if ((u.ice.w & 2u) == 0u || !onGround || snowW < 0.5 || u.sunCol.w < 0.5) return;
+        vec3 sl = normalize(u.sun.xyz);
+        if (sl.y < 0.03) return;
+        float cell = max(u.spark.z, dist * 0.0012);          // never smaller than about a pixel: no shimmering far away
+        uvec3 c = uvec3(ivec3(floor(P / cell)) + ivec3(1 << 20));
+        uint h0 = hash3(c);
+        if (float(h0 & 0xFFFFu) / 65535.0 > u.spark.y) return;   // most cells hold no flat facet
+        vec3 gn = groundNormal(prim);
+        if (gn.y < 0.0) gn = -gn;
+        uint h1 = hash3(c + uvec3(17u, 31u, 47u)), h2 = hash3(c + uvec3(5u, 89u, 13u));
+        vec3 rn = vec3(float(h1 & 0xFFFFu), float(h1 >> 16), float(h2 & 0xFFFFu)) / 65535.0 * 2.0 - 1.0;
+        vec3 fn = normalize(gn + rn * 0.45);                  // the facet: the surface normal, randomly tilted
+        vec3 H = normalize(sl - V);
+        float a = pow(max(dot(fn, H), 0.0), 900.0);           // only a facet almost exactly between the sun and the eye
+        if (a < 0.02) return;
+        rayQueryEXT rs;                                       // and only in the sun
+        rayQueryInitializeEXT(rs, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, P + gn * 0.05, 0.0, sl, 2000.0);
+        while (rayQueryProceedEXT(rs)) {}
+        if (rayQueryGetIntersectionTypeEXT(rs, true) != gl_RayQueryCommittedIntersectionNoneEXT) return;
+        float fade = (1.0 - smoothstep(30.0, 60.0, dist)) * smoothstep(0.5, 0.8, snowW);
+        vec3 col = imageLoad(uWater, p).rgb + u.sunCol.rgb * (a * u.spark.x * 6.0 * fade);
+        if (any(isnan(col)) || any(isinf(col))) return;
+        imageStore(uWater, p, vec4(min(col, vec3(60.0)), imageLoad(uWater, p).a));
+        return;
+    }
     if (abs(groundNormal(prim).y) < 0.8 && !lid) return;   // ice lies flat
     float edge = smoothstep(0.3, 0.8, iceW);       // where the ice blends into snow the reflection fades
 #else
