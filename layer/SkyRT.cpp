@@ -601,6 +601,8 @@ struct DeviceData {
     std::unordered_map<VkCommandBuffer, FrameGeo> frameGeo;          // geoMtx
     FrameGeo waterFg;                                                 // geoMtx: water drawn in its own pass, merged into the next trace pass
     FrameGeo pendStatic;                                              // the static draws of the previous trace pass: their matrices are readable now
+    struct Churn { uint32_t fresh = 0; uint64_t since = 0; bool moving = false; };
+    std::unordered_map<GeoKey, Churn, GeoKeyHash> churn;              // cacheMtx: per mesh (key without matrix): how often it shows up at a new place
     std::atomic<int> mainCount{0};
     bool track = false;                                               // track vertex/index/pipeline binds of every cb
     struct RtSlot {
@@ -4395,6 +4397,7 @@ static void LevelUpdate(DeviceData* d, VkCommandBuffer cb) {
         if (d->lvl.blas) { d->lvlGrave.emplace_back(fr, d->lvl); d->lvl = DeviceData::LevelGpu{}; }
         if (d->mdl.blas) { d->lvlGrave.emplace_back(fr, d->mdl); d->mdl = DeviceData::LevelGpu{}; }
         d->mdlFailed = false;
+        d->churn.clear();   // a new level: moving meshes are judged again
         d->cacheForce = true;
     }
     {   // the level's meshes: one BLAS for all of them
@@ -4628,6 +4631,12 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 }
             }
             ++(hasXf ? xfMoved : xfPlain);
+            GeoKey base = pg.keys[i];
+            base.xf = 0;
+            if (hasXf) {   // a moving mesh (a bell, a door, a flag) shows up at a new place every frame: it must not pile up copies in the cache
+                auto ch = d->churn.find(base);
+                if (ch != d->churn.end() && ch->second.moving) continue;
+            }
             {   // recorded last frame: the game may have destroyed its buffers / memory since (a level change) - such a draw must not be built
                 std::lock_guard<std::mutex> rk(d->regMtx);
                 const DeviceData::FrameGeo::Verts& fv0 = pg.verts[i];
@@ -4637,6 +4646,24 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 if (!alive) { static std::atomic<uint64_t> gone{0}; if (++gone % 1000 == 1) Logf("rt: a draw of last frame lost its buffers before it reached the cache (level change) - skipped (%llu so far)", (unsigned long long)gone.load()); continue; }
             }
             auto it = d->geoCache.find(pg.keys[i]);
+            if (it == d->geoCache.end() && hasXf) {
+                DeviceData::Churn& ch = d->churn[base];
+                if (fr - ch.since > 600) { ch.since = fr; ch.fresh = 0; }
+                if (++ch.fresh > 24) {   // more than 24 new places within ~10 s: it moves. Its copies go, and it stays out of the cache
+                    ch.moving = true;
+                    uint32_t gone = 0;
+                    for (auto ci = d->geoCache.begin(); ci != d->geoCache.end();) {
+                        GeoKey ck = ci->first;
+                        ck.xf = 0;
+                        if (ci->second.hasXf && ck == base) { d->cacheTris -= std::min<uint64_t>(d->cacheTris, ci->second.r.primitiveCount); ci = d->geoCache.erase(ci); ++gone; }
+                        else ++ci;
+                    }
+                    d->cacheDirty = true;
+                    static std::atomic<int> ml{0};
+                    if (ml.fetch_add(1) < 30) Logf("rt: a moving mesh (%u tris) keeps the cache out: %u copies removed", pg.ranges[i].primitiveCount, gone);
+                    continue;
+                }
+            }
             if (it == d->geoCache.end()) {
                 const DeviceData::FrameGeo::Verts& fv = pg.verts[i];
                 GeoEnt e{pg.geoms[i], pg.ranges[i], fr, pg.mems[i].first, pg.mems[i].second, pg.mats[i], fv.v, fv.ab, fv.am};
