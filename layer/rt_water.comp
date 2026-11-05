@@ -164,15 +164,27 @@ void main() {
     // whose terrain material is ice
     if (u.ice.w == 0u || u.ice.z == 0u || u.lvl.z == 0u) return;
     rayQueryEXT rc;
-    rayQueryInitializeEXT(rc, uTlas, gl_RayFlagsOpaqueEXT, 0x02, u.cam.xyz, 0.0, V, dist * 1.05 + 0.5);
+    rayQueryInitializeEXT(rc, uTlas, gl_RayFlagsOpaqueEXT, 0x02, u.cam.xyz, 0.0, V, dist + 8.0 / max(abs(V.y), 0.1));
     while (rayQueryProceedEXT(rc)) {}
     if (rayQueryGetIntersectionTypeEXT(rc, true) == gl_RayQueryCommittedIntersectionNoneEXT) return;
-    if (abs(rayQueryGetIntersectionTEXT(rc, true) - dist) > max(0.3, dist * 0.02)) return;   // something else (a mesh, a character) is in front
+    float tg = rayQueryGetIntersectionTEXT(rc, true);
+    bool onGround = abs(tg - dist) <= max(0.3, dist * 0.02);
+    // an ice lid: a flat, level surface (a mesh such as a frozen pond's slab) with ice ground at most 6 m below it
+    bool lid = false;
+    if (!onGround && tg > dist && (tg - dist) * abs(V.y) < 6.0) {
+        ivec2 qr = min(p + ivec2(1, 0), sz - 1), qu = min(p + ivec2(0, 1), sz - 1);
+        float zr = texelFetch(uWDepth, qr, 0).r, zu = texelFetch(uWDepth, qu, 0).r;
+        if (zr > 0.0 && zu > 0.0) {
+            vec3 n = normalize(cross(worldAt(qr, sz, zr) - P, worldAt(qu, sz, zu) - P));
+            lid = abs(n.y) > 0.97;
+        }
+    }
+    if (!onGround && !lid) return;   // something else (a character, a wall) is in front
     uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rc, true));
     if (prim >= u.ice.z) return;
     float iceW = float((read32(u.ice.xy, prim & ~3u) >> ((prim & 3u) * 8u)) & 255u) / 255.0;
     if (iceW < 0.3) return;
-    if (abs(groundNormal(prim).y) < 0.8) return;   // ice lies flat
+    if (abs(groundNormal(prim).y) < 0.8 && !lid) return;   // ice lies flat
     float edge = smoothstep(0.3, 0.8, iceW);       // where the ice blends into snow the reflection fades
 #else
     // the water's own geometry is in the ray scene as the only non-opaque geometry: a pixel is water only if the camera ray meets
