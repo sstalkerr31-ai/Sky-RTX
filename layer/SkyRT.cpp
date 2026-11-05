@@ -107,7 +107,7 @@ static int g_aniso = 16;          // step 13: anisotropic filtering forced on ev
 static std::atomic<bool> g_texProbe{false};  // cfg texprobe=1: log which textures every pipeline samples (log only)
 static std::atomic<bool> g_matAlbedo{false}; // cfg matalbedo=1: off-screen ray hits use the average colour of their material (Ctrl+F9 on/off)
 static bool g_matTrack = false;              // descriptor tracking for materials, decided at start: set before the game creates its textures
-static bool g_uboTrack = false;              // per-draw UBO (set 0 binding 0) tracking: materials or water, decided at start like g_matTrack
+static bool g_uboTrack = true;               // per-draw UBO (set 0 binding 0) tracking: materials or water, decided at start like g_matTrack
 static bool g_matBaked = true;               // cfg matbaked=0: the trace shader reads no vertices, ambient at the hit stays one shade colour
 static const uint64_t kMatBakeVs[] = {0x80d5b0d5e9f45e34ull,    // RockFaceShMesh: baked light in attributes loc2, loc3
                                       0xa179ffcd45e93352ull,    // GrassSh: the same layout of baked light
@@ -331,15 +331,16 @@ struct GeoKey {
     VkBuffer vb, ib;
     uint64_t vbase, ibase;
     uint32_t count, stride;
+    uint64_t xf = 0;   // hash of the draw's model matrix (0 = none / identity)
     bool operator==(const GeoKey& o) const {
-        return vb == o.vb && ib == o.ib && vbase == o.vbase && ibase == o.ibase && count == o.count && stride == o.stride;
+        return vb == o.vb && ib == o.ib && vbase == o.vbase && ibase == o.ibase && count == o.count && stride == o.stride && xf == o.xf;
     }
 };
 struct GeoKeyHash {
     size_t operator()(const GeoKey& k) const {
         uint64_t h = 1469598103934665603ull;
-        const uint64_t v[5] = {(uint64_t)(uintptr_t)k.vb, (uint64_t)(uintptr_t)k.ib, k.vbase, k.ibase,
-                               ((uint64_t)k.count << 32) | k.stride};
+        const uint64_t v[6] = {(uint64_t)(uintptr_t)k.vb, (uint64_t)(uintptr_t)k.ib, k.vbase, k.ibase,
+                               ((uint64_t)k.count << 32) | k.stride, k.xf};
         for (uint64_t x : v) { h ^= x + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); h *= 1099511628211ull; }
         return (size_t)h;
     }
@@ -357,6 +358,8 @@ struct GeoEnt {
     GeoV v;
     VkBuffer ab;            // attribute stream the shader reads: kept alive like vb / ib
     VkDeviceMemory am;
+    VkTransformMatrixKHR xf{};   // the draw's model matrix: Mesh* shaders place their mesh with it (set 0 binding 0, offset 0)
+    bool hasXf = false;
 };
 static const uint64_t kMaxCacheTris = 700000;
 static const uint64_t kDynTrisMax = 200000;   // step 16: more than this in CPU-written buffers is not 'characters' any more
@@ -562,6 +565,7 @@ struct DeviceData {
         std::vector<uint32_t> mats;     // material id of every entry of `keys`
         struct Verts { GeoV v; VkBuffer ab; VkDeviceMemory am; };
         std::vector<Verts> verts;       // vertex access of every entry of `keys`
+        std::vector<std::pair<VkBuffer, VkDeviceSize>> ubo;   // where every entry's per-draw block (model matrix) is: read a frame later
         uint64_t tris = 0, draws = 0, skipPipe = 0, skipRange = 0, skipOther = 0, unreadable = 0;
         std::vector<VkAccelerationStructureGeometryKHR> dynGeoms;       // step 16: CPU-written vertex buffers (characters)
         std::vector<VkAccelerationStructureBuildRangeInfoKHR> dynRanges;
@@ -593,6 +597,7 @@ struct DeviceData {
     std::mutex geoMtx;
     std::unordered_map<VkCommandBuffer, FrameGeo> frameGeo;          // geoMtx
     FrameGeo waterFg;                                                 // geoMtx: water drawn in its own pass, merged into the next trace pass
+    FrameGeo pendStatic;                                              // the static draws of the previous trace pass: their matrices are readable now
     std::atomic<int> mainCount{0};
     bool track = false;                                               // track vertex/index/pipeline binds of every cb
     struct RtSlot {
@@ -602,6 +607,7 @@ struct DeviceData {
         VkAccelerationStructureKHR blas = VK_NULL_HANDLE, tlas = VK_NULL_HANDLE;
         VkDeviceSize blasCap = 0, tlasCap = 0, scratchCap = 0;
         void* instPtr = nullptr;   // instance 0 = the cache BLAS (written once), instance 1 = the level's ground when there is one
+        VkBuffer xfBuf = VK_NULL_HANDLE; VkDeviceMemory xfMem = VK_NULL_HANDLE; VkDeviceAddress xfAddr = 0; VkTransformMatrixKHR* xfPtr = nullptr;   // model matrices of the cached geometries
         uint64_t lastUse = 0;  // frame number of the last trace pass that read this slot
         bool ok = false;
     };
@@ -3091,6 +3097,13 @@ static bool EnsureRtSlots(DeviceData* d) {
         sl.blasCap = kBlasCap;
         sl.tlasCap = tlasCap;
         sl.scratchCap = kScratchCap;
+        {
+            void* xp = nullptr;
+            if (MakeBufEx(d, (VkDeviceSize)kMaxCacheGeoms * sizeof(VkTransformMatrixKHR), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, sl.xfBuf, sl.xfMem, sl.xfAddr) &&
+                d->MapMemory(d->device, sl.xfMem, 0, VK_WHOLE_SIZE, 0, &xp) == VK_SUCCESS && xp) sl.xfPtr = (VkTransformMatrixKHR*)xp;
+            else Logf("!!! rt: slot %d: no model matrix buffer - meshes drawn with a matrix stay where their vertices are", i);
+        }
         sl.ok = true;
     }
     d->rtSlotsOk = true;
@@ -3630,6 +3643,13 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         fg.geoms.push_back(g);
         fg.ranges.push_back(rg);
         fg.keys.push_back(GeoKey{st.vb[binding], st.ib, vbase, ibase, c.indexCount, vstride});
+        {
+            std::pair<VkBuffer, VkDeviceSize> ub{};
+            std::lock_guard<std::mutex> lk(g_tpMtx);
+            auto it = g_tpCbUbo.find(cb);
+            if (it != g_tpCbUbo.end()) ub = {it->second.buf, it->second.off};
+            fg.ubo.push_back(ub);
+        }
         if (g_castProbe) { std::lock_guard<std::mutex> lk(d->keyFsMtx); d->keyFs[fg.keys.back()] = fsHash; }
         fg.mems.emplace_back(vbi.mem, ibi.mem);
         fg.mats.push_back(matId);
@@ -4434,7 +4454,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         for (size_t i = 0; i < fg.dynGeoms.size(); ++i) {
             if (i < fg.dynProp.size() && fg.dynProp[i]) continue;   // props have no meaning without their transform
             fg.geoms.push_back(fg.dynGeoms[i]); fg.ranges.push_back(fg.dynRanges[i]);
-            fg.keys.push_back(fg.dynKeys[i]); fg.mems.push_back(fg.dynMems[i]); fg.mats.push_back(0); fg.verts.push_back(DeviceData::FrameGeo::Verts{});
+            fg.keys.push_back(fg.dynKeys[i]); fg.mems.push_back(fg.dynMems[i]); fg.mats.push_back(0); fg.verts.push_back(DeviceData::FrameGeo::Verts{}); fg.ubo.push_back({});
             fg.tris += fg.dynRanges[i].primitiveCount;
         }
         fg.dynGeoms.clear(); fg.dynRanges.clear(); fg.dynKeys.clear(); fg.dynMems.clear(); fg.dynXf.clear(); fg.dynProp.clear(); fg.dynTris = 0; fg.propTris = 0; fg.propGeoms = 0;
@@ -4458,6 +4478,8 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
     std::vector<uint32_t> geoMats;   // material of every entry of `geoms`
     std::vector<GeoV> geoVs;         // vertex access of every entry of `geoms`
+    std::vector<int32_t> geoXfIdx;   // index into geoXfs of every entry of `geoms`, -1 = no matrix
+    std::vector<VkTransformMatrixKHR> geoXfs;
     std::vector<GeoKey> rebuildKeys; // castprobe: the key of every entry of `geoms`
     uint64_t geoVGenNow = 0;
     uint64_t cacheTrisNow = 0;
@@ -4471,22 +4493,53 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             if (d->hideGenSeen) { d->geoCache.clear(); d->cacheTris = 0; d->cacheDirty = false; d->cacheForce = true; }
             d->hideGenSeen = hg;
         }
-        for (size_t i = 0; i < fg.keys.size(); ++i) {
-            auto it = d->geoCache.find(fg.keys[i]);
+        // The Mesh* shaders place a mesh with a model matrix from the draw's own UBO, which the game fills after recording: the draws of
+        // the previous trace pass go into the cache now, with their matrices; this pass's wait for the next one.
+        DeviceData::FrameGeo pg = std::move(d->pendStatic);
+        d->pendStatic = DeviceData::FrameGeo{};
+        d->pendStatic.geoms = fg.geoms; d->pendStatic.ranges = fg.ranges; d->pendStatic.keys = fg.keys; d->pendStatic.mems = fg.mems;
+        d->pendStatic.mats = fg.mats; d->pendStatic.verts = fg.verts; d->pendStatic.ubo = fg.ubo;
+        static std::atomic<uint64_t> xfMoved{0}, xfPlain{0};
+        for (size_t i = 0; i < pg.keys.size(); ++i) {
+            VkTransformMatrixKHR xf{};
+            bool hasXf = false;
+            float mm[16];
+            if (i < pg.ubo.size() && pg.ubo[i].first && ReadBufHost(d, pg.ubo[i].first, pg.ubo[i].second, mm, sizeof mm) && FiniteMat(mm, 16) &&
+                fabsf(mm[3]) < 1e-4f && fabsf(mm[7]) < 1e-4f && fabsf(mm[11]) < 1e-4f && fabsf(mm[15] - 1.0f) < 1e-3f) {
+                bool ident = true;
+                for (int k = 0; k < 15; ++k) if (fabsf(mm[k] - ((k % 5 == 0) ? 1.0f : 0.0f)) > 1e-5f) ident = false;
+                if (!ident) {
+                    for (int r = 0; r < 3; ++r) for (int c2 = 0; c2 < 4; ++c2) xf.matrix[r][c2] = mm[c2 * 4 + r];
+                    hasXf = true;
+                    uint64_t h = 1469598103934665603ull;
+                    for (int k = 0; k < 16; ++k) { uint32_t x; memcpy(&x, &mm[k], 4); h ^= x; h *= 1099511628211ull; }
+                    pg.keys[i].xf = h | 1ull;
+                }
+            }
+            ++(hasXf ? xfMoved : xfPlain);
+            auto it = d->geoCache.find(pg.keys[i]);
             if (it == d->geoCache.end()) {
-                const DeviceData::FrameGeo::Verts& fv = fg.verts[i];
-                d->geoCache.emplace(fg.keys[i], GeoEnt{fg.geoms[i], fg.ranges[i], fr, fg.mems[i].first, fg.mems[i].second, fg.mats[i], fv.v, fv.ab, fv.am});
-                d->buildMems.insert(fg.mems[i].first);
-                d->buildMems.insert(fg.mems[i].second);
-                d->cachedBufs.insert(fg.keys[i].vb);
-                d->cachedBufs.insert(fg.keys[i].ib);
+                const DeviceData::FrameGeo::Verts& fv = pg.verts[i];
+                GeoEnt e{pg.geoms[i], pg.ranges[i], fr, pg.mems[i].first, pg.mems[i].second, pg.mats[i], fv.v, fv.ab, fv.am};
+                e.xf = xf;
+                e.hasXf = hasXf;
+                d->geoCache.emplace(pg.keys[i], e);
+                d->buildMems.insert(pg.mems[i].first);
+                d->buildMems.insert(pg.mems[i].second);
+                d->cachedBufs.insert(pg.keys[i].vb);
+                d->cachedBufs.insert(pg.keys[i].ib);
                 if (fv.ab) { d->cachedBufs.insert(fv.ab); d->buildMems.insert(fv.am); }
-                d->cacheTris += fg.ranges[i].primitiveCount;
+                d->cacheTris += pg.ranges[i].primitiveCount;
                 d->cacheDirty = true;
             } else {
                 it->second.lastSeen = fr;
-                if (!it->second.mat) it->second.mat = fg.mats[i];
+                if (!it->second.mat) it->second.mat = pg.mats[i];
             }
+        }
+        {
+            static std::atomic<uint64_t> xl{0};
+            const uint64_t n = ++xl;
+            if (n == 300 || n % 18000 == 0) Logf("rt: cached draws placed by their model matrix: %llu, without one: %llu (so far)", (unsigned long long)xfMoved.load(), (unsigned long long)xfPlain.load());
         }
         if (fr - d->lastEvict >= 300) {  // forget what has not been drawn for a minute
             d->lastEvict = fr;
@@ -4527,7 +4580,11 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             ranges.reserve(d->geoCache.size());
             geoMats.reserve(d->geoCache.size());
             geoVs.reserve(d->geoCache.size());
-            for (auto& kv : d->geoCache) { geoms.push_back(kv.second.g); ranges.push_back(kv.second.r); geoMats.push_back(kv.second.mat); geoVs.push_back(kv.second.v); }
+            for (auto& kv : d->geoCache) {
+                geoms.push_back(kv.second.g); ranges.push_back(kv.second.r); geoMats.push_back(kv.second.mat); geoVs.push_back(kv.second.v);
+                geoXfIdx.push_back(kv.second.hasXf ? (int32_t)geoXfs.size() : -1);
+                if (kv.second.hasXf) geoXfs.push_back(kv.second.xf);
+            }
             if (g_castProbe) { rebuildKeys.clear(); for (auto& kv : d->geoCache) rebuildKeys.push_back(kv.first); }
             geoVGenNow = d->geoVGen;
         }
@@ -4670,6 +4727,11 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             return;
         }
 
+        if (slot->xfPtr && !geoXfs.empty()) {   // the model matrices (this slot is not in flight)
+            memcpy(slot->xfPtr, geoXfs.data(), std::min(geoXfs.size(), kMaxCacheGeoms) * sizeof(VkTransformMatrixKHR));
+            for (size_t i = 0; i < geoms.size(); ++i)
+                geoms[i].geometry.triangles.transformData.deviceAddress = geoXfIdx[i] >= 0 && (size_t)geoXfIdx[i] < kMaxCacheGeoms ? slot->xfAddr + (VkDeviceAddress)geoXfIdx[i] * sizeof(VkTransformMatrixKHR) : 0;
+        }
         if (d->geoMatPtr) memcpy(d->geoMatPtr + (size_t)idx * kMaxCacheGeoms, geoMats.data(), std::min(geoMats.size(), kMaxCacheGeoms) * sizeof(uint32_t));   // this slot is not in flight (see above)
         if (d->geoVPtr) {
             memcpy(d->geoVPtr + (size_t)idx * kMaxCacheGeoms, geoVs.data(), std::min(geoVs.size(), kMaxCacheGeoms) * sizeof(GeoV));
