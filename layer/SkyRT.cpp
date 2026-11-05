@@ -42,6 +42,7 @@
 #include "rtlmerge_spv.h"  // SPIR-V of rt_lmerge.comp (generated): persistent light list (step 23)
 #include "rtmat_spv.h"  // SPIR-V of rt_mat.comp (generated): average colour of a material
 #include "rtwater_spv.h"  // SPIR-V of rt_water.comp (generated): reflections on the game's water picture
+#include "rtice_spv.h"    // SPIR-V of rt_water.comp with -DICE (generated): reflections on ice, on the main frame
 #include "rtpf_spv.h"   // SPIR-V of rt.comp with -DPOSFETCH (generated): trace pass for GPUs with position fetch
 #include "skyrt_version.h"     // SKYRT_VERSION_STR; SKYRT_BUILD comes from the build (GitHub: run number + commit)
 #include "level_terrain.h"   // the ground of the whole level from the game files
@@ -92,6 +93,9 @@ static int g_bounces = 3;         // step 26: bounces per path in deep mode, 1..
 static int g_ptAdapt = 0;         // cfg ptadapt=1: screenshot mode runs at full quality only while the camera stands still (default 0 = always full)
 static int g_pathTrace = 0;       // step 25: 'path tracing' / screenshot mode: 4x rays per pixel, long accumulation, deeper bounces (cfg pathtrace=0/1, Ctrl+Backspace)
 static int g_grass = 1;           // step 24: grass (non-indexed triangle strips written by the CPU) in the acceleration structure (cfg grass=0/1)
+static bool g_iceOn = true;               // cfg icefx: reflections on ice (level ground whose terrain material is ice)
+static std::string g_iceMats = "22";      // cfg icemats: terrain material ids that are ice (22 = the Valley's rink)
+static float g_iceF0 = 0.15f, g_iceRefl = 0.5f;   // cfg icef0 / icerefl
 static std::atomic<bool> g_fpsOn{false};   // FPS counter in the corner (Ctrl+F, cfg fps=1)
 static int g_fpsCfg = -1;                 // last fps= value read from SkyRT.cfg (a change there switches the counter)
 static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
@@ -606,6 +610,7 @@ struct DeviceData {
         VkDeviceMemory vbMem = VK_NULL_HANDLE, ibMem = VK_NULL_HANDLE, blasMem = VK_NULL_HANDLE, scratchMem = VK_NULL_HANDLE;
         VkAccelerationStructureKHR blas = VK_NULL_HANDLE;
         VkDeviceAddress blasAddr = 0, vbAddr = 0, ibAddr = 0;
+        VkBuffer iceBuf = VK_NULL_HANDLE; VkDeviceMemory iceMem = VK_NULL_HANDLE; VkDeviceAddress iceAddr = 0;   // per triangle: how much of it is ice (byte)
     };
     LevelGpu lvl;                                       // cacheMtx (blasAddr is read when the TLAS is built)
     std::vector<std::pair<uint64_t, LevelGpu>> lvlGrave;   // grounds of earlier levels, freed once no frame in flight can use them
@@ -635,6 +640,7 @@ struct DeviceData {
     VkImage domeImg = VK_NULL_HANDLE; VkDeviceMemory domeMem = VK_NULL_HANDLE; VkImageView domeView = VK_NULL_HANDLE;   // the sky seen so far, all around (equirectangular, alpha = seen)
     uint64_t domeGen = ~0ull;   // the level the sky panorama belongs to; another level clears it
     VkPipeline waterPipe = VK_NULL_HANDLE;
+    VkPipeline icePipe = VK_NULL_HANDLE;              // rt_water.comp -DICE: reflections on ice, on the main frame
     VkDescriptorSet waterSets[16] = {};   // a ring as long as the trace pass's: a set is not rewritten while a frame in flight uses it
     uint32_t waterRing = 0;
     VkAccelerationStructureKHR lastTlas = VK_NULL_HANDLE;   // the TLAS and parameter buffer of the last trace pass, for the water pass
@@ -2705,7 +2711,8 @@ struct FxParams {
     uint32_t lvl[4]; // the level ground's buffers: x,y = index buffer address (lo, hi), z,w = vertex positions; 0 = none
     float grassCol[4];   // the game's grass colour (per-draw colour of GrassSh), w = 1 when known
     float rockCol[4];    // the game's rock colour (per-draw colour of RockFaceSh / RockFaceShMesh), w = 1 when known
-    float wat[4];        // water: x = base reflectivity (cfg waterf0), y = 1: show only the reflection (cfg waterdebug)
+    float wat[4];        // water: x = base reflectivity (cfg waterf0), y = 1: show only the reflection (cfg waterdebug); z, w = ice reflectivity / strength
+    uint32_t ice[4];     // x,y = per-triangle ice weight table of the level ground (address lo, hi), z = triangles, w = 1 on
 };
 static_assert(sizeof(FxParams) <= 512, "the parameter buffers are 512 bytes");
 static const uint32_t kLightMax = 256, kLightBufBytes = 16 + 256 * 32 + 64 * 48;   // header, candidates (2 x vec4), 64 persistent lights (3 x vec4)
@@ -2765,6 +2772,7 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->fxPipe = MakeComputePipe(d, kRtFxSpv, sizeof(kRtFxSpv), "composite");
     if (!d->paintPipe || !d->fxPipe) return false;
     if (d->posFetch) d->deepPipe = MakeComputePipe(d, kRtDeepSpv, sizeof(kRtDeepSpv), "deep trace");
+    d->icePipe = MakeComputePipe(d, kRtIceSpv, sizeof(kRtIceSpv), "ice reflections");   // optional
     d->waterPipe = MakeComputePipe(d, kRtWaterSpv, sizeof(kRtWaterSpv), "water reflections");   // optional   // optional: without it the deep bounce mode is unavailable
     Logf("rt: deep bounce mode %s", d->deepPipe ? "available (Ctrl+] on/off, Ctrl+Up/Down = bounces)" : "unavailable (GPU/driver lacks position fetch)");
     d->lightPipe = MakeComputePipe(d, kRtLightSpv, sizeof(kRtLightSpv), "lights");   // optional: without it the emissive light is simply off
@@ -3928,6 +3936,10 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "hidefs")) { std::string t = sv; while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back(); g_hideFsCfg = t; }
         else if (!strcmp(key, "levelgeo")) g_levelGeo = v != 0.0;
         else if (!strcmp(key, "castprobe")) g_castProbe = v != 0.0;
+        else if (!strcmp(key, "icefx")) g_iceOn = v != 0.0;
+        else if (!strcmp(key, "icef0")) g_iceF0 = (float)std::max(0.0, std::min(1.0, v));
+        else if (!strcmp(key, "icerefl")) g_iceRefl = (float)std::max(0.0, std::min(1.0, v));
+        else if (!strcmp(key, "icemats")) { std::string s = sv; while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back(); g_iceMats = s; }
         else if (!strcmp(key, "fps")) { const int fv = v != 0.0 ? 1 : 0; if (fv != g_fpsCfg) { g_fpsCfg = fv; g_fpsOn = fv != 0; } }
         else if (!strcmp(key, "grass")) g_grass = v != 0.0;
         else if (!strcmp(key, "taa")) g_taa = v != 0.0;
@@ -4236,8 +4248,8 @@ static void LevelWatch() {
 
 static void FreeLevelGpu(DeviceData* d, DeviceData::LevelGpu& g) {
     if (g.blas) d->DestroyAccelerationStructureKHR(d->device, g.blas, nullptr);
-    for (VkBuffer b : {g.vb, g.ib, g.blasBuf, g.scratch}) if (b) d->DestroyBuffer(d->device, b, nullptr);
-    for (VkDeviceMemory mm : {g.vbMem, g.ibMem, g.blasMem, g.scratchMem}) if (mm) d->FreeMemory(d->device, mm, nullptr);
+    for (VkBuffer b : {g.vb, g.ib, g.blasBuf, g.scratch, g.iceBuf}) if (b) d->DestroyBuffer(d->device, b, nullptr);
+    for (VkDeviceMemory mm : {g.vbMem, g.ibMem, g.blasMem, g.scratchMem, g.iceMem}) if (mm) d->FreeMemory(d->device, mm, nullptr);
     g = DeviceData::LevelGpu{};
 }
 
@@ -4335,6 +4347,34 @@ static void LevelUpdate(DeviceData* d, VkCommandBuffer cb) {
     g.tris = prims;
     g.vbAddr = vbAddr;
     g.ibAddr = ibAddr;
+    {   // ice: per triangle, the share of the ice materials (cfg icemats) in its three vertices
+        bool isIce[256] = {};
+        for (size_t a = 0; a <= g_iceMats.size();) {
+            size_t b = g_iceMats.find(',', a);
+            if (b == std::string::npos) b = g_iceMats.size();
+            const int id = atoi(g_iceMats.substr(a, b - a).c_str());
+            if (id > 0 && id < 256) isIce[id] = true;
+            a = b + 1;
+        }
+        std::vector<uint8_t> w((prims + 3) & ~3u, 0);
+        uint32_t iceTris = 0;
+        for (uint32_t tr = 0; tr < prims && !t->matIds.empty(); ++tr) {
+            uint32_t s = 0;
+            for (int k = 0; k < 3; ++k) {
+                const uint32_t v = t->idx[(size_t)tr * 3 + k], ids = t->matIds[v], ws = t->matWeights[v];
+                for (int j = 0; j < 4; ++j) if (isIce[(ids >> (j * 8)) & 255]) s += (ws >> (j * 8)) & 255;
+            }
+            w[tr] = (uint8_t)std::min<uint32_t>(255, s / 3);
+            if (w[tr] >= 77) ++iceTris;
+        }
+        void* ip = nullptr;
+        if (iceTris && MakeBufEx(d, w.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host, g.iceBuf, g.iceMem, g.iceAddr) &&
+            d->MapMemory(d->device, g.iceMem, 0, VK_WHOLE_SIZE, 0, &ip) == VK_SUCCESS && ip) {
+            memcpy(ip, w.data(), w.size());
+            d->UnmapMemory(d->device, g.iceMem);
+            Logf("level: ice (materials %s) on %u of %u ground triangles", g_iceMats.c_str(), iceTris, prims);
+        } else g.iceAddr = 0;
+    }
     {
         std::lock_guard<std::mutex> lk(d->cacheMtx);
         d->lvl = g;
@@ -4659,7 +4699,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 VkAccelerationStructureInstanceKHR li{};
                 li.transform.matrix[0][0] = li.transform.matrix[1][1] = li.transform.matrix[2][2] = 1.0f;
                 li.instanceCustomIndex = 1;
-                li.mask = 0xFF;
+                li.mask = 0x02;   // every other ray uses 0xFF and still sees it; the ice test uses 0x02 to see only the ground
                 li.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
                 li.accelerationStructureReference = d->lvl.blasAddr;
                 memcpy((uint8_t*)slot->instPtr + sizeof li, &li, sizeof li);
@@ -4766,7 +4806,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 uint32_t nInst = 2;
                 {
                     std::lock_guard<std::mutex> lk(d->cacheMtx);
-                    if (d->lvl.blasAddr) { inst[2].accelerationStructureReference = d->lvl.blasAddr; inst[2].instanceCustomIndex = 1; nInst = 3; }
+                    if (d->lvl.blasAddr) { inst[2].accelerationStructureReference = d->lvl.blasAddr; inst[2].instanceCustomIndex = 1; inst[2].mask = 0x02; nInst = 3; }
                 }
                 memcpy(ds->instPtr, inst, sizeof inst);
                 VkAccelerationStructureGeometryKHR tg{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
@@ -4900,7 +4940,12 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             memcpy(par->grassCol, g_grassCol, sizeof g_grassCol);
             memcpy(par->rockCol, g_rockCol, sizeof g_rockCol);
         }
-        par->wat[0] = g_waterF0; par->wat[1] = (float)g_waterDebug; par->wat[2] = par->wat[3] = 0.0f;
+        par->wat[0] = g_waterF0; par->wat[1] = (float)g_waterDebug; par->wat[2] = g_iceF0; par->wat[3] = g_iceRefl;
+        {
+            std::lock_guard<std::mutex> lk(d->cacheMtx);
+            const VkDeviceAddress ia = d->lvl.blasAddr ? d->lvl.iceAddr : 0;
+            par->ice[0] = (uint32_t)ia; par->ice[1] = (uint32_t)(ia >> 32); par->ice[2] = ia ? (uint32_t)d->lvl.tris : 0u; par->ice[3] = (ia && g_iceOn) ? 1u : 0u;
+        }
         static std::atomic<uint64_t> cn{0};
         if (matOn && cn.fetch_add(1) % 1800 == 0) Logf("rt: hit lighting: sun colour %.3f %.3f %.3f, shade %.3f %.3f %.3f, sky %.3f %.3f %.3f (%s), vertex reads %s", (double)sc[0], (double)sc[1], (double)sc[2], (double)ac[0], (double)ac[1], (double)ac[2], (double)kc[0], (double)kc[1], (double)kc[2], ok ? "read" : "NOT readable", par->mat[3] ? "on" : "off");
     }
@@ -5105,6 +5150,17 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     // ---- pass 2: denoise + composite into the game's color image
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->fxPipe);
     d->CmdDispatch(cb, (m.w + 7) / 8, (m.h + 7) / 8, 1);
+    if (d->icePipe && par->ice[3]) {   // pass 3: ice reflections on the finished picture (it reads the frame copy the composite just wrote)
+        VkMemoryBarrier ib{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        ib.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &ib, 0, nullptr, 0, nullptr);
+        d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->icePipe);
+        d->CmdDispatch(cb, (m.w + 7) / 8, (m.h + 7) / 8, 1);
+        static std::atomic<uint64_t> iceRuns{0};
+        const uint64_t ir = ++iceRuns;
+        if (ir == 1 || ir % 6000 == 0) Logf("rt: ice reflections: pass #%llu (%u ice-able ground triangles)", (unsigned long long)ir, par->ice[2]);
+    }
 
     VkImageMemoryBarrier post = {};
     post.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
