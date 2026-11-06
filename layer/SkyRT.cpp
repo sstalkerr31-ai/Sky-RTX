@@ -44,6 +44,7 @@
 #include "rtmat_spv.h"  // SPIR-V of rt_mat.comp (generated): average colour of a material
 #include "rtwater_spv.h"  // SPIR-V of rt_water.comp (generated): reflections on the game's water picture
 #include "rtice_spv.h"    // SPIR-V of rt_water.comp with -DICE (generated): reflections on ice, on the main frame
+#include "rtbounds_spv.h"  // SPIR-V of rt_bounds.comp (generated): measures a mesh before it enters the ray scene
 #include "rtpf_spv.h"   // SPIR-V of rt.comp with -DPOSFETCH (generated): trace pass for GPUs with position fetch
 #include "skyrt_version.h"     // SKYRT_VERSION_STR; SKYRT_BUILD comes from the build (GitHub: run number + commit)
 #include "level_terrain.h"   // the ground of the whole level from the game files
@@ -104,6 +105,7 @@ static std::atomic<bool> g_fpsOn{false};   // FPS counter in the corner (Ctrl+F,
 static int g_fpsCfg = -1;                 // last fps= value read from SkyRT.cfg (a change there switches the counter)
 static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
 static int g_meshXf = 0;          // cfg meshxf=1: cached meshes placed by their draw's model matrix (fixes phantoms; off: the village freezes, under study)
+static int g_boundsCheck = 1;     // cfg bounds: every cached mesh is measured on the GPU before it enters the ray scene (garbage stays out)
 static int g_guard = 1;           // cfg guard: meshes the rays meet in front of what the game drew leave the ray scene (stale / misplaced geometry)
 static int g_levelModels = 0;     // cfg levelmodels (off until the village freeze is understood): the level's placed meshes from the game files in the ray scene
 static int g_modelsAll = 0;       // cfg modelsall: also meshes the level switches on later (enabled=0)
@@ -366,7 +368,11 @@ struct GeoEnt {
     VkDeviceMemory am;
     VkTransformMatrixKHR xf{};   // the draw's model matrix: Mesh* shaders place their mesh with it (set 0 binding 0, offset 0)
     bool hasXf = false;
+    bool measured = false;   // rt_bounds.comp found it sane: only then it is part of the ray scene
+    int32_t bslot = -1;      // its measurement in flight (slot in the bounds buffer), -1 = none
+    uint64_t bfr = 0;        // frame of its last measurement
 };
+struct BoundsJob { uint32_t va[2], ia[2], oa[2], stride, tris, maxVertex, pad; };
 static const uint64_t kMaxCacheTris = 700000;
 static const uint64_t kDynTrisMax = 200000;   // step 16: more than this in CPU-written buffers is not 'characters' any more
 static const size_t kMaxCacheGeoms = 30000;
@@ -609,7 +615,10 @@ struct DeviceData {
     FrameGeo pendStatic;                                              // the static draws of the previous trace pass: their matrices are readable now
     struct Churn { uint32_t fresh = 0, seen = 0; bool moving = false; };   // new places / places met again
     std::unordered_set<GeoKey, GeoKeyHash> banned;   // cacheMtx: meshes the rays met in front of what the game drew (stale buffers, wrong place): out until the next level
-    int guardSlot = -1; uint64_t guardFrom = 0;      // the AS slot the guard counters belong to, and since which frame
+    int guardSlot = -1; uint64_t guardFrom = 0;
+    VkPipeline boundsPipe = VK_NULL_HANDLE; VkPipelineLayout boundsPl = VK_NULL_HANDLE; bool boundsTried = false;
+    VkBuffer boundsBuf = VK_NULL_HANDLE; VkDeviceMemory boundsMem = VK_NULL_HANDLE; uint32_t* boundsPtr = nullptr; VkDeviceAddress boundsAddr = 0;
+    uint32_t boundsNext = 0;      // the AS slot the guard counters belong to, and since which frame
     std::unordered_map<GeoKey, Churn, GeoKeyHash> churn;              // cacheMtx: per mesh (key without matrix): how often it shows up at a new place
     std::atomic<int> mainCount{0};
     bool track = false;                                               // track vertex/index/pipeline binds of every cb
@@ -3988,6 +3997,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "levelmodels")) g_levelModels = v != 0.0;
         else if (!strcmp(key, "meshxf")) g_meshXf = v != 0.0;
         else if (!strcmp(key, "guard")) g_guard = v != 0.0;
+        else if (!strcmp(key, "bounds")) g_boundsCheck = v != 0.0;
         else if (!strcmp(key, "modelsall")) g_modelsAll = v != 0.0;
         else if (!strcmp(key, "castprobe")) g_castProbe = v != 0.0;
         else if (!strcmp(key, "icefx")) g_iceOn = v != 0.0;
@@ -4617,6 +4627,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     std::vector<int32_t> geoXfIdx;   // index into geoXfs of every entry of `geoms`, -1 = no matrix
     std::vector<VkTransformMatrixKHR> geoXfs;
     std::vector<GeoKey> rebuildKeys; // castprobe: the key of every entry of `geoms`
+    std::vector<BoundsJob> boundsJobs;   // meshes to measure this frame
     uint64_t geoVGenNow = 0;
     uint64_t cacheTrisNow = 0;
     bool rebuild = false;
@@ -4727,6 +4738,60 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             const uint64_t n = ++xl;
             if (n == 300 || n % 18000 == 0) Logf("rt: cached draws placed by their model matrix: %llu, without one: %llu (so far)", (unsigned long long)xfMoved.load(), (unsigned long long)xfPlain.load());
         }
+        if (d->boundsPtr) {   // measurements: results of ~10 frames ago come in; new meshes and old ones due again go out
+            int queued = 0, recheck = 0;
+            for (auto it = d->geoCache.begin(); it != d->geoCache.end();) {
+                GeoEnt& e = it->second;
+                if (e.bslot >= 0 && fr - e.bfr >= 10) {
+                    const uint32_t* o = d->boundsPtr + (size_t)e.bslot * 8;
+                    e.bslot = -1;
+                    auto unord = [](uint32_t u) { u = (u & 0x80000000u) ? (u & 0x7FFFFFFFu) : ~u; float f; memcpy(&f, &u, 4); return f; };
+                    const uint32_t tris = e.r.primitiveCount, bad = o[7];
+                    if (o[0] == 0xFFFFFFFFu && bad == 0) { ++it; continue; }   // never ran (frame skipped): again next time
+                    float ext[3] = {0, 0, 0};
+                    if (o[0] != 0xFFFFFFFFu) for (int a = 0; a < 3; ++a) ext[a] = unord(o[3 + a]) - unord(o[a]);
+                    const double diag = sqrt((double)ext[0] * ext[0] + (double)ext[1] * ext[1] + (double)ext[2] * ext[2]);
+                    const uint32_t good = tris > bad ? tris - bad : 0;
+                    const double meanEdge = good ? o[6] / 16.0 / good : 0.0;
+                    const bool garbage = bad > tris / 100 + 2 || ext[0] > 3000.0f || ext[1] > 3000.0f || ext[2] > 3000.0f || !(diag == diag) ||
+                                         (tris >= 200 && meanEdge > 5.0 && meanEdge > 0.08 * diag);
+                    static std::atomic<int> ml{0};
+                    if (garbage || (meanEdge > 0.03 * diag && tris >= 100 && ml.fetch_add(1) < 25)) {
+                        uint64_t fs = 0;
+                        { std::lock_guard<std::mutex> fk(d->keyFsMtx); auto f = d->keyFs.find(it->first); if (f != d->keyFs.end()) fs = f->second; }
+                        Logf("bounds: %s (%u tris, stride %u%s): box %.1f x %.1f x %.1f m, mean edge %.2f m, bad indices %u%s", fs ? FsName(fs).c_str() : "mesh", tris,
+                             it->first.stride, e.measured ? ", measured before" : "", ext[0], ext[1], ext[2], meanEdge, bad,
+                             garbage ? " - GARBAGE (a buffer the game reused?): out of the ray scene until the next level" : "");
+                    }
+                    if (garbage) {
+                        d->banned.insert(it->first);
+                        d->cacheTris -= std::min<uint64_t>(d->cacheTris, tris);
+                        it = d->geoCache.erase(it);
+                        d->cacheForce = true;
+                        continue;
+                    }
+                    if (!e.measured) { e.measured = true; d->cacheDirty = true; }
+                    ++it;
+                    continue;
+                }
+                const bool due = e.bslot < 0 && ((!e.measured && queued < 64) || (e.measured && fr - e.bfr >= 600 && recheck < 8));
+                if (due && e.g.geometry.triangles.vertexData.deviceAddress && e.g.geometry.triangles.indexData.deviceAddress) {
+                    const uint32_t s = d->boundsNext++ % 4096u;
+                    uint32_t* o = d->boundsPtr + (size_t)s * 8;
+                    for (int a = 0; a < 3; ++a) { o[a] = 0xFFFFFFFFu; o[3 + a] = 0; }
+                    o[6] = o[7] = 0;
+                    const uint64_t va = e.g.geometry.triangles.vertexData.deviceAddress, ia = e.g.geometry.triangles.indexData.deviceAddress;
+                    const uint64_t oa = d->boundsAddr + (uint64_t)s * 32;
+                    BoundsJob j{{(uint32_t)va, (uint32_t)(va >> 32)}, {(uint32_t)ia, (uint32_t)(ia >> 32)}, {(uint32_t)oa, (uint32_t)(oa >> 32)},
+                                (uint32_t)e.g.geometry.triangles.vertexStride, e.r.primitiveCount, e.g.geometry.triangles.maxVertex, 0};
+                    boundsJobs.push_back(j);
+                    e.bslot = (int32_t)s;
+                    e.bfr = fr;
+                    if (e.measured) ++recheck; else ++queued;
+                }
+                ++it;
+            }
+        }
         if (fr - d->lastEvict >= 300) {  // forget what has not been drawn for a minute
             d->lastEvict = fr;
             for (auto it = d->geoCache.begin(); it != d->geoCache.end();) {
@@ -4767,11 +4832,12 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             geoMats.reserve(d->geoCache.size());
             geoVs.reserve(d->geoCache.size());
             for (auto& kv : d->geoCache) {
+                if (d->boundsPtr && !kv.second.measured) continue;
                 geoms.push_back(kv.second.g); ranges.push_back(kv.second.r); geoMats.push_back(kv.second.mat); geoVs.push_back(kv.second.v);
                 geoXfIdx.push_back(kv.second.hasXf ? (int32_t)geoXfs.size() : -1);
                 if (kv.second.hasXf) geoXfs.push_back(kv.second.xf);
             }
-            rebuildKeys.clear(); for (auto& kv : d->geoCache) rebuildKeys.push_back(kv.first);
+            rebuildKeys.clear(); for (auto& kv : d->geoCache) if (!d->boundsPtr || kv.second.measured) rebuildKeys.push_back(kv.first);
             geoVGenNow = d->geoVGen;
         }
     }
@@ -4832,6 +4898,30 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, d->tsPool, tsBase);
     }
     LevelUpdate(d, cb);
+    if (!d->boundsTried && g_boundsCheck) {
+        d->boundsTried = true;
+        VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BoundsJob)};
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pl.pushConstantRangeCount = 1;
+        pl.pPushConstantRanges = &pr;
+        void* hp = nullptr;
+        if (d->CreatePipelineLayout(d->device, &pl, nullptr, &d->boundsPl) == VK_SUCCESS &&
+            (d->boundsPipe = MakeComputePipe(d, kRtBoundsSpv, sizeof(kRtBoundsSpv), "mesh bounds", d->boundsPl)) != VK_NULL_HANDLE &&
+            MakeBufEx(d, 4096 * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->boundsBuf, d->boundsMem, d->boundsAddr) &&
+            d->MapMemory(d->device, d->boundsMem, 0, VK_WHOLE_SIZE, 0, &hp) == VK_SUCCESS && hp) {
+            std::lock_guard<std::mutex> lk(d->cacheMtx);
+            d->boundsPtr = (uint32_t*)hp;
+            d->cacheForce = true;
+            Logf("rt: mesh measurement on: a cached mesh enters the ray scene only after its bounds and edges look sane");
+        } else Logf("!!! rt: mesh measurement unavailable");
+    }
+    if (!boundsJobs.empty() && d->boundsPipe) {
+        d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->boundsPipe);
+        for (const BoundsJob& j : boundsJobs) {
+            d->CmdPushConstants(cb, d->boundsPl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof j, &j);
+            d->CmdDispatch(cb, 1, 1, 1);
+        }
+    }
     if (g_guard && d->castPtr) {   // the guard: camera rays to what the game drew; a cached mesh met in front of it is not where the game has it
         uint32_t* gc = d->castPtr + (kMaxCacheGeoms + 8) * 5 + 8;
         std::lock_guard<std::mutex> lk(d->cacheMtx);

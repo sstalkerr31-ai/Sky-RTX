@@ -1,0 +1,56 @@
+#version 460
+// SkyRT: measures one cached mesh before it may enter the ray scene - its bounds, how long its triangle edges are, and whether its
+// indices stay inside its vertices. A mesh read from a buffer the game has meanwhile filled with something else shows up as
+// triangles that join random far vertices: long edges over a huge box. Such a mesh would make every ray crawl.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Floats { float f[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Out { uint o[]; };
+
+layout(push_constant) uniform P {
+    uvec2 va;      // vertex positions (float3 at the start of each vertex)
+    uvec2 ia;      // first 16-bit index
+    uvec2 oa;      // result slot: [0..2] min (ordered), [3..5] max (ordered), [6] sum of edge lengths (1/16 m), [7] bad indices
+    uint stride;   // vertex stride in bytes
+    uint tris;
+    uint maxVertex;
+    uint pad;
+} pc;
+
+uint ordered(float f) { uint u = floatBitsToUint(f); return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u); }
+
+void main() {
+    Words W = Words(uvec2(pc.ia.x & ~3u, pc.ia.y));
+    const uint first = (pc.ia.x & 3u) >> 1;   // the first index sits in the upper half of its word
+    Floats V = Floats(pc.va);
+    Out O = Out(pc.oa);
+    const uint fs = pc.stride >> 2;
+    vec3 mn = vec3(3.0e38), mx = vec3(-3.0e38);
+    uint edge = 0u, bad = 0u;
+    for (uint t = gl_LocalInvocationID.x; t < pc.tris; t += 256u) {
+        vec3 p[3];
+        bool ok = true;
+        for (uint k = 0u; k < 3u; ++k) {
+            const uint e = first + t * 3u + k;
+            const uint wd = W.w[e >> 1];
+            const uint ix = (e & 1u) != 0u ? (wd >> 16) : (wd & 0xFFFFu);
+            if (ix > pc.maxVertex) { ok = false; break; }
+            const uint b = ix * fs;
+            p[k] = vec3(V.f[b], V.f[b + 1u], V.f[b + 2u]);
+            if (any(isnan(p[k])) || any(isinf(p[k]))) { ok = false; break; }
+        }
+        if (!ok) { ++bad; continue; }
+        for (uint k = 0u; k < 3u; ++k) { mn = min(mn, p[k]); mx = max(mx, p[k]); }
+        const float el = length(p[1] - p[0]) + length(p[2] - p[1]) + length(p[0] - p[2]);
+        edge += uint(min(el * (16.0 / 3.0), 1048575.0));
+    }
+    if (mn.x <= mx.x) {
+        atomicMin(O.o[0], ordered(mn.x)); atomicMin(O.o[1], ordered(mn.y)); atomicMin(O.o[2], ordered(mn.z));
+        atomicMax(O.o[3], ordered(mx.x)); atomicMax(O.o[4], ordered(mx.y)); atomicMax(O.o[5], ordered(mx.z));
+    }
+    if (edge != 0u) atomicAdd(O.o[6], edge);
+    if (bad != 0u) atomicAdd(O.o[7], bad);
+}
