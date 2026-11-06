@@ -23,11 +23,13 @@ int wmain(int argc, wchar_t** argv) {
     {
         LARGE_INTEGER m0, m1; QueryPerformanceCounter(&m0);
         skylevel::Models md;
+        md.verbose = getenv("LEVELPROBE_LIST") != nullptr;
         std::string me;
         const bool mok = skylevel::LoadModels(argv[1], argv[2], md, &me);
         QueryPerformanceCounter(&m1);
         printf("models: %s placed %u, %zu tris, %zu verts, %.1f ms | skipped: hidden %u, disabled %u, shader %u, skinned %u, missing %u, broken %u\n", mok ? "ok" : me.c_str(),
                md.placed, md.idx.size() / 3, md.pos.size() / 3, 1000.0 * double(m1.QuadPart - m0.QuadPart) / double(f.QuadPart), md.skippedHidden, md.skippedDisabled, md.skippedShader, md.skippedBones, md.missing, md.broken);
+        for (const std::string& s : md.list) puts(("  " + s).c_str());
         if (mok) printf("  bounds %.1f %.1f %.1f .. %.1f %.1f %.1f\n", md.mn[0], md.mn[1], md.mn[2], md.mx[0], md.mx[1], md.mx[2]);
     }
     if (argc >= 6) {

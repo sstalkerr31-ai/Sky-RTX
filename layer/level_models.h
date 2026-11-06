@@ -15,6 +15,8 @@ namespace skylevel {
 struct Models {
     std::vector<float> pos;        // xyz per vertex, world space
     std::vector<uint32_t> idx;     // triangles
+    bool verbose = false;            // tools: list every LevelMesh in `list` (name, shader, flags, LOD0 tris, world bounds)
+    std::vector<std::string> list;
     uint32_t placed = 0, skippedShader = 0, skippedHidden = 0, skippedDisabled = 0, skippedBones = 0, missing = 0, broken = 0;
     float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
 };
@@ -208,6 +210,23 @@ inline bool LoadModels(const std::wstring& gameRoot, const std::wstring& level, 
         };
         if (!t.Walk(type, o, top, 0)) break;
         if (type != levelMesh || res.empty() || !haveXf) continue;
+        if (m.verbose) {
+            const std::wstring wr(res.begin(), res.end());
+            auto mf = meshes.find(wr);
+            std::vector<float> pp; std::vector<uint32_t> ii; bool bn = false, ok = false;
+            std::vector<uint8_t> md;
+            if (mf != meshes.end() && ReadFileAll(mf->second, md)) ok = ReadMeshLod0(md, mf->first, pp, ii, bn);
+            float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
+            for (size_t v = 0; v + 2 < pp.size(); v += 3) {
+                const float x = pp[v], y = pp[v + 1], z = pp[v + 2];
+                const float w[3] = {xf[0] * x + xf[4] * y + xf[8] * z + xf[12], xf[1] * x + xf[5] * y + xf[9] * z + xf[13], xf[2] * x + xf[6] * y + xf[10] * z + xf[14]};
+                for (int a = 0; a < 3; ++a) { if (w[a] < mn[a]) mn[a] = w[a]; if (w[a] > mx[a]) mx[a] = w[a]; }
+            }
+            char s[512];
+            snprintf(s, sizeof s, "%-40s %-28s r%d c%d i%d e%d %s tris %6zu  %.0f %.0f %.0f .. %.0f %.0f %.0f  scale %.4g", res.c_str(), shader.c_str(), render, cloud, invisible, enabled,
+                     mf == meshes.end() ? "nofile" : bn ? "bones" : ok ? "ok" : "bad", ii.size() / 3, mn[0], mn[1], mn[2], mx[0], mx[1], mx[2], sqrt(xf[0] * xf[0] + xf[1] * xf[1] + xf[2] * xf[2]));
+            m.list.push_back(s);
+        }
         if (!render || cloud || invisible) { ++m.skippedHidden; continue; }
         if (!enabled && !withDisabled) { ++m.skippedDisabled; continue; }   // switched on later by the level's scripts: unknown whether it is there now
         if (!SolidShader(shader)) { ++m.skippedShader; continue; }

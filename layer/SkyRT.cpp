@@ -103,6 +103,7 @@ static std::atomic<bool> g_fpsOn{false};   // FPS counter in the corner (Ctrl+F,
 static int g_fpsCfg = -1;                 // last fps= value read from SkyRT.cfg (a change there switches the counter)
 static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
 static int g_meshXf = 0;          // cfg meshxf=1: cached meshes placed by their draw's model matrix (fixes phantoms; off: the village freezes, under study)
+static int g_guard = 1;           // cfg guard: meshes the rays meet in front of what the game drew leave the ray scene (stale / misplaced geometry)
 static int g_levelModels = 0;     // cfg levelmodels (off until the village freeze is understood): the level's placed meshes from the game files in the ray scene
 static int g_modelsAll = 0;       // cfg modelsall: also meshes the level switches on later (enabled=0)
 static int g_levelGeo = 1;        // the whole level's ground from the game files in the ray scene, also off the screen (cfg levelgeo=0/1)
@@ -603,6 +604,8 @@ struct DeviceData {
     FrameGeo waterFg;                                                 // geoMtx: water drawn in its own pass, merged into the next trace pass
     FrameGeo pendStatic;                                              // the static draws of the previous trace pass: their matrices are readable now
     struct Churn { uint32_t fresh = 0, seen = 0; bool moving = false; };   // new places / places met again
+    std::unordered_set<GeoKey, GeoKeyHash> banned;   // cacheMtx: meshes the rays met in front of what the game drew (stale buffers, wrong place): out until the next level
+    int guardSlot = -1; uint64_t guardFrom = 0;      // the AS slot the guard counters belong to, and since which frame
     std::unordered_map<GeoKey, Churn, GeoKeyHash> churn;              // cacheMtx: per mesh (key without matrix): how often it shows up at a new place
     std::atomic<int> mainCount{0};
     bool track = false;                                               // track vertex/index/pipeline binds of every cb
@@ -635,7 +638,7 @@ struct DeviceData {
     uint32_t hideGenSeen = 0;   // cacheMtx
     std::mutex keyFsMtx;
     std::unordered_map<GeoKey, uint64_t, GeoKeyHash> keyFs;   // keyFsMtx: fragment shader of every cached geometry (castprobe only)
-    std::vector<GeoKey> slotKeys[8];                           // cacheMtx: geometry order of every AS slot (castprobe only)
+    std::vector<GeoKey> slotKeys[8];                           // cacheMtx: geometry order of every AS slot (castprobe and the guard)
     VkBuffer castBuf = VK_NULL_HANDLE; VkDeviceMemory castMem = VK_NULL_HANDLE; uint32_t* castPtr = nullptr;   // binding 15: shadow-ray hit counts
     uint64_t castLast = 0;
     bool lvlFailed = false;
@@ -2841,7 +2844,7 @@ static bool EnsurePaintResources(DeviceData* d) {
             d->MapMemory(d->device, d->geoMatMem, 0, VK_WHOLE_SIZE, 0, &gp) != VK_SUCCESS || !gp ||
             d->MapMemory(d->device, d->matColMem, 0, VK_WHOLE_SIZE, 0, &cp) != VK_SUCCESS || !cp) { Logf("!!! rt: material buffers failed"); return false; }
         void* hp = nullptr;
-        if (!MakeBufEx(d, (VkDeviceSize)((kMaxCacheGeoms + 8) * 5 + 8) * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->castBuf, d->castMem, da) ||
+        if (!MakeBufEx(d, (VkDeviceSize)((kMaxCacheGeoms + 8) * 5 + 8 + kMaxCacheGeoms * 2) * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->castBuf, d->castMem, da) ||
             d->MapMemory(d->device, d->castMem, 0, VK_WHOLE_SIZE, 0, &hp) != VK_SUCCESS || !hp) { Logf("!!! rt: shadow probe buffer failed"); return false; }
         d->castPtr = (uint32_t*)hp;
         memset(hp, 0, (size_t)((kMaxCacheGeoms + 8) * 5 + 8) * sizeof(uint32_t));
@@ -3969,6 +3972,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "levelgeo")) g_levelGeo = v != 0.0;
         else if (!strcmp(key, "levelmodels")) g_levelModels = v != 0.0;
         else if (!strcmp(key, "meshxf")) g_meshXf = v != 0.0;
+        else if (!strcmp(key, "guard")) g_guard = v != 0.0;
         else if (!strcmp(key, "modelsall")) g_modelsAll = v != 0.0;
         else if (!strcmp(key, "castprobe")) g_castProbe = v != 0.0;
         else if (!strcmp(key, "icefx")) g_iceOn = v != 0.0;
@@ -4400,6 +4404,7 @@ static void LevelUpdate(DeviceData* d, VkCommandBuffer cb) {
         if (d->mdl.blas) { d->lvlGrave.emplace_back(fr, d->mdl); d->mdl = DeviceData::LevelGpu{}; }
         d->mdlFailed = false;
         d->churn.clear();   // a new level: moving meshes are judged again
+        d->banned.clear();
         d->cacheForce = true;
     }
     {   // the level's meshes: one BLAS for all of them
@@ -4661,6 +4666,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 const bool alive = bufOk(pg.keys[i].vb) && bufOk(pg.keys[i].ib) && bufOk(fv0.ab) && memOk(pg.mems[i].first) && memOk(pg.mems[i].second) && memOk(fv0.am);
                 if (!alive) { static std::atomic<uint64_t> gone{0}; if (++gone % 1000 == 1) Logf("rt: a draw of last frame lost its buffers before it reached the cache (level change) - skipped (%llu so far)", (unsigned long long)gone.load()); continue; }
             }
+            if (d->banned.count(pg.keys[i])) continue;
             auto it = d->geoCache.find(pg.keys[i]);
             if (it == d->geoCache.end() && hasXf) {
                 DeviceData::Churn& ch = d->churn[base];
@@ -4750,7 +4756,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 geoXfIdx.push_back(kv.second.hasXf ? (int32_t)geoXfs.size() : -1);
                 if (kv.second.hasXf) geoXfs.push_back(kv.second.xf);
             }
-            if (g_castProbe) { rebuildKeys.clear(); for (auto& kv : d->geoCache) rebuildKeys.push_back(kv.first); }
+            rebuildKeys.clear(); for (auto& kv : d->geoCache) rebuildKeys.push_back(kv.first);
             geoVGenNow = d->geoVGen;
         }
     }
@@ -4782,6 +4788,39 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         set = d->paintSets[ringIdx];
     }
     LevelUpdate(d, cb);
+    if (g_guard && d->castPtr) {   // the guard: camera rays to what the game drew; a cached mesh met in front of it is not where the game has it
+        uint32_t* gc = d->castPtr + (kMaxCacheGeoms + 8) * 5 + 8;
+        std::lock_guard<std::mutex> lk(d->cacheMtx);
+        const uint64_t fr = d->frames.load();
+        if (d->rtCur != d->guardSlot) {
+            memset(gc, 0, kMaxCacheGeoms * 2 * sizeof(uint32_t));
+            d->guardSlot = d->rtCur; d->guardFrom = fr;
+        } else if (d->rtCur >= 0 && fr - d->guardFrom >= 4) {
+            const std::vector<GeoKey>& keys = d->slotKeys[d->rtCur];
+            bool any = false;
+            for (size_t g = 0; g < keys.size() && g < kMaxCacheGeoms; ++g) {
+                const uint32_t front = gc[g * 2], agree = gc[g * 2 + 1];
+                if (front < 40 || front < agree * 3) continue;
+                auto it = d->geoCache.find(keys[g]);
+                if (it == d->geoCache.end()) continue;
+                d->banned.insert(keys[g]);
+                d->cacheTris -= std::min<uint64_t>(d->cacheTris, it->second.r.primitiveCount);
+                d->geoCache.erase(it);
+                d->cacheForce = true;
+                any = true;
+                static std::atomic<int> gl{0};
+                if (gl.fetch_add(1) < 60) {
+                    uint64_t fs = 0;
+                    { std::lock_guard<std::mutex> fk(d->keyFsMtx); auto f = d->keyFs.find(keys[g]); if (f != d->keyFs.end()) fs = f->second; }
+                    Logf("guard: %s (%u tris, vertex stride %u%s) is met %u times in front of the game's picture, %u times on it - out of the ray scene until the next level",
+                         fs ? FsName(fs).c_str() : "?", keys[g].count / 3, keys[g].stride, keys[g].xf ? ", placed by a matrix" : "", front, agree);
+                }
+            }
+            memset(gc, 0, kMaxCacheGeoms * 2 * sizeof(uint32_t));
+            d->guardFrom = fr;
+            if (any) d->guardSlot = -1;
+        }
+    }
     if (g_castProbe && d->castPtr && GetTickCount64() - d->castLast >= 5000) {   // what the sun shadow rays of the last ~5 s ran into (every 64th pixel) - by the clock, so a slow game still reports
         d->castLast = GetTickCount64();
         const size_t n = kMaxCacheGeoms + 8;
@@ -4959,7 +4998,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         {
             std::lock_guard<std::mutex> lk(d->cacheMtx);
             d->rtCur = idx;
-            if (g_castProbe) d->slotKeys[idx] = rebuildKeys;
+            d->slotKeys[idx] = rebuildKeys;
         }
         const uint64_t nb = ++d->rtRebuilds;
         if (nb <= 30 || nb % 200 == 0)
@@ -5165,7 +5204,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         default: flagsEff |= 8u; if (lightsOn) flagsEff |= 16u; break;
     }
     const bool matOn = g_matTrack && d->matPipe;
-    par->mat[0] = (d->domeView ? 32u : 0u) | (g_castProbe && d->castPtr ? 16u : 0u) | (matOn && g_matAlbedo.load(std::memory_order_relaxed) ? 1u : 0u) | (matOn && (g_view == 8 || g_view == 10) ? 2u : 0u) | (matOn && g_view == 9 ? 4u : 0u) | (matOn && g_view == 10 ? 8u : 0u);
+    par->mat[0] = (g_guard && d->castPtr ? 64u : 0u) | (d->domeView ? 32u : 0u) | (g_castProbe && d->castPtr ? 16u : 0u) | (matOn && g_matAlbedo.load(std::memory_order_relaxed) ? 1u : 0u) | (matOn && (g_view == 8 || g_view == 10) ? 2u : 0u) | (matOn && g_view == 9 ? 4u : 0u) | (matOn && g_view == 10 ? 8u : 0u);
     par->mat[1] = (uint32_t)(slot - d->rtSlots);
     par->mat[2] = (uint32_t)(g_matGain * 256.0f);
     {

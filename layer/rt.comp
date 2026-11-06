@@ -235,6 +235,21 @@ void main() {
             castHist[b] = 1u;
         } else castHist[b] = 2u;
     }
+    if ((u.mat.x & 64u) != 0u && (p.x & 7) == int(u.misc.w & 7u) && (p.y & 7) == int((u.misc.w >> 3) & 7u)) {
+        // the guard (every 64th pixel, a new one each frame): does the camera ray meet a cached mesh in front of what the game drew here?
+        vec3 gd = P - u.cam.xyz;
+        float gl = length(gd);
+        if (gl > 0.5 && gl < 400.0) {
+            rayQueryEXT rg;
+            rayQueryInitializeEXT(rg, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0x01, u.cam.xyz, 0.0, gd / gl, gl * 1.03 + 0.3);
+            while (rayQueryProceedEXT(rg)) {}
+            if (rayQueryGetIntersectionTypeEXT(rg, true) != gl_RayQueryCommittedIntersectionNoneEXT && rayQueryGetIntersectionInstanceIdEXT(rg, true) == 0) {
+                uint gi = min(uint(rayQueryGetIntersectionGeometryIndexEXT(rg, true)), 29999u);
+                float gt = rayQueryGetIntersectionTEXT(rg, true);
+                atomicAdd(castHist[150048u + gi * 2u + (gt < gl * 0.85 - 0.5 ? 0u : 1u)], 1u);
+            }
+        }
+    }
     if ((u.mat.x & 2u) != 0u) {   // view=8: what the rays know about the surface in this pixel (black = no material)
         vec3 vd = P - u.cam.xyz;
         float vl = length(vd);
