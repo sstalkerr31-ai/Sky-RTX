@@ -353,6 +353,8 @@ struct GeoKeyHash {
         return (size_t)h;
     }
 };
+struct DeviceData;
+static uint64_t FsOfKey(DeviceData* d, GeoKey k);   // shader of a cached mesh (keyFs is recorded without the matrix)
 struct GeoV {                // where the trace shader finds the vertices of a geometry (std430 in rt.comp); stride 0 = not available
     uint32_t stride, off3;   // attribute stream stride, offset from attribute loc2 to loc3
     uint64_t idx, attr;      // device addresses: first index of the draw, loc2 of vertex 0
@@ -1698,6 +1700,13 @@ static bool ReadBufHost(DeviceData* d, VkBuffer buf, VkDeviceSize off, void* out
 }
 
 // called from vkQueueSubmit while capturing: the CPU-side indirect data is final at this point
+static uint64_t FsOfKey(DeviceData* d, GeoKey k) {
+    k.xf = 0;
+    std::lock_guard<std::mutex> lk(d->keyFsMtx);
+    auto it = d->keyFs.find(k);
+    return it != d->keyFs.end() ? it->second : 0;
+}
+
 static void ResolveSubmit(DeviceData* d, uint32_t submitCount, const VkSubmitInfo* pSubmits) {
     for (uint32_t s = 0; s < submitCount; ++s) {
         for (uint32_t i = 0; i < pSubmits[s].commandBufferCount; ++i) {
@@ -2868,7 +2877,7 @@ static bool EnsurePaintResources(DeviceData* d) {
             d->MapMemory(d->device, d->geoMatMem, 0, VK_WHOLE_SIZE, 0, &gp) != VK_SUCCESS || !gp ||
             d->MapMemory(d->device, d->matColMem, 0, VK_WHOLE_SIZE, 0, &cp) != VK_SUCCESS || !cp) { Logf("!!! rt: material buffers failed"); return false; }
         void* hp = nullptr;
-        if (!MakeBufEx(d, (VkDeviceSize)((kMaxCacheGeoms + 8) * 5 + 8 + kMaxCacheGeoms * 2) * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->castBuf, d->castMem, da) ||
+        if (!MakeBufEx(d, (VkDeviceSize)((kMaxCacheGeoms + 8) * 5 + 8 + kMaxCacheGeoms * 2 + 8) * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->castBuf, d->castMem, da) ||
             d->MapMemory(d->device, d->castMem, 0, VK_WHOLE_SIZE, 0, &hp) != VK_SUCCESS || !hp) { Logf("!!! rt: shadow probe buffer failed"); return false; }
         d->castPtr = (uint32_t*)hp;
         memset(hp, 0, (size_t)((kMaxCacheGeoms + 8) * 5 + 8) * sizeof(uint32_t));
@@ -4758,7 +4767,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                     static std::atomic<int> ml{0};
                     if (garbage || (meanEdge > 0.03 * diag && tris >= 100 && ml.fetch_add(1) < 25)) {
                         uint64_t fs = 0;
-                        { std::lock_guard<std::mutex> fk(d->keyFsMtx); auto f = d->keyFs.find(it->first); if (f != d->keyFs.end()) fs = f->second; }
+                        fs = FsOfKey(d, it->first);
                         Logf("bounds: %s (%u tris, stride %u%s): box %.1f x %.1f x %.1f m, mean edge %.2f m, bad indices %u%s", fs ? FsName(fs).c_str() : "mesh", tris,
                              it->first.stride, e.measured ? ", measured before" : "", ext[0], ext[1], ext[2], meanEdge, bad,
                              garbage ? " - GARBAGE (a buffer the game reused?): out of the ray scene until the next level" : "");
@@ -4945,7 +4954,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 static std::atomic<int> gl{0};
                 if (gl.fetch_add(1) < 60) {
                     uint64_t fs = 0;
-                    { std::lock_guard<std::mutex> fk(d->keyFsMtx); auto f = d->keyFs.find(keys[g]); if (f != d->keyFs.end()) fs = f->second; }
+                    fs = FsOfKey(d, keys[g]);
                     Logf("guard: %s (%u tris, vertex stride %u%s) is met %u times in front of the game's picture, %u times on it - out of the ray scene until the next level",
                          fs ? FsName(fs).c_str() : "?", keys[g].count / 3, keys[g].stride, keys[g].xf ? ", placed by a matrix" : "", front, agree);
                 }
@@ -4978,7 +4987,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             } else {
                 uint64_t fs = 0; uint32_t tris = 0, verts = 0;
                 if (i < keys.size()) {
-                    { std::lock_guard<std::mutex> lk(d->keyFsMtx); auto it = d->keyFs.find(keys[i]); if (it != d->keyFs.end()) fs = it->second; }
+                    fs = FsOfKey(d, keys[i]);
                     tris = keys[i].count / 3; verts = keys[i].stride;
                 }
                 snprintf(t, sizeof t, "\n    %5.1f%%  geometry %u: %s, %u tris (vertex stride %u)  near<1m %.0f%%%s", 100.0 * top[r].first / all, i, fs ? FsName(fs).c_str() : "?", tris, verts, 100.0 * d->castPtr[i * 5 + 1] / top[r].first, at);
@@ -5014,13 +5023,42 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                     { std::lock_guard<std::mutex> lk(d->cacheMtx); if (d->rtCur >= 0) keys = d->slotKeys[d->rtCur]; }
                     if (c[3] < keys.size()) {
                         tris = keys[c[3]].count / 3; stride = keys[c[3]].stride;
-                        std::lock_guard<std::mutex> lk(d->keyFsMtx); auto it = d->keyFs.find(keys[c[3]]); if (it != d->keyFs.end()) fs = it->second;
+                        fs = FsOfKey(d, keys[c[3]]);
                     }
                 }
                 Logf("aim: %s geometry %u, %.1f m away (pixel %.1f m): %s, %u tris, vertex stride %u", c[2] == 0 ? "cached" : "dynamic", c[3], (double)ct, (double)cl, fs ? FsName(fs).c_str() : "?", tris, stride);
             }
         }
+        {   // what keeps the sun from the middle of the screen
+            const uint32_t* s = d->castPtr + n * 5 + 8 + kMaxCacheGeoms * 2;
+            float st = 0, hp[3] = {0, 0, 0};
+            memcpy(&st, &s[4], 4); memcpy(hp, &s[5], 12);
+            if (s[0] == 2) Logf("aim: the sun reaches the middle of the screen (nothing in the way)");
+            else if (s[0] == 1) {
+                const char* what = s[1] == 0 ? "cached mesh" : s[1] == 1 ? "level ground or characters/props" : s[1] == 2 ? "level ground" : "level models / other";
+                std::string desc;
+                if (s[1] == 0) {
+                    GeoKey k{}; bool have = false; bool placed = false;
+                    {
+                        std::lock_guard<std::mutex> lk(d->cacheMtx);
+                        if (d->rtCur >= 0 && s[2] < d->slotKeys[d->rtCur].size()) {
+                            k = d->slotKeys[d->rtCur][s[2]]; have = true;
+                            auto it = d->geoCache.find(k);
+                            if (it != d->geoCache.end()) placed = it->second.hasXf;
+                        }
+                    }
+                    if (have) {
+                        const uint64_t fs = FsOfKey(d, k);
+                        char b[256];
+                        snprintf(b, sizeof b, " %u: %s, %u tris, stride %u, %s", s[2], fs ? FsName(fs).c_str() : "?", k.count / 3, k.stride, placed ? "placed by its matrix" : "no matrix (as recorded)");
+                        desc = b;
+                    }
+                }
+                Logf("aim: the sun is blocked %.1f m from the middle of the screen, at %.1f %.1f %.1f, by %s%s", (double)st, (double)hp[0], (double)hp[1], (double)hp[2], what, desc.c_str());
+            }
+        }
         memset(d->castPtr, 0, (n * 5 + 8) * sizeof(uint32_t));
+        memset(d->castPtr + n * 5 + 8 + kMaxCacheGeoms * 2, 0, 8 * sizeof(uint32_t));
     }
 
     // ---- (re)build BLAS + TLAS only when the set of geometry changed, otherwise reuse the newest complete slot
