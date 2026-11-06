@@ -102,7 +102,8 @@ static float g_sparkle = 3.0f, g_sparkDens = 0.08f;   // cfg sparkle (strength, 
 static std::atomic<bool> g_fpsOn{false};   // FPS counter in the corner (Ctrl+F, cfg fps=1)
 static int g_fpsCfg = -1;                 // last fps= value read from SkyRT.cfg (a change there switches the counter)
 static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
-static int g_levelModels = 1;     // cfg levelmodels: the level's placed meshes from the game files in the ray scene
+static int g_meshXf = 0;          // cfg meshxf=1: cached meshes placed by their draw's model matrix (fixes phantoms; off: the village freezes, under study)
+static int g_levelModels = 0;     // cfg levelmodels (off until the village freeze is understood): the level's placed meshes from the game files in the ray scene
 static int g_modelsAll = 0;       // cfg modelsall: also meshes the level switches on later (enabled=0)
 static int g_levelGeo = 1;        // the whole level's ground from the game files in the ray scene, also off the screen (cfg levelgeo=0/1)
 static int g_dynGeo = 1;          // step 16: geometry in CPU-written (host visible) vertex buffers = skinned characters -> own BLAS rebuilt every frame (cfg dyngeo=0/1)
@@ -3967,6 +3968,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "hidefs")) { std::string t = sv; while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back(); g_hideFsCfg = t; }
         else if (!strcmp(key, "levelgeo")) g_levelGeo = v != 0.0;
         else if (!strcmp(key, "levelmodels")) g_levelModels = v != 0.0;
+        else if (!strcmp(key, "meshxf")) g_meshXf = v != 0.0;
         else if (!strcmp(key, "modelsall")) g_modelsAll = v != 0.0;
         else if (!strcmp(key, "castprobe")) g_castProbe = v != 0.0;
         else if (!strcmp(key, "icefx")) g_iceOn = v != 0.0;
@@ -4618,7 +4620,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             VkTransformMatrixKHR xf{};
             bool hasXf = false;
             float mm[16];
-            if (i < pg.ubo.size() && pg.ubo[i].first && ReadBufHost(d, pg.ubo[i].first, pg.ubo[i].second, mm, sizeof mm) && FiniteMat(mm, 16) &&
+            if (g_meshXf && i < pg.ubo.size() && pg.ubo[i].first && ReadBufHost(d, pg.ubo[i].first, pg.ubo[i].second, mm, sizeof mm) && FiniteMat(mm, 16) &&
                 fabsf(mm[3]) < 1e-4f && fabsf(mm[7]) < 1e-4f && fabsf(mm[11]) < 1e-4f && fabsf(mm[15] - 1.0f) < 1e-3f) {
                 bool ident = true;
                 for (int k = 0; k < 15; ++k) if (fabsf(mm[k] - ((k % 5 == 0) ? 1.0f : 0.0f)) > 1e-5f) ident = false;
