@@ -104,7 +104,7 @@ static float g_sparkle = 3.0f, g_sparkDens = 0.08f;   // cfg sparkle (strength, 
 static std::atomic<bool> g_fpsOn{false};   // FPS counter in the corner (Ctrl+F, cfg fps=1)
 static int g_fpsCfg = -1;                 // last fps= value read from SkyRT.cfg (a change there switches the counter)
 static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
-static int g_meshXf = 0;          // cfg meshxf=1: cached meshes placed by their draw's model matrix (fixes phantoms; off: the village freezes, under study)
+static int g_meshXf = 1;          // cfg meshxf: cached meshes placed by their draw's model matrix (fixes phantoms)
 static int g_boundsCheck = 1;     // cfg bounds: every cached mesh is measured on the GPU before it enters the ray scene (garbage stays out)
 static int g_guard = 1;           // cfg guard: meshes the rays meet in front of what the game drew leave the ray scene (stale / misplaced geometry)
 static int g_levelModels = 0;     // cfg levelmodels (off until the village freeze is understood): the level's placed meshes from the game files in the ray scene
