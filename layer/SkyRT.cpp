@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <psapi.h>
 #include <io.h>
 #include <stdio.h>
 
@@ -517,6 +518,9 @@ struct DeviceData {
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
     PFN_vkCmdPushConstants CmdPushConstants;
     PFN_vkCmdDispatch CmdDispatch;
+    PFN_vkCreateQueryPool CreateQueryPool; PFN_vkCmdResetQueryPool CmdResetQueryPool; PFN_vkCmdWriteTimestamp CmdWriteTimestamp; PFN_vkGetQueryPoolResults GetQueryPoolResults;
+    VkQueryPool tsPool = VK_NULL_HANDLE; bool tsTried = false; float tsPeriod = 1.0f; bool tsWritten[16] = {}; uint32_t tsRing = 0;
+    std::atomic<uint64_t> gpuAs{0}, gpuTrace{0}, gpuFx{0}, gpuN{0}, gpuMax{0};   // GPU time of our work per stats period (us)
     PFN_vkCmdClearColorImage CmdClearColorImage;
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
     PFN_vkGetSwapchainImagesKHR GetSwapchainImagesKHR;   // FPS counter
@@ -1102,6 +1106,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
     LOADD(CmdBindDescriptorSets);
     LOADD(CmdPushConstants);
     LOADD(CmdDispatch);
+    LOADD(CreateQueryPool); LOADD(CmdResetQueryPool); LOADD(CmdWriteTimestamp); LOADD(GetQueryPoolResults);
     LOADD(CmdClearColorImage);
     LOADD(CmdPipelineBarrier);
     LOADD(CreateSwapchainKHR);
@@ -1172,6 +1177,16 @@ static void PrintStats(DeviceData* d, const char* tag) {
         const uint64_t ui = d->usInject.exchange(0), um = d->usInjectMax.exchange(0), ud = d->usDraw.exchange(0);
         if (n) Logf("[%s] layer CPU cost per frame: RT pass recording avg %.0f us (max %.0f us), geometry collection avg %.0f us", tag,
                     (double)ui / (double)n, (double)um, (double)ud / (double)n);
+    }
+    {
+        const uint64_t n = d->gpuN.exchange(0);
+        const uint64_t a = d->gpuAs.exchange(0), tr = d->gpuTrace.exchange(0), fx = d->gpuFx.exchange(0), mx = d->gpuMax.exchange(0);
+        if (n) Logf("[%s] layer GPU time per frame: scene build + lights %.2f ms, trace %.2f ms, denoise+ice %.2f ms (worst frame %.1f ms)", tag,
+                    a / 1000.0 / n, tr / 1000.0 / n, fx / 1000.0 / n, mx / 1000.0);
+        PROCESS_MEMORY_COUNTERS_EX pm{};
+        pm.cb = sizeof pm;
+        if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm))
+            Logf("[%s] game process RAM: private %.0f MB, working set %.0f MB (peak %.0f MB)", tag, pm.PrivateUsage / 1048576.0, pm.WorkingSetSize / 1048576.0, pm.PeakWorkingSetSize / 1048576.0);
     }
 }
 
@@ -4787,6 +4802,35 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         ringIdx = d->paintRing.fetch_add(1) % 16;
         set = d->paintSets[ringIdx];
     }
+    // GPU timers: 4 marks per frame in a ring of 16; a slot is read back when it comes round again (long finished by then)
+    uint32_t tsBase = 0xFFFFFFFFu;
+    if (!d->tsTried) {
+        d->tsTried = true;
+        VkPhysicalDeviceProperties pp{};
+        d->inst->GetPhysicalDeviceProperties(d->phys, &pp);
+        d->tsPeriod = pp.limits.timestampPeriod > 0.0f ? pp.limits.timestampPeriod : 1.0f;
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 64;
+        if (!d->CreateQueryPool || d->CreateQueryPool(d->device, &qi, nullptr, &d->tsPool) != VK_SUCCESS) d->tsPool = VK_NULL_HANDLE;
+        Logf("rt: GPU timers %s (period %.2f ns)", d->tsPool ? "on" : "unavailable", d->tsPeriod);
+    }
+    if (d->tsPool) {
+        const uint32_t s = d->tsRing++ % 16u;
+        if (d->tsWritten[s]) {
+            uint64_t v[4] = {};
+            if (d->GetQueryPoolResults(d->device, d->tsPool, s * 4, 4, sizeof v, v, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && v[3] >= v[0]) {
+                auto us = [&](uint64_t a, uint64_t b) { return (uint64_t)((double)(b - a) * d->tsPeriod / 1000.0); };
+                d->gpuAs += us(v[0], v[1]); d->gpuTrace += us(v[1], v[2]); d->gpuFx += us(v[2], v[3]); ++d->gpuN;
+                const uint64_t all = us(v[0], v[3]);
+                uint64_t mx = d->gpuMax.load(); while (all > mx && !d->gpuMax.compare_exchange_weak(mx, all)) {}
+            }
+        }
+        d->CmdResetQueryPool(cb, d->tsPool, s * 4, 4);
+        d->tsWritten[s] = true;
+        tsBase = s * 4;
+        d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, d->tsPool, tsBase);
+    }
     LevelUpdate(d, cb);
     if (g_guard && d->castPtr) {   // the guard: camera rays to what the game drew; a cached mesh met in front of it is not where the game has it
         uint32_t* gc = d->castPtr + (kMaxCacheGeoms + 8) * 5 + 8;
@@ -5391,11 +5435,13 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         if (d->statBuf) { VkBufferCopy rg{0, 0, 16}; d->CmdCopyBuffer(cb, d->lightBuf, d->statBuf, 1, &rg); }
     }
 
+    if (tsBase != 0xFFFFFFFFu) d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, d->tsPool, tsBase + 1);
     // ---- pass 1: trace
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, deepOn ? d->deepPipe : d->paintPipe);  // original function: not our graphics hook
     d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->paintPl, 0, 1, &set, 0, nullptr);
     d->CmdDispatch(cb, (m.w + 7) / 8, (m.h + 7) / 8, 1);
 
+    if (tsBase != 0xFFFFFFFFu) d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, d->tsPool, tsBase + 2);
     VkImageMemoryBarrier mid[2] = {};
     for (int i = 0; i < 2; ++i) {
         mid[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -5465,6 +5511,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
                           nullptr, 1, &post);
 
+    if (tsBase != 0xFFFFFFFFu) d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, d->tsPool, tsBase + 3);
     d->lastTlas = traceTlas;
     d->lastParRing = ringIdx;
     if (taaOn) {   // this frame's output becomes the next frame's history
