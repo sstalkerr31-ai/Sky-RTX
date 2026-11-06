@@ -4782,8 +4782,8 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         set = d->paintSets[ringIdx];
     }
     LevelUpdate(d, cb);
-    if (g_castProbe && d->castPtr && d->frames.load() - d->castLast >= 300) {   // what the sun shadow rays of the last ~5 s ran into (every 64th pixel)
-        d->castLast = d->frames.load();
+    if (g_castProbe && d->castPtr && GetTickCount64() - d->castLast >= 5000) {   // what the sun shadow rays of the last ~5 s ran into (every 64th pixel) - by the clock, so a slow game still reports
+        d->castLast = GetTickCount64();
         const size_t n = kMaxCacheGeoms + 8;
         std::vector<std::pair<uint32_t, uint32_t>> top;   // hits, index
         uint64_t all = 0;
