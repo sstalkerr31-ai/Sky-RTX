@@ -601,7 +601,7 @@ struct DeviceData {
     std::unordered_map<VkCommandBuffer, FrameGeo> frameGeo;          // geoMtx
     FrameGeo waterFg;                                                 // geoMtx: water drawn in its own pass, merged into the next trace pass
     FrameGeo pendStatic;                                              // the static draws of the previous trace pass: their matrices are readable now
-    struct Churn { uint32_t fresh = 0; uint64_t since = 0; bool moving = false; };
+    struct Churn { uint32_t fresh = 0, seen = 0; bool moving = false; };   // new places / places met again
     std::unordered_map<GeoKey, Churn, GeoKeyHash> churn;              // cacheMtx: per mesh (key without matrix): how often it shows up at a new place
     std::atomic<int> mainCount{0};
     bool track = false;                                               // track vertex/index/pipeline binds of every cb
@@ -4622,6 +4622,20 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 fabsf(mm[3]) < 1e-4f && fabsf(mm[7]) < 1e-4f && fabsf(mm[11]) < 1e-4f && fabsf(mm[15] - 1.0f) < 1e-3f) {
                 bool ident = true;
                 for (int k = 0; k < 15; ++k) if (fabsf(mm[k] - ((k % 5 == 0) ? 1.0f : 0.0f)) > 1e-5f) ident = false;
+                // a model matrix scales by a sane amount and places within the world; some shaders keep other data in this block, which
+                // must never stretch a mesh over kilometres (every ray would crawl through it)
+                bool sane = true;
+                for (int c2 = 0; c2 < 3; ++c2) {
+                    const float l = sqrtf(mm[c2 * 4] * mm[c2 * 4] + mm[c2 * 4 + 1] * mm[c2 * 4 + 1] + mm[c2 * 4 + 2] * mm[c2 * 4 + 2]);
+                    if (!(l > 0.001f && l < 60.0f)) sane = false;
+                }
+                if (!(fabsf(mm[12]) < 20000.0f && fabsf(mm[13]) < 20000.0f && fabsf(mm[14]) < 20000.0f)) sane = false;
+                if (!ident && !sane) {
+                    static std::atomic<int> bl{0};
+                    if (bl.fetch_add(1) < 20) Logf("rt: a draw's block 0 is not a sane model matrix - mesh left out (%u tris): %.3g %.3g %.3g %.3g | %.3g %.3g %.3g %.3g | %.3g %.3g %.3g %.3g | %.3g %.3g %.3g %.3g",
+                                                   pg.ranges[i].primitiveCount, mm[0], mm[1], mm[2], mm[3], mm[4], mm[5], mm[6], mm[7], mm[8], mm[9], mm[10], mm[11], mm[12], mm[13], mm[14], mm[15]);
+                    continue;
+                }
                 if (!ident) {
                     for (int r = 0; r < 3; ++r) for (int c2 = 0; c2 < 4; ++c2) xf.matrix[r][c2] = mm[c2 * 4 + r];
                     hasXf = true;
@@ -4648,8 +4662,10 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             auto it = d->geoCache.find(pg.keys[i]);
             if (it == d->geoCache.end() && hasXf) {
                 DeviceData::Churn& ch = d->churn[base];
-                if (fr - ch.since > 600) { ch.since = fr; ch.fresh = 0; }
-                if (++ch.fresh > 24) {   // more than 24 new places within ~10 s: it moves. Its copies go, and it stays out of the cache
+                // a copy of a still mesh is met again every frame it is on the screen; a moving mesh's places are each met once.
+                // Many new places that are hardly ever met again (or simply too many): it moves. Its copies go, it stays out of the cache
+                ++ch.fresh;
+                if ((ch.fresh > 24 && ch.seen < ch.fresh * 4) || ch.fresh > 96) {
                     ch.moving = true;
                     uint32_t gone = 0;
                     for (auto ci = d->geoCache.begin(); ci != d->geoCache.end();) {
@@ -4680,6 +4696,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             } else {
                 it->second.lastSeen = fr;
                 if (!it->second.mat) it->second.mat = pg.mats[i];
+                if (hasXf) { auto ch = d->churn.find(base); if (ch != d->churn.end()) ++ch->second.seen; }
             }
         }
         {
@@ -4690,7 +4707,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         if (fr - d->lastEvict >= 300) {  // forget what has not been drawn for a minute
             d->lastEvict = fr;
             for (auto it = d->geoCache.begin(); it != d->geoCache.end();) {
-                if (fr - it->second.lastSeen > 12000) {
+                if (fr - it->second.lastSeen > (it->second.hasXf ? 600u : 12000u)) {   // placed copies go after ~10 s unseen: the level's models from the files cover the rest
                     d->cacheTris -= std::min<uint64_t>(d->cacheTris, it->second.r.primitiveCount);
                     it = d->geoCache.erase(it);
                     d->rtEvicted++;

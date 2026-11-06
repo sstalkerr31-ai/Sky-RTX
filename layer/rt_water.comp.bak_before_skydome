@@ -1,0 +1,194 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+// SkyRT water reflections. Runs right after the game's own water pass, on the half-resolution picture the water was drawn into
+// (the game later scales it up and lays it over the frame, so the reflections come along). For every water pixel one ray goes along the
+// mirrored view direction; what it sees is read back from a copy of the frame and mixed in by Fresnel: strong at a glancing angle,
+// weak when looking straight down.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D uWater;           // the game's water picture (half resolution): read and written
+layout(set = 0, binding = 1) uniform texture2D uWDepth;                 // its depth
+layout(set = 0, binding = 2) uniform accelerationStructureEXT uTlas;
+layout(set = 0, binding = 5, std140) uniform Params {
+    mat4 vp;
+    mat4 invVP;
+    vec4 sun;
+    vec4 cam;      // xyz = camera, w = flip-Y flag
+    uvec4 misc;    // x,y = size of the full frame, z = mode, w = frame
+    uvec4 flags;
+    vec4 fx;
+    vec4 fx2;      // y = reflection strength (cfg waterrefl)
+    mat4 pvp;
+    vec4 tp;
+    vec4 lt;
+    uvec4 lm;
+    uvec4 mat;
+    vec4 sunCol;
+    vec4 ambCol;
+    vec4 skyCol;
+    uvec4 lvl;      // the level ground's index buffer (x,y) and vertex positions (z,w); 0 = none
+    vec4 grassCol;  // the game's grass and rock colours, w = 1 when known
+    vec4 rockCol;
+} u;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U32 { uint v; };
+uint read32(uvec2 a, uint off) {
+    uint carry;
+    uint lo = uaddCarry(a.x, off, carry);
+    return U32(uvec2(lo, a.y + carry)).v;
+}
+// normal of a triangle of the level ground (read from its own buffers)
+vec3 groundNormal(uint prim) {
+    vec3 v[3];
+    for (uint k = 0u; k < 3u; ++k) {
+        uint vi = read32(u.lvl.xy, (prim * 3u + k) * 4u);
+        v[k] = vec3(uintBitsToFloat(read32(u.lvl.zw, vi * 12u)), uintBitsToFloat(read32(u.lvl.zw, vi * 12u + 4u)), uintBitsToFloat(read32(u.lvl.zw, vi * 12u + 8u)));
+    }
+    vec3 n = cross(v[1] - v[0], v[2] - v[0]);
+    float l = length(n);
+    return l > 1e-12 ? n / l : vec3(0.0, 1.0, 0.0);
+}
+layout(set = 0, binding = 14, rgba16f) uniform readonly image2D uFrame;   // the frame as the game drew it, full resolution; alpha = its depth
+layout(set = 0, binding = 11, std430) readonly buffer GeoMat { uint geoMat[]; };   // the material tables of the trace pass
+struct MatColor { vec4 c; vec4 pad[15]; };
+layout(set = 0, binding = 12, std430) readonly buffer MatColors { MatColor matColor[]; };
+
+vec4 hitMaterial(uint inst, uint geom) {
+    if ((u.mat.x & 1u) == 0u || inst != 0u || geom >= 30000u) return vec4(0.0);
+    uint id = geoMat[u.mat.y * 30000u + geom];
+    return id != 0u ? matColor[id].c : vec4(0.0);
+}
+
+vec3 worldAt(ivec2 p, ivec2 sz, float z) {
+    vec2 ndc = (vec2(p) + 0.5) / vec2(sz) * 2.0 - 1.0;
+    if (u.cam.w > 0.5) ndc.y = -ndc.y;
+    vec4 w = u.invVP * vec4(ndc, z, 1.0);
+    return w.xyz / w.w;
+}
+
+// the frame's colour where a world point lands on the screen; false when it is off the screen
+bool frameAt(vec3 wp, out vec3 col) {
+    col = vec3(0.0);
+    vec4 clip = u.vp * vec4(wp, 1.0);
+    if (clip.w <= 1e-5) return false;
+    vec2 ndc = clip.xy / clip.w;
+    if (u.cam.w > 0.5) ndc.y = -ndc.y;
+    vec2 uv = ndc * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) return false;
+    // only if that point is what the frame really shows there: something nearer (a character in front of the sky, say) must not
+    // be mirrored instead. Reverse-Z: a larger depth is nearer; the frame copy keeps the depth in alpha.
+    float zh = clip.z / clip.w;
+    float zs = imageLoad(uFrame, clamp(ivec2(uv * vec2(u.misc.xy)), ivec2(0), ivec2(u.misc.xy) - 1)).a;
+    if (zs > zh * 1.03 + 1e-7) return false;
+    // bilinear: the water picture is half the frame's size, nearest pixels made the reflection blocky
+    vec2 f = uv * vec2(u.misc.xy) - 0.5;
+    ivec2 i0 = ivec2(floor(f));
+    vec2 w = f - vec2(i0);
+    ivec2 mx = ivec2(u.misc.xy) - 1;
+    vec3 c00 = imageLoad(uFrame, clamp(i0, ivec2(0), mx)).rgb, c10 = imageLoad(uFrame, clamp(i0 + ivec2(1, 0), ivec2(0), mx)).rgb;
+    vec3 c01 = imageLoad(uFrame, clamp(i0 + ivec2(0, 1), ivec2(0), mx)).rgb, c11 = imageLoad(uFrame, clamp(i0 + ivec2(1, 1), ivec2(0), mx)).rgb;
+    col = mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
+    return true;
+}
+
+// the sky in direction R when it is off the screen: lower the direction towards the horizon until it lands on the screen.
+// The horizon is smooth and stays put while the camera turns, so this neither streaks nor jumps.
+vec3 skyToward(vec3 R, vec3 fallback) {
+    vec3 h = normalize(vec3(R.x, 0.0, R.z) + vec3(0.0, 0.03, 0.0));
+    vec3 c;
+    for (int i = 1; i <= 8; ++i) {
+        vec3 d = normalize(mix(R, h, float(i) / 8.0));
+        if (frameAt(u.cam.xyz + d * 5000.0, c)) return c;
+    }
+    return fallback;
+}
+
+vec3 rippleNormal(vec2 q, float t) {
+    float nx = sin(q.x * 1.7 + q.y * 0.9 + t * 1.3) + 0.6 * sin(q.x * 3.1 - q.y * 2.3 - t * 1.9) + 0.3 * sin(q.y * 5.3 + q.x * 1.1 + t * 2.7);
+    float nz = sin(q.y * 1.5 - q.x * 1.1 + t * 1.1) + 0.6 * sin(q.y * 2.9 + q.x * 2.1 - t * 2.3) + 0.3 * sin(q.x * 4.9 - q.y * 1.7 + t * 2.9);
+    return normalize(vec3(nx * 0.05, 1.0, nz * 0.05));
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(uWater);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+    float z = texelFetch(uWDepth, p, 0).r;
+    if (z <= 0.0) return;   // nothing drawn here (reverse-Z: 0 = far)
+    vec3 P = worldAt(p, sz, z);
+    vec3 toP = P - u.cam.xyz;
+    float dist = length(toP);
+    if (dist < 0.01) return;
+    vec3 V = toP / dist;
+    // the water's own geometry is in the ray scene as the only non-opaque geometry: a pixel is water only if the camera ray meets
+    // the water right at this pixel's depth. Clouds, fog and everything else in this picture are left alone.
+    rayQueryEXT rc;
+    rayQueryInitializeEXT(rc, uTlas, gl_RayFlagsCullOpaqueEXT, 0xFF, u.cam.xyz, 0.0, V, dist * 1.06 + 1.0);
+    while (rayQueryProceedEXT(rc)) {
+        if (rayQueryGetIntersectionTypeEXT(rc, false) == gl_RayQueryCandidateIntersectionTriangleEXT) rayQueryConfirmIntersectionEXT(rc);
+    }
+    if (rayQueryGetIntersectionTypeEXT(rc, true) == gl_RayQueryCommittedIntersectionNoneEXT) return;
+    if (abs(rayQueryGetIntersectionTEXT(rc, true) - dist) > max(0.6, dist * 0.04)) return;   // waves move the drawn surface a little
+    // and water lies flat
+    ivec2 pr = min(p + ivec2(1, 0), sz - 1), pu = min(p + ivec2(0, 1), sz - 1);
+    ivec2 pl = max(p - ivec2(1, 0), ivec2(0)), pd = max(p - ivec2(0, 1), ivec2(0));
+    float zr = texelFetch(uWDepth, pr, 0).r, zu = texelFetch(uWDepth, pu, 0).r;
+    float zl = texelFetch(uWDepth, pl, 0).r, zd = texelFetch(uWDepth, pd, 0).r;
+    if (zr > 0.0 && zu > 0.0) {
+        vec3 n = normalize(cross(worldAt(pr, sz, zr) - P, worldAt(pu, sz, zu) - P));
+        if (abs(n.y) < 0.85) return;
+    }
+    // at the water's edge the depth jumps: fade the reflection out there instead of a hard, blocky border
+    float jump = max(max(abs(zr - z), abs(zl - z)), max(abs(zu - z), abs(zd - z))) / max(z, 1e-6);
+    float edge = 1.0 - smoothstep(0.02, 0.15, jump);
+
+    vec3 N = rippleNormal(P.xz, float(u.misc.w & 1023u) * 0.05);
+    vec3 R = reflect(V, N);
+    if (R.y < 0.0) R.y = -R.y;   // ripples must not send the ray into the water itself
+    vec3 refl;
+    rayQueryEXT rr;
+    rayQueryInitializeEXT(rr, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0xFF, P + N * 0.05, 0.0, R, 3000.0);
+    while (rayQueryProceedEXT(rr)) {}
+    vec3 wc = imageLoad(uWater, p).rgb;
+    vec3 sky = skyToward(R, wc);
+    if (rayQueryGetIntersectionTypeEXT(rr, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+        vec3 hp = P + N * 0.05 + R * rayQueryGetIntersectionTEXT(rr, true);
+        if (!frameAt(hp, refl)) {   // something off the screen: light its material like the trace pass does, else a darker horizon
+            vec4 hm = hitMaterial(rayQueryGetIntersectionInstanceIdEXT(rr, true), rayQueryGetIntersectionGeometryIndexEXT(rr, true));
+            bool ground = rayQueryGetIntersectionInstanceCustomIndexEXT(rr, true) == 1 && u.lvl.z != 0u && u.grassCol.w > 0.5 && u.rockCol.w > 0.5;
+            if (ground && u.sunCol.w > 0.5) {   // the level ground from the game files: grass on the flat, rock on the steep, lit by the sun
+                vec3 gn = groundNormal(uint(rayQueryGetIntersectionPrimitiveIndexEXT(rr, true)));
+                if (dot(gn, R) > 0.0) gn = -gn;
+                vec3 alb = mix(u.rockCol.rgb, u.grassCol.rgb, smoothstep(0.55, 0.8, abs(gn.y)));
+                vec3 sl = normalize(u.sun.xyz);
+                float nl = max(dot(gn, sl), 0.0);
+                if (nl > 0.0) {
+                    rayQueryEXT rs;
+                    rayQueryInitializeEXT(rs, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, hp + gn * 0.1, 0.0, sl, 2000.0);
+                    while (rayQueryProceedEXT(rs)) {}
+                    if (rayQueryGetIntersectionTypeEXT(rs, true) != gl_RayQueryCommittedIntersectionNoneEXT) nl = 0.0;
+                }
+                refl = alb * (u.sunCol.rgb * nl + u.ambCol.rgb + u.skyCol.rgb) * (float(u.mat.z) / 256.0);
+            } else if (hm.w > 0.5 && u.sunCol.w > 0.5) {
+                vec3 sl = normalize(u.sun.xyz);
+                rayQueryEXT rs;
+                rayQueryInitializeEXT(rs, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, hp - R * 0.05, 0.0, sl, 2000.0);
+                while (rayQueryProceedEXT(rs)) {}
+                float lit = rayQueryGetIntersectionTypeEXT(rs, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 0.5 : 0.0;   // no normal here: half of N.L on average
+                refl = hm.rgb * (u.sunCol.rgb * lit + u.ambCol.rgb) * (float(u.mat.z) / 256.0);
+            } else {
+                refl = sky * 0.5;
+            }
+        }
+    } else {
+        if (!frameAt(P + R * 5000.0, refl)) refl = sky;
+    }
+    float cosv = max(dot(-V, N), 0.0);
+    float F = 0.02 + 0.98 * pow(1.0 - cosv, 5.0);
+    float k = clamp(F * u.fx2.y * 2.0, 0.0, 0.9) * edge;
+    vec3 outc = mix(wc, refl, k);
+    if (any(isnan(outc)) || any(isinf(outc))) return;
+    imageStore(uWater, p, vec4(outc, imageLoad(uWater, p).a));
+}
