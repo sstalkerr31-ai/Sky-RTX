@@ -226,19 +226,58 @@ vec3 rippleNormal(vec2 q, float t) {
     return normalize(vec3(nx * 0.05, 1.0, nz * 0.05));
 }
 
+// cone of a rough reflection: gCone = tan of its half angle (0 = a mirror), gTaps = samples of the fixed pattern
+float gCone = 0.0;
+int gTaps = 1;
+// the frame around a world point, averaged over a disc of radius rad (pixels): a fixed spiral, so nothing flickers
+bool frameAtBlur(vec3 wp, float rad, out vec3 col) {
+    if (rad < 0.75 || gTaps <= 1) return frameAt(wp, col, false);
+    col = vec3(0.0);
+    vec4 clip = u.vp * vec4(wp, 1.0);
+    if (clip.w <= 1e-5) return false;
+    vec2 ndc = clip.xy / clip.w;
+    if (u.cam.w > 0.5) ndc.y = -ndc.y;
+    vec2 uv = ndc * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) return false;
+    vec2 c = uv * vec2(u.misc.xy);
+    ivec2 mx = ivec2(u.misc.xy) - 1;
+    for (int i = 0; i < gTaps; ++i) {   // Vogel spiral
+        float r = sqrt((float(i) + 0.5) / float(gTaps)) * rad, a = float(i) * 2.39996323;
+        col += imageLoad(uFrame, clamp(ivec2(c + vec2(cos(a), sin(a)) * r), ivec2(0), mx)).rgb;
+    }
+    col /= float(gTaps);
+    return true;
+}
+// the sky over the cone around R
+vec3 skyCone(vec3 R, vec3 fallback) {
+    if (gCone < 0.02 || gTaps <= 1) return skyToward(R, fallback);
+    vec3 T = normalize(abs(R.y) < 0.99 ? cross(R, vec3(0.0, 1.0, 0.0)) : cross(R, vec3(1.0, 0.0, 0.0)));
+    vec3 B = cross(R, T);
+    int n = min(gTaps, 8);
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < n; ++i) {
+        float r = sqrt((float(i) + 0.5) / float(n)) * gCone, a = float(i) * 2.39996323;
+        acc += skyToward(normalize(R + (T * cos(a) + B * sin(a)) * r), fallback);
+    }
+    return acc / float(n);
+}
 // what a reflected ray from O along R sees: the frame where that point is on the screen, else a stand-in colour, else the sky.
-// wc = the colour of the reflecting pixel (a stand-in never gets much brighter than it)
+// wc = the colour of the reflecting pixel (a stand-in never gets much brighter than it). pixA = the angle of one screen pixel (rad)
+float gPixA = 0.001;
 vec3 traceRefl(vec3 O, vec3 R, vec3 wc, out vec3 dbg) {
     vec3 refl;
     rayQueryEXT rr;
     rayQueryInitializeEXT(rr, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0xFF, O, 0.0, R, 3000.0);
     while (rayQueryProceedEXT(rr)) {}
-    vec3 sky = skyToward(R, wc);
+    vec3 sky = skyCone(R, wc);
     dbg = vec3(0.0);   // waterdebug=2: where the reflection came from
     if (rayQueryGetIntersectionTypeEXT(rr, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
         vec3 hp = O + R * rayQueryGetIntersectionTEXT(rr, true);
         dbg = vec3(1.0, 0.0, 0.0);   // red: hit something on the screen
-        if (!frameAt(hp, refl, false)) {
+        // the cone is gCone * t wide where the ray lands; that many pixels of the frame there (seen from the camera)
+        float th = rayQueryGetIntersectionTEXT(rr, true);
+        float radPx = gCone * th / max(length(hp - u.cam.xyz) * gPixA, 1e-4);
+        if (!frameAtBlur(hp, min(radPx, 40.0), refl)) {
             dbg = rayQueryGetIntersectionInstanceCustomIndexEXT(rr, true) == 1 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 1.0, 0.0);   // green: level ground off the screen, yellow: other geometry off the screen   // something off the screen: light its material like the trace pass does, else a darker horizon
             vec4 hm = hitMaterial(rayQueryGetIntersectionInstanceIdEXT(rr, true), rayQueryGetIntersectionGeometryIndexEXT(rr, true));
             bool ground = rayQueryGetIntersectionInstanceCustomIndexEXT(rr, true) == 1 && u.lvl.z != 0u && u.grassCol.w > 0.5 && u.rockCol.w > 0.5;
@@ -406,33 +445,12 @@ void main() {
     vec3 wc = imageLoad(uWater, p).rgb;
     vec3 dbg;
 #ifdef SURF
-    // rough: several rays spread like the game's GGX lobe (alpha = roughness); a new set every frame, the game's TAA averages them
-    vec3 refl = vec3(0.0);
-    int nr = rough < 0.08 ? 1 : int(u.surf.z);
-    float a2 = rough * rough;
-    vec3 Tt = normalize(abs(N.y) < 0.99 ? cross(N, vec3(0.0, 1.0, 0.0)) : cross(N, vec3(1.0, 0.0, 0.0)));
-    vec3 Bt = cross(N, Tt);
-    uint seed = hash3(uvec3(uvec2(p), u.misc.w));
-    int got = 0;
-    for (int i = 0; i < nr; ++i) {
-        vec3 Ri = R;
-        if (nr > 1) {
-            float u1 = float((seed >> 8) & 0xFFFFu) / 65535.0, u2 = float(hash3(uvec3(seed, uint(i), 7u)) & 0xFFFFu) / 65535.0;
-            seed = hash3(uvec3(seed, uint(i) + 1u, 13u));
-            float ph = 6.2831853 * (u1 + float(i) / float(nr));                       // stratified around the lobe
-            float ct = sqrt((1.0 - u2) / (1.0 + (a2 - 1.0) * u2));
-            float st = sqrt(max(1.0 - ct * ct, 0.0));
-            vec3 H = normalize(Tt * (cos(ph) * st) + Bt * (sin(ph) * st) + N * ct);
-            Ri = reflect(V, H);
-            if (dot(Ri, Ngw) < 0.02) continue;                                        // below the surface: no light from there
-        }
-        vec3 di;
-        refl += traceRefl(P + Ngw * 0.03, Ri, wc, di);
-        dbg = di;
-        ++got;
-    }
-    if (got == 0) return;
-    refl /= float(got);
+    // rough: one ray along the mirror direction, and the blur of the GGX lobe (alpha = roughness) taken where it lands -
+    // a fixed pattern over the frame / the sky, so it neither speckles nor flickers
+    gCone = rough < 0.08 ? 0.0 : 0.6 * rough;
+    gTaps = rough < 0.08 ? 1 : 4 * int(u.surf.z);
+    gPixA = pix / max(dist, 1e-3);
+    vec3 refl = traceRefl(P + Ngw * 0.03, R, wc, dbg);
 #elif defined(ICE)
     vec3 refl = traceRefl(P + N * 0.05, R, wc, dbg);
 #else
