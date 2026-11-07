@@ -105,6 +105,9 @@ static std::atomic<bool> g_fpsOn{false};   // FPS counter in the corner (Ctrl+F,
 static int g_fpsCfg = -1;                 // last fps= value read from SkyRT.cfg (a change there switches the counter)
 static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
 static int g_meshXf = 1;          // cfg meshxf: cached meshes placed by their draw's model matrix (fixes phantoms)
+static int g_surfTex = 1;          // cfg surftex: the game's normal maps / roughness of MeshSh models are read in the rays
+static const uint64_t kMeshShFs = 0xc7e04cd8a8bb69c0ull;   // MeshSh-13f fragment shader (u_normTex at set 1 binding 7)
+struct DescUbo { VkBuffer buf = VK_NULL_HANDLE; VkDeviceSize off = 0; bool dyn = false; };
 static int g_menuSwitch = 1;      // cfg menuswitch: the game's "dark mode only" switch turns ray tracing on / off
 static int g_boundsCheck = 1;     // cfg bounds: every cached mesh is measured on the GPU before it enters the ray scene (garbage stays out)
 static int g_guard = 1;           // cfg guard: meshes the rays meet in front of what the game drew leave the ray scene (stale / misplaced geometry)
@@ -354,6 +357,15 @@ struct GeoKeyHash {
         return (size_t)h;
     }
 };
+struct GeoS {                // where the ray shaders find the surface of a geometry (MeshSh): UV, vertex colour, normal map (std430 in rt.comp)
+    uint64_t idx, uv, col;   // device addresses: first index of the draw, a_uv0 (loc3) and a_color (loc1) of vertex 0
+    uint32_t strides;        // uv stride | colour stride << 16
+    uint32_t tex;            // texture slot + 1 of u_normTex (0 = none) | uv format << 16 (1 = 4 x half, 2 = 2 x half, 3 = 2 x float)
+    float nscale;            // u_normTexScale: uv of the normal map = a_uv0.xy * nscale
+    uint32_t pad;
+};
+static_assert(sizeof(GeoS) == 40, "GeoS is 40 bytes in rt.comp");
+static const uint32_t kTexMax = 4096;   // slots of the surface texture table
 struct DeviceData;
 static uint64_t FsOfKey(DeviceData* d, GeoKey k);   // shader of a cached mesh (keyFs is recorded without the matrix)
 struct GeoV {                // where the trace shader finds the vertices of a geometry (std430 in rt.comp); stride 0 = not available
@@ -371,6 +383,7 @@ struct GeoEnt {
     VkDeviceMemory am;
     VkTransformMatrixKHR xf{};   // the draw's model matrix: Mesh* shaders place their mesh with it (set 0 binding 0, offset 0)
     bool hasXf = false;
+    GeoS s{};                // its surface (textures), zero = none
     bool measured = false;   // rt_bounds.comp found it sane: only then it is part of the ray scene
     int32_t bslot = -1;      // its measurement in flight (slot in the bounds buffer), -1 = none
     uint64_t bfr = 0;        // frame of its last measurement
@@ -558,6 +571,22 @@ struct DeviceData {
     VkPipeline paintPipe = VK_NULL_HANDLE;
     VkPipeline deepPipe = VK_NULL_HANDLE;   // step 26: trace variant with several bounces (needs VK_KHR_ray_tracing_position_fetch)
     bool posFetch = false;
+    bool descIdx = false;   // descriptor indexing on: the surface texture table can be used
+    // surface textures: the game's views in a table the ray shaders index (binding 17); binding 18 = surface records, 19 = slot alive
+    std::mutex texMtx;
+    VkSampler texSampler = VK_NULL_HANDLE;
+    VkBuffer surfBuf = VK_NULL_HANDLE; VkDeviceMemory surfMem = VK_NULL_HANDLE; GeoS* surfPtr = nullptr;
+    VkBuffer texAliveBuf = VK_NULL_HANDLE; VkDeviceMemory texAliveMem = VK_NULL_HANDLE; uint32_t* texAlivePtr = nullptr;
+    std::unordered_map<VkImageView, uint32_t> texOf;      // texMtx: view -> slot
+    VkImageView texView[kTexMax] = {};                     // texMtx: view of every slot
+    uint64_t texGen[kTexMax] = {};                         // texMtx: when the slot got its view (texSerial)
+    uint64_t texSerial = 0, texSetSerial[16] = {};         // texMtx: last texSerial written into each trace descriptor set
+    std::vector<std::pair<uint32_t, uint64_t>> texFree;    // texMtx: freed slots and the frame they were freed
+    uint32_t texNext = 0;                                  // texMtx: next never used slot
+    std::unordered_set<VkImage> texHeldImgs;               // cacheMtx: images behind slots - their destruction is held back
+    std::unordered_set<VkDeviceMemory> texHeldMems;        // cacheMtx: memory of held images
+    std::unordered_map<VkImage, VkDeviceMemory> imgMem;    // texMtx: memory every image is bound to
+    std::unordered_map<VkImageView, VkImage> viewImg;      // texMtx: image of every view
     VkDescriptorPool paintPool = VK_NULL_HANDLE;
     VkDescriptorSet paintSets[16] = {};
     bool paintTried = false, paintOk = false;             // guarded by paintMtx
@@ -583,6 +612,7 @@ struct DeviceData {
         std::vector<uint32_t> mats;     // material id of every entry of `keys`
         struct Verts { GeoV v; VkBuffer ab; VkDeviceMemory am; };
         std::vector<Verts> verts;       // vertex access of every entry of `keys`
+        std::vector<GeoS> surf;         // surface record of every entry of `keys`
         std::vector<std::pair<VkBuffer, VkDeviceSize>> ubo;   // where every entry's per-draw block (model matrix) is: read a frame later
         uint64_t tris = 0, draws = 0, skipPipe = 0, skipRange = 0, skipOther = 0, unreadable = 0;
         std::vector<VkAccelerationStructureGeometryKHR> dynGeoms;       // step 16: CPU-written vertex buffers (characters)
@@ -661,6 +691,7 @@ struct DeviceData {
     // step 8: trace + composite passes, own result images, per-frame parameter buffers
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
     PFN_vkBindImageMemory BindImageMemory;
+    PFN_vkBindImageMemory2 BindImageMemory2;
     VkPipeline fxPipe = VK_NULL_HANDLE;
     VkPipeline lightPipe = VK_NULL_HANDLE;           // step 21: emissive light search
     VkPipeline lmergePipe = VK_NULL_HANDLE;          // step 23: merges the candidates into persistent lights
@@ -714,7 +745,7 @@ struct DeviceData {
     std::unordered_set<VkBuffer> cachedBufs;                          // cacheMtx
     std::unordered_set<VkDeviceMemory> buildMems;                     // cacheMtx: memory blocks an AS build may read
     PFN_vkDeviceWaitIdle DeviceWaitIdle;
-    struct Deferred { VkBuffer buf; VkDeviceMemory mem; uint64_t frame; };  // cacheMtx: game objects whose destruction is held back
+    struct Deferred { VkBuffer buf; VkDeviceMemory mem; uint64_t frame; VkImageView view = VK_NULL_HANDLE; VkImage img = VK_NULL_HANDLE; };  // cacheMtx: game objects whose destruction is held back
     std::vector<Deferred> deferred;
     uint64_t cacheTris = 0, lastEvict = 0;                            // cacheMtx
     bool cacheDirty = false;                                          // cacheMtx: new geometry appeared (rebuild is throttled)
@@ -909,6 +940,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
     // ---- decide whether RT can be enabled
     bool wantRT = !g_logOnly;
     bool posFetchWanted = false;
+    bool descIdxWanted = false;   // surface textures: one big table of the game's textures, indexed per hit in the ray shaders
     const char* needExt[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME,
                              VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME};
     if (wantRT && props.apiVersion < kApi12) { Logf("RT skipped: device api < 1.2"); wantRT = false; }
@@ -950,6 +982,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
                 }
                 Logf("GPU ray tracing position fetch (deep bounce mode): %s", posFetchWanted ? "available" : "NOT available (deep mode off)");
             }
+            {
+                VkPhysicalDeviceDescriptorIndexingFeatures diF{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+                VkPhysicalDeviceFeatures2 g2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                g2.pNext = &diF;
+                inst->GetPhysicalDeviceFeatures2(phys, &g2);
+                descIdxWanted = diF.runtimeDescriptorArray && diF.descriptorBindingPartiallyBound && diF.shaderSampledImageArrayNonUniformIndexing;
+                Logf("GPU descriptor indexing (surface textures in the rays): %s", descIdxWanted ? "available" : "NOT available");
+            }
             if (!asF.accelerationStructure || !rqF.rayQuery || !bdaF.bufferDeviceAddress) wantRT = false;
         }
     }
@@ -962,15 +1002,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asAdd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceRayQueryFeaturesKHR rqAdd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR pfAdd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR};
+    VkPhysicalDeviceDescriptorIndexingFeatures diAdd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
     std::vector<std::pair<VkBool32*, VkBool32>> undo;  // to restore the game's structs on fallback
 
     if (wantRT) {
-        bool hasBda = false, hasV12 = false, hasAs = false, hasRq = false;
+        bool hasBda = false, hasV12 = false, hasAs = false, hasRq = false, hasDi = false;
         auto setTrue = [&](VkBool32* f) { undo.emplace_back(f, *f); *f = VK_TRUE; };
         for (auto* p = (VkBaseOutStructure*)pCreateInfo->pNext; p; p = p->pNext) {
             switch (p->sType) {
-                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
-                    setTrue(&((VkPhysicalDeviceVulkan12Features*)p)->bufferDeviceAddress); hasV12 = true; break;
+                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: {
+                    auto* v12 = (VkPhysicalDeviceVulkan12Features*)p;
+                    setTrue(&v12->bufferDeviceAddress); hasV12 = true;
+                    if (descIdxWanted) { setTrue(&v12->runtimeDescriptorArray); setTrue(&v12->descriptorBindingPartiallyBound); setTrue(&v12->shaderSampledImageArrayNonUniformIndexing); }
+                    break;
+                }
+                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES:
+                    if (descIdxWanted) {
+                        auto* di = (VkPhysicalDeviceDescriptorIndexingFeatures*)p;
+                        setTrue(&di->runtimeDescriptorArray); setTrue(&di->descriptorBindingPartiallyBound); setTrue(&di->shaderSampledImageArrayNonUniformIndexing);
+                    }
+                    hasDi = true; break;
                 case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES:
                     setTrue(&((VkPhysicalDeviceBufferDeviceAddressFeatures*)p)->bufferDeviceAddress); hasBda = true; break;
                 case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR:
@@ -983,6 +1034,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
         if (!hasV12 && !hasBda) { bdaAdd.bufferDeviceAddress = VK_TRUE; bdaAdd.pNext = (void*)ci.pNext; ci.pNext = &bdaAdd; }
         if (!hasAs) { asAdd.accelerationStructure = VK_TRUE; asAdd.pNext = (void*)ci.pNext; ci.pNext = &asAdd; }
         if (!hasRq) { rqAdd.rayQuery = VK_TRUE; rqAdd.pNext = (void*)ci.pNext; ci.pNext = &rqAdd; }
+        if (descIdxWanted && !hasV12 && !hasDi) {
+            diAdd.runtimeDescriptorArray = diAdd.descriptorBindingPartiallyBound = diAdd.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+            diAdd.pNext = (void*)ci.pNext; ci.pNext = &diAdd;
+        }
         for (const char* e : needExt) {
             bool have = false;
             for (const char* x : exts) if (!strcmp(x, e)) { have = true; break; }
@@ -1037,6 +1092,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
     }
     if (r != VK_SUCCESS && wantRT) {
         posFetchWanted = false;
+        descIdxWanted = false;
         Logf("!!! vkCreateDevice with RT failed (%d) - retrying with the game's original info (RT off)", (int)r);
         for (auto& u : undo) *u.first = u.second;
         chain->u.pLayerInfo = savedLink;
@@ -1053,6 +1109,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
     d->gdpa = gdpa;
     d->rtEnabled = wantRT;
     d->posFetch = wantRT && posFetchWanted;
+    d->descIdx = wantRT && descIdxWanted;
     d->setLoaderData = setLoaderData;
     d->anisoOk = anisoWanted;
     d->maxAniso = props.limits.maxSamplerAnisotropy;
@@ -1135,6 +1192,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateDevice(VkPhysicalDevice phys, 
     LOADD(GetImageMemoryRequirements);
     LOADD(DeviceWaitIdle);
     LOADD(BindImageMemory);
+    LOADD(BindImageMemory2);
 #undef LOADD
     d->track = wantRT && !g_logOnly && !g_noPaint;
     if (!d->GetBufferDeviceAddress)
@@ -1427,6 +1485,10 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_FreeMemory(VkDevice device, VkDeviceMemo
     {   // an AS build recorded in a command buffer that has not run yet may still read this memory:
         // keep the memory alive for a few frames instead of freeing it now
         std::lock_guard<std::mutex> lk(d->cacheMtx);
+        if (d->texHeldMems.count(memory)) {   // a surface texture lives here: a frame in flight may still sample it
+            d->deferred.push_back({VK_NULL_HANDLE, memory, d->frames.load()});
+            return;
+        }
         if (d->buildMems.erase(memory)) {
             for (auto it = d->geoCache.begin(); it != d->geoCache.end();) {
                 if (it->second.vm == memory || it->second.im == memory || it->second.am == memory) {
@@ -2109,6 +2171,62 @@ static uint32_t MatConst(DeviceData* d, VkCommandBuffer cb, uint64_t vs, uint32_
     return id;
 }
 
+// surface textures: the table slot of a game view (+1; 0 = none). Its image and memory are held from now on.
+static uint32_t TexSlotFor(DeviceData* d, VkImageView v) {
+    if (!d->descIdx || !v || !d->texAlivePtr || !d->texSampler) return 0;
+    std::lock_guard<std::mutex> tk(d->texMtx);
+    auto it = d->texOf.find(v);
+    if (it != d->texOf.end()) return (it->second & 0x80000000u) ? 0 : it->second + 1;
+    auto vi = d->viewImg.find(v);
+    if (vi == d->viewImg.end()) return 0;   // a view made before the layer could see it: unknown image, cannot be held
+    uint32_t s = 0xFFFFFFFFu;
+    const uint64_t fr = d->frames.load();
+    for (size_t i = 0; i < d->texFree.size(); ++i)
+        if (fr - d->texFree[i].second > 64) { s = d->texFree[i].first; d->texFree[i] = d->texFree.back(); d->texFree.pop_back(); break; }
+    if (s == 0xFFFFFFFFu) {
+        if (d->texNext >= kTexMax) { static std::atomic<int> fl{0}; if (fl.fetch_add(1) < 3) Logf("rt: surface texture table full (%u)", kTexMax); return 0; }
+        s = d->texNext++;
+    }
+    d->texOf[v] = s;
+    d->texView[s] = v;
+    d->texGen[s] = ++d->texSerial;
+    d->texAlivePtr[s] = 1;
+    {
+        std::lock_guard<std::mutex> lk(d->cacheMtx);
+        d->texHeldImgs.insert(vi->second);
+        auto mi = d->imgMem.find(vi->second);
+        if (mi != d->imgMem.end()) d->texHeldMems.insert(mi->second);
+    }
+    static std::atomic<int> tl{0};
+    if (tl.fetch_add(1) < 3 || s % 500 == 499) Logf("rt: surface texture slot %u <- view %p", s, (void*)v);
+    return s + 1;
+}
+// writes the slots that changed since this descriptor set was last used (the set is not in flight: 16 sets in a ring)
+static void TexSync(DeviceData* d, uint32_t setIdx) {
+    if (!d->descIdx || !d->texSampler || setIdx >= 16) return;
+    std::lock_guard<std::mutex> tk(d->texMtx);
+    if (d->texSetSerial[setIdx] == d->texSerial) return;
+    std::vector<VkDescriptorImageInfo> ii;
+    std::vector<VkWriteDescriptorSet> w;
+    ii.reserve(64);
+    for (uint32_t s = 0; s < d->texNext; ++s)
+        if (d->texGen[s] > d->texSetSerial[setIdx] && d->texView[s]) ii.push_back({d->texSampler, d->texView[s], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+    size_t k = 0;
+    for (uint32_t s = 0; s < d->texNext; ++s) {
+        if (!(d->texGen[s] > d->texSetSerial[setIdx] && d->texView[s])) continue;
+        VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        x.dstSet = d->paintSets[setIdx];
+        x.dstBinding = 17;
+        x.dstArrayElement = s;
+        x.descriptorCount = 1;
+        x.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        x.pImageInfo = &ii[k++];
+        w.push_back(x);
+    }
+    if (!w.empty()) d->UpdateDescriptorSets(d->device, (uint32_t)w.size(), w.data(), 0, nullptr);
+    d->texSetSerial[setIdx] = d->texSerial;
+}
+
 static uint32_t MatForDraw(DeviceData* d, VkCommandBuffer cb, uint64_t vs, uint64_t fs) {
     if (!g_matTrack) return 0;
     for (const MatVs& m : kMatVs) if (m.vs == vs) return MatConst(d, cb, vs, m.off);
@@ -2417,6 +2535,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateImageView(VkDevice device, con
     if (!d) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult r = d->CreateImageView(device, pCreateInfo, pAllocator, pView);
     if (r == VK_SUCCESS && g_texProbe.load(std::memory_order_relaxed)) TpOnView(pCreateInfo, *pView);
+    if (r == VK_SUCCESS && d->descIdx) { std::lock_guard<std::mutex> tk(d->texMtx); d->viewImg[*pView] = pCreateInfo->image; }
     if (r == VK_SUCCESS) {
         std::lock_guard<std::mutex> lk(d->regMtx);
         if (d->imgs.find(pCreateInfo->image) != d->imgs.end()) d->views[*pView] = DeviceData::ViewInfo{pCreateInfo->image};
@@ -2798,7 +2917,7 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->paintTried = true;
     g_stage = "EnsurePaintResources";
 
-    VkDescriptorSetLayoutBinding b[17] = {};
+    VkDescriptorSetLayoutBinding b[20] = {};
     const VkDescriptorType types[17] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                                        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -2811,8 +2930,17 @@ static bool EnsurePaintResources(DeviceData* d) {
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
+    b[17].binding = 17; b[17].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[17].descriptorCount = d->descIdx ? kTexMax : 1; b[17].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[18].binding = 18; b[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[18].descriptorCount = 1; b[18].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[19].binding = 19; b[19].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[19].descriptorCount = 1; b[19].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorBindingFlags bflags[20] = {};
+    bflags[17] = d->descIdx ? VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT : 0;
+    VkDescriptorSetLayoutBindingFlagsCreateInfo bfi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+    bfi.bindingCount = 20;
+    bfi.pBindingFlags = bflags;
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.bindingCount = 17;
+    dl.pNext = d->descIdx ? &bfi : nullptr;
+    dl.bindingCount = 20;
     dl.pBindings = b;
     VkResult r = d->CreateDescriptorSetLayout(d->device, &dl, nullptr, &d->paintDsl);
     if (r != VK_SUCCESS) { Logf("!!! rt: descriptor set layout failed (%d)", (int)r); return false; }
@@ -2834,12 +2962,12 @@ static bool EnsurePaintResources(DeviceData* d) {
     d->lmergePipe = MakeComputePipe(d, kRtLMergeSpv, sizeof(kRtLMergeSpv), "light merge");
     if (!d->lmergePipe) d->lightPipe = VK_NULL_HANDLE;
 
-    VkDescriptorPoolSize ps[5] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 * 10}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32},
+    VkDescriptorPoolSize ps[6] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32 * 10}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32},
                                   {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 32}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32},
-                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 * 5}};
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 * 7}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32 * (d->descIdx ? kTexMax : 1)}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 32;   // 16 for the trace ring, 16 for the water pass
-    pi.poolSizeCount = 5;
+    pi.poolSizeCount = 6;
     pi.pPoolSizes = ps;
     r = d->CreateDescriptorPool(d->device, &pi, nullptr, &d->paintPool);
     if (r != VK_SUCCESS) { Logf("!!! rt: descriptor pool failed (%d)", (int)r); return false; }
@@ -2873,6 +3001,26 @@ static bool EnsurePaintResources(DeviceData* d) {
             d->MapMemory(d->device, d->geoVMem, 0, VK_WHOLE_SIZE, 0, &vp) != VK_SUCCESS || !vp) { Logf("!!! rt: vertex table failed"); return false; }
         d->geoVPtr = (GeoV*)vp;
         memset(vp, 0, (size_t)8 * kMaxCacheGeoms * sizeof(GeoV));
+        void* sp2 = nullptr;
+        void* ap2 = nullptr;
+        if (!MakeBufEx(d, (VkDeviceSize)8 * kMaxCacheGeoms * sizeof(GeoS), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->surfBuf, d->surfMem, da) ||
+            d->MapMemory(d->device, d->surfMem, 0, VK_WHOLE_SIZE, 0, &sp2) != VK_SUCCESS || !sp2 ||
+            !MakeBufEx(d, (VkDeviceSize)kTexMax * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->texAliveBuf, d->texAliveMem, da) ||
+            d->MapMemory(d->device, d->texAliveMem, 0, VK_WHOLE_SIZE, 0, &ap2) != VK_SUCCESS || !ap2) { Logf("!!! rt: surface tables failed"); return false; }
+        memset(sp2, 0, (size_t)8 * kMaxCacheGeoms * sizeof(GeoS));
+        memset(ap2, 0, (size_t)kTexMax * sizeof(uint32_t));
+        {
+            VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+            si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+            si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            si.maxLod = 16.0f;
+            if (d->CreateSampler(d->device, &si, nullptr, &d->texSampler) != VK_SUCCESS) d->texSampler = VK_NULL_HANDLE;
+        }
+        std::lock_guard<std::mutex> tk(d->texMtx);
+        d->surfPtr = (GeoS*)sp2;
+        d->texAlivePtr = (uint32_t*)ap2;
+        Logf("rt: surface textures %s (table of %u game textures in the rays)", d->descIdx && d->texSampler ? "on" : "UNAVAILABLE", kTexMax);
         if (!MakeBufEx(d, (VkDeviceSize)8 * kMaxCacheGeoms * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->geoMatBuf, d->geoMatMem, da) ||
             !MakeBufEx(d, (VkDeviceSize)kMatMax * kMatStride, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->matColBuf, d->matColMem, da) ||
             d->MapMemory(d->device, d->geoMatMem, 0, VK_WHOLE_SIZE, 0, &gp) != VK_SUCCESS || !gp ||
@@ -2947,17 +3095,19 @@ static bool EnsurePaintResources(DeviceData* d) {
             lw.pBufferInfo = &lbi;
             d->UpdateDescriptorSets(d->device, 1, &lw, 0, nullptr);
         }
-        VkDescriptorBufferInfo mbi[4] = {{d->geoMatBuf, 0, VK_WHOLE_SIZE}, {d->matColBuf, 0, VK_WHOLE_SIZE}, {d->geoVBuf, 0, VK_WHOLE_SIZE}, {d->castBuf, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet mw[4] = {};
-        for (uint32_t k = 0; k < 4; ++k) {
+        VkDescriptorBufferInfo mbi[6] = {{d->geoMatBuf, 0, VK_WHOLE_SIZE}, {d->matColBuf, 0, VK_WHOLE_SIZE}, {d->geoVBuf, 0, VK_WHOLE_SIZE}, {d->castBuf, 0, VK_WHOLE_SIZE},
+                                         {d->surfBuf, 0, VK_WHOLE_SIZE}, {d->texAliveBuf, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet mw[6] = {};
+        static const uint32_t kBind[6] = {11, 12, 13, 15, 18, 19};
+        for (uint32_t k = 0; k < 6; ++k) {
             mw[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             mw[k].dstSet = d->paintSets[i];
-            mw[k].dstBinding = k < 3 ? 11 + k : 15;
+            mw[k].dstBinding = kBind[k];
             mw[k].descriptorCount = 1;
             mw[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             mw[k].pBufferInfo = &mbi[k];
         }
-        d->UpdateDescriptorSets(d->device, 4, mw, 0, nullptr);
+        d->UpdateDescriptorSets(d->device, 6, mw, 0, nullptr);
     }
 
     d->paintOk = true;
@@ -3593,6 +3743,58 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         }
     }
     const uint32_t matId = bufsOk ? MatForDraw(d, cb, vsHash, fsHash) : 0;
+    // surface textures (MeshSh): a_uv0 (loc3), a_color (loc1), u_normTex (set 1 binding 7), u_normTexScale (set 1 binding 0, offset 0)
+    struct SurfPipe { uint32_t uvB = 8, uvOff = 0, uvStride = 0, uvFmt = 0, colB = 8, colOff = 0, colStride = 0; } sp;
+    uint64_t surfUvA = 0, surfColA = 0;
+    uint32_t surfTex = 0;
+    float surfScale = 1.0f;
+    if (bufsOk && d->descIdx && g_surfTex && fsHash == kMeshShFs) {
+        {
+            std::lock_guard<std::mutex> lk(d->regMtx);
+            auto pit = d->pipes.find(st.pipe);
+            if (pit != d->pipes.end()) {
+                for (const DeviceData::PipeInfo::Attr& a : pit->second.attrs) {
+                    if (a.loc == 3) { sp.uvB = a.binding; sp.uvOff = a.offset;
+                        sp.uvFmt = a.format == (uint32_t)VK_FORMAT_R16G16B16A16_SFLOAT ? 1u : a.format == (uint32_t)VK_FORMAT_R16G16_SFLOAT ? 2u : (a.format == (uint32_t)VK_FORMAT_R32G32_SFLOAT || a.format == (uint32_t)VK_FORMAT_R32G32B32A32_SFLOAT) ? 3u : 0u; }
+                    if (a.loc == 1 && a.format == (uint32_t)VK_FORMAT_R8G8B8A8_UNORM) { sp.colB = a.binding; sp.colOff = a.offset; }
+                }
+                for (const DeviceData::PipeInfo::Bind& bd : pit->second.binds) {
+                    if (bd.binding == sp.uvB && bd.rate == 0) sp.uvStride = bd.stride;
+                    if (bd.binding == sp.colB && bd.rate == 0) sp.colStride = bd.stride;
+                }
+            }
+        }
+        auto addr = [&](uint32_t b) -> uint64_t {
+            if (b >= 8 || !st.vb[b]) return 0;
+            VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            ai.buffer = st.vb[b];
+            return d->GetBufferDeviceAddress(d->device, &ai);
+        };
+        VkImageView nv = VK_NULL_HANDLE;
+        DescUbo mu{};
+        {
+            std::lock_guard<std::mutex> lk(g_tpMtx);
+            auto cit = g_tpCb.find(cb);
+            if (cit != g_tpCb.end()) {
+                auto sit = g_tpSet.find(cit->second[1]);
+                if (sit != g_tpSet.end()) nv = sit->second[7];
+                auto uit = g_tpSetUbo.find(cit->second[1]);
+                if (uit != g_tpSetUbo.end()) { mu.buf = uit->second.buf; mu.off = uit->second.off; mu.dyn = uit->second.dyn; }
+            }
+        }
+        if (sp.uvFmt && sp.uvStride && sp.colStride && nv) {
+            surfUvA = addr(sp.uvB);
+            surfColA = addr(sp.colB);
+            surfTex = TexSlotFor(d, nv);
+            if (mu.buf && !mu.dyn) {
+                float sc = 1.0f;
+                if (ReadBufHost(d, mu.buf, mu.off, &sc, 4) && sc == sc && sc > 1e-4f && sc < 1e4f) surfScale = sc;
+            }
+            static std::atomic<int> sl{0};
+            if (sl.fetch_add(1) < 6) Logf("rt: surface of a MeshSh draw: uv loc3 binding %u +%u stride %u fmt %u | colour binding %u +%u stride %u | normTex slot %u | normTexScale %.3f%s",
+                                          sp.uvB, sp.uvOff, sp.uvStride, sp.uvFmt, sp.colB, sp.colOff, sp.colStride, surfTex, surfScale, mu.dyn ? " (dynamic block: 1)" : "");
+        }
+    }
     DeviceData::BufInfo abi{};
     VkDeviceAddress aa = 0;
     if (bufsOk && bakeStride && bakeB < 8 && st.vb[bakeB] && BufInfoOf(d, st.vb[bakeB], abi)) {
@@ -3696,6 +3898,19 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
             fg.ubo.push_back(ub);
         }
         if (g_castProbe) { std::lock_guard<std::mutex> lk(d->keyFsMtx); d->keyFs[fg.keys.back()] = fsHash; }
+        {
+            GeoS gs{};
+            if (surfTex && surfUvA && surfColA) {
+                gs.idx = ia + ibase;
+                gs.uv = surfUvA + st.vbOff[sp.uvB] + sp.uvOff + (uint64_t)c.vertexOffset * sp.uvStride;
+                gs.col = surfColA + st.vbOff[sp.colB] + sp.colOff + (uint64_t)c.vertexOffset * sp.colStride;
+                gs.strides = sp.uvStride | (sp.colStride << 16);
+                gs.tex = surfTex | (sp.uvFmt << 16);
+                gs.nscale = surfScale;
+                if ((gs.uv & 3) || (gs.col & 3)) gs = GeoS{};   // the shaders read 4-byte words
+            }
+            fg.surf.push_back(gs);
+        }
         fg.mems.emplace_back(vbi.mem, ibi.mem);
         fg.mats.push_back(matId);
         DeviceData::FrameGeo::Verts fv{};
@@ -3979,7 +4194,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         char key[32] = {};
         strncpy(key, k, sizeof key - 1);
         for (int i = (int)strlen(key) - 1; i >= 0 && (key[i] == ' ' || key[i] == '\t'); --i) key[i] = 0;
-        if (!strcmp(key, "view")) g_view = (uint32_t)v % 11u;
+        if (!strcmp(key, "view")) g_view = (uint32_t)v % 14u;
         else if (!strcmp(key, "enabled")) g_enabled = v != 0.0;
         else if (!strcmp(key, "autosun")) g_autoSun = v != 0.0;
         else if (!strcmp(key, "az")) g_sunAz = v;
@@ -4009,6 +4224,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "guard")) g_guard = v != 0.0;
         else if (!strcmp(key, "bounds")) g_boundsCheck = v != 0.0;
         else if (!strcmp(key, "menuswitch")) g_menuSwitch = v != 0.0;
+        else if (!strcmp(key, "surftex")) g_surfTex = v != 0.0;
         else if (!strcmp(key, "modelsall")) g_modelsAll = v != 0.0;
         else if (!strcmp(key, "castprobe")) g_castProbe = v != 0.0;
         else if (!strcmp(key, "icefx")) g_iceOn = v != 0.0;
@@ -4668,7 +4884,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         for (size_t i = 0; i < fg.dynGeoms.size(); ++i) {
             if (i < fg.dynProp.size() && fg.dynProp[i]) continue;   // props have no meaning without their transform
             fg.geoms.push_back(fg.dynGeoms[i]); fg.ranges.push_back(fg.dynRanges[i]);
-            fg.keys.push_back(fg.dynKeys[i]); fg.mems.push_back(fg.dynMems[i]); fg.mats.push_back(0); fg.verts.push_back(DeviceData::FrameGeo::Verts{}); fg.ubo.push_back({});
+            fg.keys.push_back(fg.dynKeys[i]); fg.mems.push_back(fg.dynMems[i]); fg.mats.push_back(0); fg.verts.push_back(DeviceData::FrameGeo::Verts{}); fg.ubo.push_back({}); fg.surf.push_back(GeoS{});
             fg.tris += fg.dynRanges[i].primitiveCount;
         }
         fg.dynGeoms.clear(); fg.dynRanges.clear(); fg.dynKeys.clear(); fg.dynMems.clear(); fg.dynXf.clear(); fg.dynProp.clear(); fg.dynTris = 0; fg.propTris = 0; fg.propGeoms = 0;
@@ -4692,6 +4908,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
     std::vector<uint32_t> geoMats;   // material of every entry of `geoms`
     std::vector<GeoV> geoVs;         // vertex access of every entry of `geoms`
+    std::vector<GeoS> geoSs;         // surface of every entry of `geoms`
     std::vector<int32_t> geoXfIdx;   // index into geoXfs of every entry of `geoms`, -1 = no matrix
     std::vector<VkTransformMatrixKHR> geoXfs;
     std::vector<GeoKey> rebuildKeys; // castprobe: the key of every entry of `geoms`
@@ -4713,7 +4930,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         DeviceData::FrameGeo pg = std::move(d->pendStatic);
         d->pendStatic = DeviceData::FrameGeo{};
         d->pendStatic.geoms = fg.geoms; d->pendStatic.ranges = fg.ranges; d->pendStatic.keys = fg.keys; d->pendStatic.mems = fg.mems;
-        d->pendStatic.mats = fg.mats; d->pendStatic.verts = fg.verts; d->pendStatic.ubo = fg.ubo;
+        d->pendStatic.mats = fg.mats; d->pendStatic.verts = fg.verts; d->pendStatic.ubo = fg.ubo; d->pendStatic.surf = fg.surf;
         static std::atomic<uint64_t> xfMoved{0}, xfPlain{0};
         for (size_t i = 0; i < pg.keys.size(); ++i) {
             VkTransformMatrixKHR xf{};
@@ -4787,6 +5004,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 GeoEnt e{pg.geoms[i], pg.ranges[i], fr, pg.mems[i].first, pg.mems[i].second, pg.mats[i], fv.v, fv.ab, fv.am};
                 e.xf = xf;
                 e.hasXf = hasXf;
+                if (i < pg.surf.size()) e.s = pg.surf[i];
                 d->geoCache.emplace(pg.keys[i], e);
                 d->buildMems.insert(pg.mems[i].first);
                 d->buildMems.insert(pg.mems[i].second);
@@ -4901,7 +5119,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             geoVs.reserve(d->geoCache.size());
             for (auto& kv : d->geoCache) {
                 if (d->boundsPtr && !kv.second.measured) continue;
-                geoms.push_back(kv.second.g); ranges.push_back(kv.second.r); geoMats.push_back(kv.second.mat); geoVs.push_back(kv.second.v);
+                geoms.push_back(kv.second.g); ranges.push_back(kv.second.r); geoMats.push_back(kv.second.mat); geoVs.push_back(kv.second.v); geoSs.push_back(kv.second.s);
                 geoXfIdx.push_back(kv.second.hasXf ? (int32_t)geoXfs.size() : -1);
                 if (kv.second.hasXf) geoXfs.push_back(kv.second.xf);
             }
@@ -4935,6 +5153,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         if (!cv || !dv) return;
         ringIdx = d->paintRing.fetch_add(1) % 16;
         set = d->paintSets[ringIdx];
+        TexSync(d, ringIdx);
     }
     // GPU timers: 4 marks per frame in a ring of 16; a slot is read back when it comes round again (long finished by then)
     uint32_t tsBase = 0xFFFFFFFFu;
@@ -5168,6 +5387,10 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 geoms[i].geometry.triangles.transformData.deviceAddress = geoXfIdx[i] >= 0 && (size_t)geoXfIdx[i] < kMaxCacheGeoms ? slot->xfAddr + (VkDeviceAddress)geoXfIdx[i] * sizeof(VkTransformMatrixKHR) : 0;
         }
         if (d->geoMatPtr) memcpy(d->geoMatPtr + (size_t)idx * kMaxCacheGeoms, geoMats.data(), std::min(geoMats.size(), kMaxCacheGeoms) * sizeof(uint32_t));   // this slot is not in flight (see above)
+        if (d->surfPtr) {
+            memset(d->surfPtr + (size_t)idx * kMaxCacheGeoms, 0, kMaxCacheGeoms * sizeof(GeoS));
+            memcpy(d->surfPtr + (size_t)idx * kMaxCacheGeoms, geoSs.data(), std::min(geoSs.size(), kMaxCacheGeoms) * sizeof(GeoS));
+        }
         if (d->geoVPtr) {
             memcpy(d->geoVPtr + (size_t)idx * kMaxCacheGeoms, geoVs.data(), std::min(geoVs.size(), kMaxCacheGeoms) * sizeof(GeoV));
             std::lock_guard<std::mutex> lk(d->cacheMtx);
@@ -5432,11 +5655,14 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         case 8: modeEff = 5u; flagsEff = 4u; break;   // material colour of every pixel, see rt.comp
         case 9: modeEff = 5u; flagsEff = 4u; break;   // bounce light, rays that use a material are red
         case 10: modeEff = 5u; flagsEff = 4u; break;  // baked light read from the vertices of every pixel (black = no vertex data)
+        case 11: case 12: case 13: modeEff = 5u; flagsEff = 4u; break;   // surface textures: roughness / normal map / metalness + AO (see rt.comp)
         default: flagsEff |= 8u; if (lightsOn) flagsEff |= 16u; break;
     }
     const bool matOn = g_matTrack && d->matPipe;
     par->mat[0] = (g_guard && d->castPtr ? 64u : 0u) | (d->domeView ? 32u : 0u) | (g_castProbe && d->castPtr ? 16u : 0u) | (matOn && g_matAlbedo.load(std::memory_order_relaxed) ? 1u : 0u) | (matOn && (g_view == 8 || g_view == 10) ? 2u : 0u) | (matOn && g_view == 9 ? 4u : 0u) | (matOn && g_view == 10 ? 8u : 0u);
     par->mat[1] = (uint32_t)(slot - d->rtSlots);
+    par->mat[0] |= (g_view == 11 ? 128u : 0u) | (g_view == 12 ? 256u : 0u) | (g_view == 13 ? 512u : 0u) |
+                   (d->descIdx && g_surfTex && d->surfPtr && par->mat[1] < 8 && d->geoVOk[par->mat[1]] ? 1024u : 0u);
     par->mat[2] = (uint32_t)(g_matGain * 256.0f);
     {
         std::lock_guard<std::mutex> lk(d->cacheMtx);
@@ -5478,7 +5704,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         d->stillFrames = (d->histValid && mvd < 5.0e-5f) ? std::min<uint32_t>(d->stillFrames + 1, 100000u) : 0u;
         ptFull = g_ptAdapt ? d->stillFrames >= 20 : true;
     }
-    const bool deepOn = g_deep && d->deepPipe;
+    const bool deepOn = g_deep && d->deepPipe && g_view < 8;   // the debug views live in the ordinary trace pass
     {
         static int lastDeep = -1;
         const int cur = deepOn ? g_bounces : 0;
@@ -5921,9 +6147,63 @@ static void MainPassEnd(DeviceData* d, VkCommandBuffer cb) {
     if (us > 3000 && d->spikes.fetch_add(1) < 40) Logf("rt: CPU spike: recording the RT pass took %.2f ms (rebuilds so far %llu)", us / 1000.0, (unsigned long long)d->rtRebuilds.load());
 }
 
+// surface textures: a view in the table may still be sampled by a frame in flight - its destruction (and that of its image and memory) waits
+static VKAPI_ATTR void VKAPI_CALL SkyRT_DestroyImageView(VkDevice device, VkImageView view, const VkAllocationCallbacks* pAllocator) {
+    DeviceData* d = GetDev(Key(device));
+    if (!d) return;
+    if (d->descIdx && view) {
+        std::lock_guard<std::mutex> tk(d->texMtx);
+        d->viewImg.erase(view);
+        auto it = d->texOf.find(view);
+        if (it != d->texOf.end()) {
+            const uint32_t s = it->second;
+            if (!(s & 0x80000000u)) {
+                if (d->texAlivePtr) d->texAlivePtr[s] = 0;
+                d->texView[s] = VK_NULL_HANDLE;
+                d->texFree.emplace_back(s, d->frames.load());
+            }
+            d->texOf.erase(it);
+            std::lock_guard<std::mutex> lk(d->cacheMtx);
+            DeviceData::Deferred e{VK_NULL_HANDLE, VK_NULL_HANDLE, d->frames.load()};
+            e.view = view;
+            d->deferred.push_back(e);
+            return;
+        }
+    }
+    d->DestroyImageView(device, view, pAllocator);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize offset) {
+    DeviceData* d = GetDev(Key(device));
+    if (!d) return VK_ERROR_INITIALIZATION_FAILED;
+    const VkResult r = d->BindImageMemory(device, image, memory, offset);
+    if (r == VK_SUCCESS && d->descIdx) { std::lock_guard<std::mutex> tk(d->texMtx); d->imgMem[image] = memory; }
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_BindImageMemory2(VkDevice device, uint32_t n, const VkBindImageMemoryInfo* pInfos) {
+    DeviceData* d = GetDev(Key(device));
+    if (!d || !d->BindImageMemory2) return VK_ERROR_INITIALIZATION_FAILED;
+    const VkResult r = d->BindImageMemory2(device, n, pInfos);
+    if (r == VK_SUCCESS && d->descIdx) { std::lock_guard<std::mutex> tk(d->texMtx); for (uint32_t i = 0; i < n; ++i) d->imgMem[pInfos[i].image] = pInfos[i].memory; }
+    return r;
+}
+
 static VKAPI_ATTR void VKAPI_CALL SkyRT_DestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator) {
     DeviceData* d = GetDev(Key(device));
     if (!d) return;
+    if (d->descIdx) {
+        std::lock_guard<std::mutex> tk(d->texMtx);
+        d->imgMem.erase(image);
+        for (auto& kv : d->texOf) {   // views of this image still in the table: their slots go now (the views themselves wait for their own destruction)
+            if (kv.second & 0x80000000u) continue;
+            auto vi = d->viewImg.find(kv.first);
+            if (vi == d->viewImg.end() || vi->second != image) continue;
+            const uint32_t s = kv.second;
+            if (d->texAlivePtr) d->texAlivePtr[s] = 0;
+            d->texView[s] = VK_NULL_HANDLE;
+            d->texFree.emplace_back(s, d->frames.load());
+            kv.second = s | 0x80000000u;
+        }
+    }
     {
         std::lock_guard<std::mutex> lk(d->regMtx);
         d->imgs.erase(image);
@@ -5935,6 +6215,15 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_DestroyImage(VkDevice device, VkImage im
         if (it != d->ownViews.end()) { own = it->second; d->ownViews.erase(it); }
     }
     if (own) d->DestroyImageView(device, own, nullptr);
+    {
+        std::lock_guard<std::mutex> lk(d->cacheMtx);
+        if (d->texHeldImgs.count(image)) {
+            DeviceData::Deferred e{VK_NULL_HANDLE, VK_NULL_HANDLE, d->frames.load()};
+            e.img = image;
+            d->deferred.push_back(e);
+            return;
+        }
+    }
     d->DestroyImage(device, image, pAllocator);
 }
 
@@ -6394,9 +6683,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_QueuePresentKHR(VkQueue queue, const
                 else ++i;
             }
         }
+        for (auto& e : rel) if (e.view) d->DestroyImageView(d->device, e.view, nullptr);   // views before their images, images before their memory
+        for (auto& e : rel) if (e.img) { { std::lock_guard<std::mutex> lk(d->cacheMtx); d->texHeldImgs.erase(e.img); } d->DestroyImage(d->device, e.img, nullptr); }
         for (auto& e : rel) {
             if (e.buf) d->DestroyBuffer(d->device, e.buf, nullptr);
-            if (e.mem) d->FreeMemory(d->device, e.mem, nullptr);
+            if (e.mem) { { std::lock_guard<std::mutex> lk(d->cacheMtx); d->texHeldMems.erase(e.mem); } d->FreeMemory(d->device, e.mem, nullptr); }
         }
     }
     if (d->track) PollKeys(f);
@@ -6683,6 +6974,9 @@ extern "C" __declspec(dllexport) VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL SkyRT_
     HOOKD(UpdateDescriptorSets);
     HOOKD(CmdBindDescriptorSets);
     HOOKD(DestroyImage);
+    HOOKD(DestroyImageView);
+    HOOKD(BindImageMemory);
+    HOOKD(BindImageMemory2);
 #undef HOOKD
     return d->gdpa(device, name);
 }

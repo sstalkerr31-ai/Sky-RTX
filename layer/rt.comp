@@ -3,6 +3,7 @@
 #extension GL_EXT_ray_query : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_nonuniform_qualifier : require
 #ifdef POSFETCH
 #extension GL_EXT_ray_tracing_position_fetch : require
 #endif
@@ -69,6 +70,33 @@ uint read16(uvec2 a, uint off) {
     uint carry;
     uint lo = uaddCarry(a.x, off, carry);
     return (U32(uvec2(lo & ~3u, a.y + carry)).v >> ((lo & 2u) * 8u)) & 0xFFFFu;
+}
+
+// ---- surface textures (MeshSh): the game's own normal map and the vertex colour at a hit of the cached scene
+layout(set = 0, binding = 17) uniform sampler2D uTex[];
+struct GeoS { uvec2 idx; uvec2 uv; uvec2 col; uint strides; uint tex; float nscale; uint pad; };
+layout(set = 0, binding = 18, std430) readonly buffer GeoSurf { GeoS geoS[]; };
+layout(set = 0, binding = 19, std430) readonly buffer TexAlive { uint texAlive[]; };
+// out: n = u_normTex (xy = normal map, z = AO, w = roughness factor), c = a_color (x = roughness, y = metalness, z = glow)
+bool surfaceAt(uint inst, uint geom, uint prim, vec2 bary, float dist, out vec4 n, out vec4 c) {
+    n = vec4(0.5, 0.5, 1.0, 1.0); c = vec4(0.0);
+    if ((u.mat.x & 1024u) == 0u || inst != 0u || geom >= 30000u) return false;
+    GeoS s = geoS[u.mat.y * 30000u + geom];
+    uint slot = s.tex & 0xFFFFu;
+    if (slot == 0u || texAlive[slot - 1u] == 0u) return false;
+    uint us = s.strides & 0xFFFFu, cs = s.strides >> 16, fmt = s.tex >> 16;
+    vec3 w = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+    vec2 uv = vec2(0.0);
+    c = vec4(0.0);
+    for (uint k = 0u; k < 3u; ++k) {
+        uint vi = read16(s.idx, (prim * 3u + k) * 2u);
+        vec2 t = fmt == 3u ? vec2(uintBitsToFloat(read32(s.uv, vi * us)), uintBitsToFloat(read32(s.uv, vi * us + 4u))) : unpackHalf2x16(read32(s.uv, vi * us));
+        uv += t * w[k];
+        c += unpackUnorm4x8(read32(s.col, vi * cs)) * w[k];
+    }
+    float lod = clamp(log2(max(dist, 0.5)) + 1.0, 0.0, 12.0);
+    n = textureLod(uTex[nonuniformEXT(slot - 1u)], uv * s.nscale, lod);
+    return true;
 }
 
 // the light the game baked into the vertices of a hit triangle: what the rock vertex shader passes on as ambient
@@ -265,6 +293,27 @@ void main() {
                 atomicAdd(castHist[150048u + gi * 2u + (gt < gl * 0.85 - 0.5 ? 0u : 1u)], 1u);
             }
         }
+    }
+    if ((u.mat.x & (128u | 256u | 512u)) != 0u) {   // views 11-13: what the rays read of the game's surfaces (black = no surface data)
+        vec3 vd = P - u.cam.xyz;
+        float vl = length(vd);
+        rayQueryEXT rv;
+        rayQueryInitializeEXT(rv, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0x01, u.cam.xyz, 0.0, vd / vl, vl * 1.03 + 0.3);
+        while (rayQueryProceedEXT(rv)) {}
+        vec3 mc = vec3(0.0);
+        if (rayQueryGetIntersectionTypeEXT(rv, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            vec4 tn, vc;
+            if (surfaceAt(rayQueryGetIntersectionInstanceIdEXT(rv, true), rayQueryGetIntersectionGeometryIndexEXT(rv, true), rayQueryGetIntersectionPrimitiveIndexEXT(rv, true),
+                          rayQueryGetIntersectionBarycentricsEXT(rv, true), rayQueryGetIntersectionTEXT(rv, true), tn, vc)) {
+                if ((u.mat.x & 128u) != 0u) mc = vec3(max(0.03, vc.x * tn.w));                // roughness as the game computes it: white = rough
+                else if ((u.mat.x & 256u) != 0u) mc = tn.rgb;                                 // the normal map itself (xy) and AO (blue)
+                else mc = vec3(vc.y, tn.z, 0.0);                                              // red = metalness, green = AO
+                mc = max(mc, vec3(0.004));
+            } else mc = vec3(0.15, 0.0, 0.15);                                                // hit, but no surface data: violet
+        }
+        imageStore(uGI, p, vec4(mc, 0.0));
+        imageStore(uSh, p, vec4(1.0));
+        return;
     }
     if ((u.mat.x & 2u) != 0u) {   // view=8: what the rays know about the surface in this pixel (black = no material)
         vec3 vd = P - u.cam.xyz;
