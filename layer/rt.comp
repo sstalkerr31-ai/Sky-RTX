@@ -74,11 +74,12 @@ uint read16(uvec2 a, uint off) {
 
 // ---- surface textures (MeshSh): the game's own normal map and the vertex colour at a hit of the cached scene
 layout(set = 0, binding = 17) uniform sampler2D uTex[];
-struct GeoS { uvec2 idx; uvec2 uv; uvec2 col; uint strides; uint tex; float nscale; uint pad; };
+struct GeoS { uvec2 idx; uvec2 uv; uvec2 col; uint strides; uint tex; float nscale; uint posStride; uvec2 pos; };
 layout(set = 0, binding = 18, std430) readonly buffer GeoSurf { GeoS geoS[]; };
 layout(set = 0, binding = 19, std430) readonly buffer TexAlive { uint texAlive[]; };
 // out: n = u_normTex (xy = normal map, z = AO, w = roughness factor), c = a_color (x = roughness, y = metalness, z = glow)
-bool surfaceAt(uint inst, uint geom, uint prim, vec2 bary, float dist, out vec4 n, out vec4 c) {
+// pix = the size of one screen pixel at the hit (m): the mip level follows the texels that fall into it, like the game's own sampling
+bool surfaceAt(uint inst, uint geom, uint prim, vec2 bary, float pix, out vec4 n, out vec4 c) {
     n = vec4(0.5, 0.5, 1.0, 1.0); c = vec4(0.0);
     if ((u.mat.x & 1024u) == 0u || inst != 0u || geom >= 30000u) return false;
     GeoS s = geoS[u.mat.y * 30000u + geom];
@@ -86,16 +87,24 @@ bool surfaceAt(uint inst, uint geom, uint prim, vec2 bary, float dist, out vec4 
     if (slot == 0u || texAlive[slot - 1u] == 0u) return false;
     uint us = s.strides & 0xFFFFu, cs = s.strides >> 16, fmt = s.tex >> 16;
     vec3 w = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
-    vec2 uv = vec2(0.0);
+    vec2 uv = vec2(0.0), tk[3];
+    vec3 pk[3];
     c = vec4(0.0);
     for (uint k = 0u; k < 3u; ++k) {
         uint vi = read16(s.idx, (prim * 3u + k) * 2u);
-        vec2 t = fmt == 3u ? vec2(uintBitsToFloat(read32(s.uv, vi * us)), uintBitsToFloat(read32(s.uv, vi * us + 4u))) : unpackHalf2x16(read32(s.uv, vi * us));
-        uv += t * w[k];
+        tk[k] = (fmt == 3u ? vec2(uintBitsToFloat(read32(s.uv, vi * us)), uintBitsToFloat(read32(s.uv, vi * us + 4u))) : unpackHalf2x16(read32(s.uv, vi * us))) * s.nscale;
+        uv += tk[k] * w[k];
         c += unpackUnorm4x8(read32(s.col, vi * cs)) * w[k];
+        uint pb = vi * s.posStride;
+        pk[k] = vec3(uintBitsToFloat(read32(s.pos, pb)), uintBitsToFloat(read32(s.pos, pb + 4u)), uintBitsToFloat(read32(s.pos, pb + 8u)));
     }
-    float lod = clamp(log2(max(dist, 0.5)) + 1.0, 0.0, 12.0);
-    n = textureLod(uTex[nonuniformEXT(slot - 1u)], uv * s.nscale, lod);
+    float aw = length(cross(pk[1] - pk[0], pk[2] - pk[0]));                        // twice the area in metres
+    vec2 e1 = tk[1] - tk[0], e2 = tk[2] - tk[0];
+    float at = abs(e1.x * e2.y - e1.y * e2.x);                                      // twice the area in uv
+    vec2 ts = vec2(textureSize(uTex[nonuniformEXT(slot - 1u)], 0));
+    float texPerM = aw > 1e-10 ? sqrt(at / aw) * max(ts.x, ts.y) : 1.0;
+    float lod = clamp(log2(max(pix * texPerM, 1e-4)), 0.0, 12.0);
+    n = textureLod(uTex[nonuniformEXT(slot - 1u)], uv, lod);
     return true;
 }
 
@@ -303,8 +312,10 @@ void main() {
         vec3 mc = vec3(0.0);
         if (rayQueryGetIntersectionTypeEXT(rv, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
             vec4 tn, vc;
+            vec3 Px;
+            float pix = neighbour(p + ivec2(1, 0), Px) ? length(Px - P) : vl * 0.001;   // one pixel at that depth, in metres
             if (surfaceAt(rayQueryGetIntersectionInstanceIdEXT(rv, true), rayQueryGetIntersectionGeometryIndexEXT(rv, true), rayQueryGetIntersectionPrimitiveIndexEXT(rv, true),
-                          rayQueryGetIntersectionBarycentricsEXT(rv, true), rayQueryGetIntersectionTEXT(rv, true), tn, vc)) {
+                          rayQueryGetIntersectionBarycentricsEXT(rv, true), min(pix, vl * 0.01), tn, vc)) {
                 if ((u.mat.x & 128u) != 0u) mc = vec3(max(0.03, vc.x * tn.w));                // roughness as the game computes it: white = rough
                 else if ((u.mat.x & 256u) != 0u) mc = tn.rgb;                                 // the normal map itself (xy) and AO (blue)
                 else mc = vec3(vc.y, tn.z, 0.0);                                              // red = metalness, green = AO

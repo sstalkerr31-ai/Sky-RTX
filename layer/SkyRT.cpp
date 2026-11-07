@@ -362,9 +362,10 @@ struct GeoS {                // where the ray shaders find the surface of a geom
     uint32_t strides;        // uv stride | colour stride << 16
     uint32_t tex;            // texture slot + 1 of u_normTex (0 = none) | uv format << 16 (1 = 4 x half, 2 = 2 x half, 3 = 2 x float)
     float nscale;            // u_normTexScale: uv of the normal map = a_uv0.xy * nscale
-    uint32_t pad;
+    uint32_t posStride;      // stride of the positions (float3)
+    uint64_t pos;            // device address of the position of vertex 0
 };
-static_assert(sizeof(GeoS) == 40, "GeoS is 40 bytes in rt.comp");
+static_assert(sizeof(GeoS) == 48, "GeoS is 48 bytes in rt.comp");
 static const uint32_t kTexMax = 4096;   // slots of the surface texture table
 struct DeviceData;
 static uint64_t FsOfKey(DeviceData* d, GeoKey k);   // shader of a cached mesh (keyFs is recorded without the matrix)
@@ -3796,13 +3797,16 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
             surfUvA = addr(sp.uvB);
             surfColA = addr(sp.colB);
             surfTex = TexSlotFor(d, nv);
+            float raw[4] = {0, 0, 0, 0};
+            bool readOk = false;
             if (mu.buf && !mu.dyn) {
-                float sc = 1.0f;
-                if (ReadBufHost(d, mu.buf, mu.off, &sc, 4) && sc == sc && sc > 1e-4f && sc < 1e4f) surfScale = sc;
+                readOk = ReadBufHost(d, mu.buf, mu.off, raw, sizeof raw);
+                if (readOk && raw[0] == raw[0] && raw[0] > 1e-4f && raw[0] < 1e4f) surfScale = raw[0];
             }
             static std::atomic<int> sl{0};
-            if (sl.fetch_add(1) < 40) Logf("rt: surface of a MeshSh draw: uv loc3 binding %u +%u stride %u fmt %u | colour binding %u +%u stride %u | normTex slot %u | normTexScale %.3f%s",
-                                          sp.uvB, sp.uvOff, sp.uvStride, sp.uvFmt, sp.colB, sp.colOff, sp.colStride, surfTex, surfScale, mu.dyn ? " (dynamic block: 1)" : "");
+            if (sl.fetch_add(1) < 40) Logf("rt: surface of a MeshSh draw: uv loc3 binding %u +%u stride %u fmt %u | colour binding %u +%u stride %u | normTex slot %u | normTexScale %.3f | material block %s%s: %.3f %.3f %.3f %.3f",
+                                          sp.uvB, sp.uvOff, sp.uvStride, sp.uvFmt, sp.colB, sp.colOff, sp.colStride, surfTex, surfScale,
+                                          !mu.buf ? "not found" : mu.dyn ? "dynamic" : readOk ? "read" : "NOT readable", "", raw[0], raw[1], raw[2], raw[3]);
         }
     }
     DeviceData::BufInfo abi{};
@@ -3917,6 +3921,8 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
                 gs.strides = sp.uvStride | (sp.colStride << 16);
                 gs.tex = surfTex | (sp.uvFmt << 16);
                 gs.nscale = surfScale;
+                gs.pos = g.geometry.triangles.vertexData.deviceAddress;
+                gs.posStride = (uint32_t)g.geometry.triangles.vertexStride;
                 if ((gs.uv & 3) || (gs.col & 3)) gs = GeoS{};   // the shaders read 4-byte words
             }
             fg.surf.push_back(gs);
