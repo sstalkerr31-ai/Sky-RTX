@@ -105,6 +105,7 @@ static std::atomic<bool> g_fpsOn{false};   // FPS counter in the corner (Ctrl+F,
 static int g_fpsCfg = -1;                 // last fps= value read from SkyRT.cfg (a change there switches the counter)
 static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
 static int g_meshXf = 1;          // cfg meshxf: cached meshes placed by their draw's model matrix (fixes phantoms)
+static int g_menuSwitch = 1;      // cfg menuswitch: the game's "dark mode only" switch turns ray tracing on / off
 static int g_boundsCheck = 1;     // cfg bounds: every cached mesh is measured on the GPU before it enters the ray scene (garbage stays out)
 static int g_guard = 1;           // cfg guard: meshes the rays meet in front of what the game drew leave the ray scene (stale / misplaced geometry)
 static int g_levelModels = 0;     // cfg levelmodels (off until the village freeze is understood): the level's placed meshes from the game files in the ray scene
@@ -4007,6 +4008,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "meshxf")) g_meshXf = v != 0.0;
         else if (!strcmp(key, "guard")) g_guard = v != 0.0;
         else if (!strcmp(key, "bounds")) g_boundsCheck = v != 0.0;
+        else if (!strcmp(key, "menuswitch")) g_menuSwitch = v != 0.0;
         else if (!strcmp(key, "modelsall")) g_modelsAll = v != 0.0;
         else if (!strcmp(key, "castprobe")) g_castProbe = v != 0.0;
         else if (!strcmp(key, "icefx")) g_iceOn = v != 0.0;
@@ -4053,7 +4055,64 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         Logf("rt: emissive light: light=%d strength %.2f range %.1f threshold %.2f rays %d debug %d | multi-bounce gimulti=%.2f | deep=%d bounces=%d pathtrace=%d", g_lightOn ? 1 : 0, (double)g_lightStrength, (double)g_lightRange, (double)g_lightThr, g_lightRays, g_lightDebug ? 1 : 0, (double)g_giMulti, g_deep ? 1 : 0, g_bounces, g_pathTrace ? 1 : 0);
 }
 
-static void PollKeys(uint64_t frame) {  // Ctrl+Home = on/off, Ctrl+End = shader census; SkyRT.cfg is re-read when it changes
+// The game's own menu switch "dark mode only" (Настройки графики) doubles as the ray tracing switch: the game writes it to
+// %APPDATA%\ThatGameCompany\com.tgc.sky.win\preferences.sav at once. Layout: "PREF", version, ..., u32 @24 = offset of the
+// name table; from @28 pairs (name offset in the table, value) up to the table. -1 = not readable.
+static int ReadDarkModePref(FILETIME* stamp) {
+    wchar_t path[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableW(L"APPDATA", path, MAX_PATH);
+    if (!n || n >= MAX_PATH - 64) return -1;
+    wcscat_s(path, L"\\ThatGameCompany\\com.tgc.sky.win\\preferences.sav");
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) return -1;
+    if (stamp) {
+        if (CompareFileTime(stamp, &fa.ftLastWriteTime) == 0) return -2;   // unchanged
+        *stamp = fa.ftLastWriteTime;
+    }
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { if (stamp) *stamp = FILETIME{}; return -1; }
+    std::vector<uint8_t> b(fa.nFileSizeLow < (1u << 20) ? fa.nFileSizeLow : 0);
+    DWORD got = 0;
+    const BOOL ok = !b.empty() && ReadFile(h, b.data(), (DWORD)b.size(), &got, nullptr) && got == b.size();
+    CloseHandle(h);
+    if (!ok || b.size() < 32 || memcmp(b.data(), "PREF", 4) != 0) { if (stamp) *stamp = FILETIME{}; return -1; }   // half written: again next time
+    uint32_t names = 0;
+    memcpy(&names, &b[24], 4);
+    if (names >= b.size() || names < 28) return -1;
+    static const char kName[] = "kUserPreference_EnableDarkMode";
+    uint32_t off = 0xFFFFFFFFu;
+    for (size_t i = names; i + sizeof kName <= b.size();) {
+        const char* s = (const char*)&b[i];
+        const size_t len = strnlen(s, b.size() - i);
+        if (len == sizeof kName - 1 && !memcmp(s, kName, len)) { off = (uint32_t)(i - names); break; }
+        i += len + 1;
+    }
+    if (off == 0xFFFFFFFFu) return -1;
+    for (size_t q = 28; q + 8 <= names; q += 8) {
+        uint32_t k, v;
+        memcpy(&k, &b[q], 4); memcpy(&v, &b[q + 4], 4);
+        if (k == off) return v ? 1 : 0;
+    }
+    return -1;
+}
+
+static void PollMenuSwitch(uint64_t frame) {
+    static FILETIME stamp{};
+    static int last = -1;
+    static uint64_t next = 0;
+    if (!g_menuSwitch || frame < next) return;
+    next = frame + 30;   // about twice a second
+    const int v = ReadDarkModePref(&stamp);
+    if (v < 0 || v == last) return;
+    const bool first = last < 0;
+    last = v;
+    g_enabled = v == 1;
+    Logf("rt: game menu switch (Настройки графики, the former \"dark mode only\") %s -> ray tracing %s", first ? "read at start" : "changed",
+         g_enabled ? "ON (our render)" : "OFF (original game picture)");
+}
+
+static void PollKeys(uint64_t frame) {
+    PollMenuSwitch(frame);  // Ctrl+Home = on/off, Ctrl+End = shader census; SkyRT.cfg is re-read when it changes
     if (frame % 60 == 1) {
         static FILETIME lastWrite = {};
         char path[MAX_PATH];
