@@ -587,6 +587,8 @@ struct DeviceData {
     std::unordered_set<VkDeviceMemory> texHeldMems;        // cacheMtx: memory of held images
     std::unordered_map<VkImage, VkDeviceMemory> imgMem;    // texMtx: memory every image is bound to
     std::unordered_map<VkImageView, VkImage> viewImg;      // texMtx: image of every view
+    struct ImgDesc { uint32_t fmt, w, h, mips; };
+    std::unordered_map<VkImage, ImgDesc> imgDesc;          // texMtx: format and size of every sampled image (for the log)
     VkDescriptorPool paintPool = VK_NULL_HANDLE;
     VkDescriptorSet paintSets[16] = {};
     bool paintTried = false, paintOk = false;             // guarded by paintMtx
@@ -2198,7 +2200,11 @@ static uint32_t TexSlotFor(DeviceData* d, VkImageView v) {
         if (mi != d->imgMem.end()) d->texHeldMems.insert(mi->second);
     }
     static std::atomic<int> tl{0};
-    if (tl.fetch_add(1) < 3 || s % 500 == 499) Logf("rt: surface texture slot %u <- view %p", s, (void*)v);
+    if (tl.fetch_add(1) < 40 || s % 500 == 499) {
+        auto di = d->imgDesc.find(vi->second);
+        if (di != d->imgDesc.end()) Logf("rt: surface texture slot %u <- view %p: %s %ux%u, %u mips", s, (void*)v, FormatName(di->second.fmt), di->second.w, di->second.h, di->second.mips);
+        else Logf("rt: surface texture slot %u <- view %p (image size unknown)", s, (void*)v);
+    }
     return s + 1;
 }
 // writes the slots that changed since this descriptor set was last used (the set is not in flight: 16 sets in a ring)
@@ -2364,6 +2370,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL SkyRT_CreateImage(VkDevice device, const V
                  finalUsage != u ? " (patched: +STORAGE/+SAMPLED)" : "");
     }
     if (r == VK_SUCCESS && g_texProbe.load(std::memory_order_relaxed)) TpOnImage(pCreateInfo, *pImage);
+    if (r == VK_SUCCESS && d->descIdx && (pCreateInfo->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
+        std::lock_guard<std::mutex> tk(d->texMtx);
+        d->imgDesc[*pImage] = {(uint32_t)pCreateInfo->format, pCreateInfo->extent.width, pCreateInfo->extent.height, pCreateInfo->mipLevels};
+    }
     return r;
 }
 
@@ -3791,7 +3801,7 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
                 if (ReadBufHost(d, mu.buf, mu.off, &sc, 4) && sc == sc && sc > 1e-4f && sc < 1e4f) surfScale = sc;
             }
             static std::atomic<int> sl{0};
-            if (sl.fetch_add(1) < 6) Logf("rt: surface of a MeshSh draw: uv loc3 binding %u +%u stride %u fmt %u | colour binding %u +%u stride %u | normTex slot %u | normTexScale %.3f%s",
+            if (sl.fetch_add(1) < 40) Logf("rt: surface of a MeshSh draw: uv loc3 binding %u +%u stride %u fmt %u | colour binding %u +%u stride %u | normTex slot %u | normTexScale %.3f%s",
                                           sp.uvB, sp.uvOff, sp.uvStride, sp.uvFmt, sp.colB, sp.colOff, sp.colStride, surfTex, surfScale, mu.dyn ? " (dynamic block: 1)" : "");
         }
     }
@@ -6193,6 +6203,7 @@ static VKAPI_ATTR void VKAPI_CALL SkyRT_DestroyImage(VkDevice device, VkImage im
     if (d->descIdx) {
         std::lock_guard<std::mutex> tk(d->texMtx);
         d->imgMem.erase(image);
+        d->imgDesc.erase(image);
         for (auto& kv : d->texOf) {   // views of this image still in the table: their slots go now (the views themselves wait for their own destruction)
             if (kv.second & 0x80000000u) continue;
             auto vi = d->viewImg.find(kv.first);
