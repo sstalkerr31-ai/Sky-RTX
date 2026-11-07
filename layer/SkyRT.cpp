@@ -3037,7 +3037,7 @@ static bool EnsurePaintResources(DeviceData* d) {
             d->MapMemory(d->device, d->geoMatMem, 0, VK_WHOLE_SIZE, 0, &gp) != VK_SUCCESS || !gp ||
             d->MapMemory(d->device, d->matColMem, 0, VK_WHOLE_SIZE, 0, &cp) != VK_SUCCESS || !cp) { Logf("!!! rt: material buffers failed"); return false; }
         void* hp = nullptr;
-        if (!MakeBufEx(d, (VkDeviceSize)((kMaxCacheGeoms + 8) * 5 + 8 + kMaxCacheGeoms * 2 + 8) * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->castBuf, d->castMem, da) ||
+        if (!MakeBufEx(d, (VkDeviceSize)((kMaxCacheGeoms + 8) * 5 + 8 + kMaxCacheGeoms * 2 + 8 + 16) * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, d->castBuf, d->castMem, da) ||
             d->MapMemory(d->device, d->castMem, 0, VK_WHOLE_SIZE, 0, &hp) != VK_SUCCESS || !hp) { Logf("!!! rt: shadow probe buffer failed"); return false; }
         d->castPtr = (uint32_t*)hp;
         memset(hp, 0, (size_t)((kMaxCacheGeoms + 8) * 5 + 8) * sizeof(uint32_t));
@@ -5352,7 +5352,15 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
             }
         }
         memset(d->castPtr, 0, (n * 5 + 8) * sizeof(uint32_t));
-        memset(d->castPtr + n * 5 + 8 + kMaxCacheGeoms * 2, 0, 8 * sizeof(uint32_t));
+        {   // the surface the rays read in the middle of the screen (surface textures)
+            const uint32_t* s = d->castPtr + n * 5 + 8 + kMaxCacheGeoms * 2 + 8;
+            float f[16];
+            memcpy(f, s, sizeof f);
+            if (s[0] == 1) Logf("aim surface: geometry %u slot %u | uv %.3f %.3f | lod %.2f (texels/m %.1f, pixel %.4f m) | normTex %.3f %.3f %.3f %.3f | a_color %.3f %.3f %.3f",
+                                s[1], s[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14]);
+            else if (s[0] == 2) Logf("aim surface: the middle of the screen is no surface with textures (geometry %u)", s[1]);
+        }
+        memset(d->castPtr + n * 5 + 8 + kMaxCacheGeoms * 2, 0, 24 * sizeof(uint32_t));
     }
 
     // ---- (re)build BLAS + TLAS only when the set of geometry changed, otherwise reuse the newest complete slot

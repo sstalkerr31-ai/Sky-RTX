@@ -79,6 +79,8 @@ layout(set = 0, binding = 18, std430) readonly buffer GeoSurf { GeoS geoS[]; };
 layout(set = 0, binding = 19, std430) readonly buffer TexAlive { uint texAlive[]; };
 // out: n = u_normTex (xy = normal map, z = AO, w = roughness factor), c = a_color (x = roughness, y = metalness, z = glow)
 // pix = the size of one screen pixel at the hit (m): the mip level follows the texels that fall into it, like the game's own sampling
+vec4 gSurfDbg;   // uv, lod, texels per metre of the last surfaceAt (aim probe)
+uint gSurfSlot;
 bool surfaceAt(uint inst, uint geom, uint prim, vec2 bary, float pix, out vec4 n, out vec4 c) {
     n = vec4(0.5, 0.5, 1.0, 1.0); c = vec4(0.0);
     if ((u.mat.x & 1024u) == 0u || inst != 0u || geom >= 30000u) return false;
@@ -105,6 +107,8 @@ bool surfaceAt(uint inst, uint geom, uint prim, vec2 bary, float pix, out vec4 n
     float texPerM = aw > 1e-10 ? sqrt(at / aw) * max(ts.x, ts.y) : 1.0;
     float lod = clamp(log2(max(pix * texPerM, 1e-4)), 0.0, 12.0);
     n = textureLod(uTex[nonuniformEXT(slot - 1u)], uv, lod);
+    gSurfDbg = vec4(uv, lod, texPerM);
+    gSurfSlot = slot;
     return true;
 }
 
@@ -287,6 +291,24 @@ void main() {
             castHist[sb + 5u] = floatBitsToUint(sp.x); castHist[sb + 6u] = floatBitsToUint(sp.y); castHist[sb + 7u] = floatBitsToUint(sp.z);
             castHist[sb] = 1u;
         } else castHist[sb] = 2u;
+        // the surface textures at this point
+        uint ab = 210056u;
+        if (rayQueryGetIntersectionTypeEXT(ra, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            vec4 tn, vc;
+            vec3 Px;
+            float pix = neighbour(p + ivec2(1, 0), Px) ? length(Px - P) : cl * 0.001;
+            uint gi = uint(rayQueryGetIntersectionGeometryIndexEXT(ra, true));
+            castHist[ab + 1u] = gi;
+            if (surfaceAt(rayQueryGetIntersectionInstanceIdEXT(ra, true), gi, rayQueryGetIntersectionPrimitiveIndexEXT(ra, true), rayQueryGetIntersectionBarycentricsEXT(ra, true), min(pix, cl * 0.01), tn, vc)) {
+                castHist[ab + 2u] = gSurfSlot - 1u;
+                castHist[ab + 3u] = floatBitsToUint(gSurfDbg.x); castHist[ab + 4u] = floatBitsToUint(gSurfDbg.y);
+                castHist[ab + 5u] = floatBitsToUint(gSurfDbg.z); castHist[ab + 6u] = floatBitsToUint(gSurfDbg.w);
+                castHist[ab + 7u] = floatBitsToUint(pix);
+                castHist[ab + 8u] = floatBitsToUint(tn.x); castHist[ab + 9u] = floatBitsToUint(tn.y); castHist[ab + 10u] = floatBitsToUint(tn.z); castHist[ab + 11u] = floatBitsToUint(tn.w);
+                castHist[ab + 12u] = floatBitsToUint(vc.x); castHist[ab + 13u] = floatBitsToUint(vc.y); castHist[ab + 14u] = floatBitsToUint(vc.z);
+                castHist[ab] = 1u;
+            } else castHist[ab] = 2u;
+        }
     }
     if ((u.mat.x & 64u) != 0u && (p.x & 7) == int(u.misc.w & 7u) && (p.y & 7) == int((u.misc.w >> 3) & 7u)) {
         // the guard (every 64th pixel, a new one each frame): does the camera ray meet a cached mesh in front of what the game drew here?
