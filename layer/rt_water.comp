@@ -226,6 +226,59 @@ vec3 rippleNormal(vec2 q, float t) {
     return normalize(vec3(nx * 0.05, 1.0, nz * 0.05));
 }
 
+// what a reflected ray from O along R sees: the frame where that point is on the screen, else a stand-in colour, else the sky.
+// wc = the colour of the reflecting pixel (a stand-in never gets much brighter than it)
+vec3 traceRefl(vec3 O, vec3 R, vec3 wc, out vec3 dbg) {
+    vec3 refl;
+    rayQueryEXT rr;
+    rayQueryInitializeEXT(rr, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0xFF, O, 0.0, R, 3000.0);
+    while (rayQueryProceedEXT(rr)) {}
+    vec3 sky = skyToward(R, wc);
+    dbg = vec3(0.0);   // waterdebug=2: where the reflection came from
+    if (rayQueryGetIntersectionTypeEXT(rr, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+        vec3 hp = O + R * rayQueryGetIntersectionTEXT(rr, true);
+        dbg = vec3(1.0, 0.0, 0.0);   // red: hit something on the screen
+        if (!frameAt(hp, refl, false)) {
+            dbg = rayQueryGetIntersectionInstanceCustomIndexEXT(rr, true) == 1 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 1.0, 0.0);   // green: level ground off the screen, yellow: other geometry off the screen   // something off the screen: light its material like the trace pass does, else a darker horizon
+            vec4 hm = hitMaterial(rayQueryGetIntersectionInstanceIdEXT(rr, true), rayQueryGetIntersectionGeometryIndexEXT(rr, true));
+            bool ground = rayQueryGetIntersectionInstanceCustomIndexEXT(rr, true) == 1 && u.lvl.z != 0u && u.grassCol.w > 0.5 && u.rockCol.w > 0.5;
+            if (ground && u.sunCol.w > 0.5) {   // the level ground from the game files: grass on the flat, rock on the steep, lit by the sun
+                vec3 gn = groundNormal(uint(rayQueryGetIntersectionPrimitiveIndexEXT(rr, true)));
+                if (dot(gn, R) > 0.0) gn = -gn;
+                vec3 alb = mix(u.rockCol.rgb, u.grassCol.rgb, smoothstep(0.55, 0.8, abs(gn.y)));
+                vec3 sl = normalize(u.sun.xyz);
+                float nl = max(dot(gn, sl), 0.0);
+                if (nl > 0.0) {
+                    rayQueryEXT rs;
+                    rayQueryInitializeEXT(rs, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, hp + gn * 0.1, 0.0, sl, 2000.0);
+                    while (rayQueryProceedEXT(rs)) {}
+                    if (rayQueryGetIntersectionTypeEXT(rs, true) != gl_RayQueryCommittedIntersectionNoneEXT) nl = 0.0;
+                }
+                refl = alb * (u.sunCol.rgb * nl + u.ambCol.rgb + u.skyCol.rgb) * (float(u.mat.z) / 256.0);
+            } else if (hm.w > 0.5 && u.sunCol.w > 0.5) {
+                vec3 sl = normalize(u.sun.xyz);
+                rayQueryEXT rs;
+                rayQueryInitializeEXT(rs, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, hp - R * 0.05, 0.0, sl, 2000.0);
+                while (rayQueryProceedEXT(rs)) {}
+                float lit = rayQueryGetIntersectionTypeEXT(rs, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 0.5 : 0.0;   // no normal here: half of N.L on average
+                refl = hm.rgb * (u.sunCol.rgb * lit + u.ambCol.rgb) * (float(u.mat.z) / 256.0);
+            } else {
+                refl = sky * 0.5;
+            }
+        }
+        if (dbg.g > 0.5) {   // off the screen (yellow / green): its stand-in colour is lit by the game's sun / shade values, which can be far
+            // brighter than the picture (a cave ceiling at night). The surface's own brightness is the best clue to the scene's: stay near it.
+            const vec3 lum = vec3(0.2126, 0.7152, 0.0722);
+            float lr = dot(refl, lum), lw = max(dot(wc, lum), 1e-4);
+            if (lr > lw * 1.5) refl *= lw * 1.5 / lr;
+        }
+    } else {
+        refl = sky;   // skyToward already tried the screen first
+        dbg = skySrc == 1 ? vec3(0.0, 0.4, 1.0) : skySrc == 2 ? vec3(0.0, 1.0, 1.0) : skySrc == 3 ? vec3(1.0, 0.0, 1.0) : vec3(1.0);   // blue: sky from the screen, cyan: panorama, magenta: lowered, white: none
+    }
+    return refl;
+}
+
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     ivec2 sz = imageSize(uWater);
@@ -350,58 +403,41 @@ void main() {
 #else
     if (R.y < 0.0) R.y = -R.y;   // ripples must not send the ray into the water itself
 #endif
-    vec3 refl;
-    rayQueryEXT rr;
-#ifdef SURF
-    rayQueryInitializeEXT(rr, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0xFF, P + Ngw * 0.03, 0.0, R, 3000.0);
-#else
-    rayQueryInitializeEXT(rr, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0xFF, P + N * 0.05, 0.0, R, 3000.0);
-#endif
-    while (rayQueryProceedEXT(rr)) {}
     vec3 wc = imageLoad(uWater, p).rgb;
-    vec3 sky = skyToward(R, wc);
-    vec3 dbg = vec3(0.0);   // waterdebug=2: where the reflection came from
-    if (rayQueryGetIntersectionTypeEXT(rr, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-        vec3 hp = P + N * 0.05 + R * rayQueryGetIntersectionTEXT(rr, true);
-        dbg = vec3(1.0, 0.0, 0.0);   // red: hit something on the screen
-        if (!frameAt(hp, refl, false)) {
-            dbg = rayQueryGetIntersectionInstanceCustomIndexEXT(rr, true) == 1 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 1.0, 0.0);   // green: level ground off the screen, yellow: other geometry off the screen   // something off the screen: light its material like the trace pass does, else a darker horizon
-            vec4 hm = hitMaterial(rayQueryGetIntersectionInstanceIdEXT(rr, true), rayQueryGetIntersectionGeometryIndexEXT(rr, true));
-            bool ground = rayQueryGetIntersectionInstanceCustomIndexEXT(rr, true) == 1 && u.lvl.z != 0u && u.grassCol.w > 0.5 && u.rockCol.w > 0.5;
-            if (ground && u.sunCol.w > 0.5) {   // the level ground from the game files: grass on the flat, rock on the steep, lit by the sun
-                vec3 gn = groundNormal(uint(rayQueryGetIntersectionPrimitiveIndexEXT(rr, true)));
-                if (dot(gn, R) > 0.0) gn = -gn;
-                vec3 alb = mix(u.rockCol.rgb, u.grassCol.rgb, smoothstep(0.55, 0.8, abs(gn.y)));
-                vec3 sl = normalize(u.sun.xyz);
-                float nl = max(dot(gn, sl), 0.0);
-                if (nl > 0.0) {
-                    rayQueryEXT rs;
-                    rayQueryInitializeEXT(rs, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, hp + gn * 0.1, 0.0, sl, 2000.0);
-                    while (rayQueryProceedEXT(rs)) {}
-                    if (rayQueryGetIntersectionTypeEXT(rs, true) != gl_RayQueryCommittedIntersectionNoneEXT) nl = 0.0;
-                }
-                refl = alb * (u.sunCol.rgb * nl + u.ambCol.rgb + u.skyCol.rgb) * (float(u.mat.z) / 256.0);
-            } else if (hm.w > 0.5 && u.sunCol.w > 0.5) {
-                vec3 sl = normalize(u.sun.xyz);
-                rayQueryEXT rs;
-                rayQueryInitializeEXT(rs, uTlas, gl_RayFlagsCullNoOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, hp - R * 0.05, 0.0, sl, 2000.0);
-                while (rayQueryProceedEXT(rs)) {}
-                float lit = rayQueryGetIntersectionTypeEXT(rs, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 0.5 : 0.0;   // no normal here: half of N.L on average
-                refl = hm.rgb * (u.sunCol.rgb * lit + u.ambCol.rgb) * (float(u.mat.z) / 256.0);
-            } else {
-                refl = sky * 0.5;
-            }
+    vec3 dbg;
+#ifdef SURF
+    // rough: several rays spread like the game's GGX lobe (alpha = roughness); a new set every frame, the game's TAA averages them
+    vec3 refl = vec3(0.0);
+    int nr = rough < 0.08 ? 1 : int(u.surf.z);
+    float a2 = rough * rough;
+    vec3 Tt = normalize(abs(N.y) < 0.99 ? cross(N, vec3(0.0, 1.0, 0.0)) : cross(N, vec3(1.0, 0.0, 0.0)));
+    vec3 Bt = cross(N, Tt);
+    uint seed = hash3(uvec3(uvec2(p), u.misc.w));
+    int got = 0;
+    for (int i = 0; i < nr; ++i) {
+        vec3 Ri = R;
+        if (nr > 1) {
+            float u1 = float((seed >> 8) & 0xFFFFu) / 65535.0, u2 = float(hash3(uvec3(seed, uint(i), 7u)) & 0xFFFFu) / 65535.0;
+            seed = hash3(uvec3(seed, uint(i) + 1u, 13u));
+            float ph = 6.2831853 * (u1 + float(i) / float(nr));                       // stratified around the lobe
+            float ct = sqrt((1.0 - u2) / (1.0 + (a2 - 1.0) * u2));
+            float st = sqrt(max(1.0 - ct * ct, 0.0));
+            vec3 H = normalize(Tt * (cos(ph) * st) + Bt * (sin(ph) * st) + N * ct);
+            Ri = reflect(V, H);
+            if (dot(Ri, Ngw) < 0.02) continue;                                        // below the surface: no light from there
         }
-        if (dbg.g > 0.5) {   // off the screen (yellow / green): its stand-in colour is lit by the game's sun / shade values, which can be far
-            // brighter than the picture (a cave ceiling at night). The surface's own brightness is the best clue to the scene's: stay near it.
-            const vec3 lum = vec3(0.2126, 0.7152, 0.0722);
-            float lr = dot(refl, lum), lw = max(dot(wc, lum), 1e-4);
-            if (lr > lw * 1.5) refl *= lw * 1.5 / lr;
-        }
-    } else {
-        refl = sky;   // skyToward already tried the screen first
-        dbg = skySrc == 1 ? vec3(0.0, 0.4, 1.0) : skySrc == 2 ? vec3(0.0, 1.0, 1.0) : skySrc == 3 ? vec3(1.0, 0.0, 1.0) : vec3(1.0);   // blue: sky from the screen, cyan: panorama, magenta: lowered, white: none
+        vec3 di;
+        refl += traceRefl(P + Ngw * 0.03, Ri, wc, di);
+        dbg = di;
+        ++got;
     }
+    if (got == 0) return;
+    refl /= float(got);
+#elif defined(ICE)
+    vec3 refl = traceRefl(P + N * 0.05, R, wc, dbg);
+#else
+    vec3 refl = traceRefl(P + N * 0.05, R, wc, dbg);
+#endif
     float cosv = max(dot(-V, N), 0.0);
 #ifdef ICE
     float F0 = clamp(u.wat.z, 0.0, 1.0), strength = u.wat.w;

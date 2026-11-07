@@ -106,7 +106,8 @@ static std::atomic<bool> g_fpsOn{false};   // FPS counter in the corner (Ctrl+F,
 static int g_fpsCfg = -1;                 // last fps= value read from SkyRT.cfg (a change there switches the counter)
 static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
 static int g_meshXf = 1;          // cfg meshxf: cached meshes placed by their draw's model matrix (fixes phantoms)
-static float g_surfRefl = 1.0f, g_surfRough = 0.6f;   // cfg surfrefl (strength of the rays' reflections on MeshSh models, 0 = off) / surfrough (rougher surfaces keep the game's own)
+static float g_surfRefl = 1.0f, g_surfRough = 0.85f;
+static int g_surfRays = 4;      // cfg surfrays: rays per pixel on rough surfaces (spread like the game's GGX lobe)   // cfg surfrefl (strength of the rays' reflections on MeshSh models, 0 = off) / surfrough (rougher surfaces keep the game's own)
 static int g_surfTex = 1;          // cfg surftex: the game's normal maps / roughness of MeshSh models are read in the rays
 static const uint64_t kMeshShFs = 0xc7e04cd8a8bb69c0ull;   // MeshSh-13f fragment shader (u_normTex at set 1 binding 7)
 struct DescUbo { VkBuffer buf = VK_NULL_HANDLE; VkDeviceSize off = 0; bool dyn = false; };
@@ -4260,6 +4261,7 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "surftex")) g_surfTex = v != 0.0;
         else if (!strcmp(key, "surfrefl")) g_surfRefl = (float)std::max(0.0, std::min(4.0, v));
         else if (!strcmp(key, "surfrough")) g_surfRough = (float)std::max(0.05, std::min(1.0, v));
+        else if (!strcmp(key, "surfrays")) g_surfRays = (int)std::max(1.0, std::min(8.0, v));
         else if (!strcmp(key, "modelsall")) g_modelsAll = v != 0.0;
         else if (!strcmp(key, "castprobe")) g_castProbe = v != 0.0;
         else if (!strcmp(key, "icefx")) g_iceOn = v != 0.0;
@@ -5705,7 +5707,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     const bool matOn = g_matTrack && d->matPipe;
     par->mat[0] = (g_guard && d->castPtr ? 64u : 0u) | (d->domeView ? 32u : 0u) | (g_castProbe && d->castPtr ? 16u : 0u) | (matOn && g_matAlbedo.load(std::memory_order_relaxed) ? 1u : 0u) | (matOn && (g_view == 8 || g_view == 10) ? 2u : 0u) | (matOn && g_view == 9 ? 4u : 0u) | (matOn && g_view == 10 ? 8u : 0u);
     par->mat[1] = (uint32_t)(slot - d->rtSlots);
-    par->surf[0] = g_surfRefl; par->surf[1] = g_surfRough; par->surf[2] = 0.0f; par->surf[3] = 0.0f;
+    par->surf[0] = g_surfRefl; par->surf[1] = g_surfRough; par->surf[2] = (float)g_surfRays; par->surf[3] = 0.0f;
     par->mat[0] |= (g_view == 11 ? 128u : 0u) | (g_view == 12 ? 256u : 0u) | (g_view == 13 ? 512u : 0u) |
                    (d->descIdx && g_surfTex && d->surfPtr && par->mat[1] < 8 && d->geoVOk[par->mat[1]] ? 1024u : 0u);
     par->mat[2] = (uint32_t)(g_matGain * 256.0f);
@@ -5965,7 +5967,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         d->CmdDispatch(cb, (m.w + 7) / 8, (m.h + 7) / 8, 1);
         static std::atomic<uint64_t> sr{0};
         const uint64_t n = ++sr;
-        if (n == 1 || n % 6000 == 0) Logf("rt: surface reflections: pass #%llu (strength %.2f, up to roughness %.2f)", (unsigned long long)n, par->surf[0], par->surf[1]);
+        if (n == 1 || n % 6000 == 0) Logf("rt: surface reflections: pass #%llu (strength %.2f, up to roughness %.2f, %d rays on rough surfaces)", (unsigned long long)n, par->surf[0], par->surf[1], (int)par->surf[2]);
     }
 
     VkImageMemoryBarrier post = {};
