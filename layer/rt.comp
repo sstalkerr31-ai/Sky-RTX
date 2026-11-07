@@ -74,7 +74,7 @@ uint read16(uvec2 a, uint off) {
 
 // ---- surface textures (MeshSh): the game's own normal map and the vertex colour at a hit of the cached scene
 layout(set = 0, binding = 17) uniform sampler2D uTex[];
-struct GeoS { uvec2 idx; uvec2 uv; uvec2 col; uint strides; uint tex; float nscale; uint posStride; uvec2 pos; };
+struct GeoS { uvec2 idx; uvec2 uv; uvec2 col; uint strides; uint tex; float nscale; uint posStride; uvec2 pos; uvec2 nrm; uint nrmStride; uint pad; vec4 xf0; vec4 xf1; vec4 xf2; };
 layout(set = 0, binding = 18, std430) readonly buffer GeoSurf { GeoS geoS[]; };
 layout(set = 0, binding = 19, std430) readonly buffer TexAlive { uint texAlive[]; };
 // out: n = u_normTex (xy = normal map, z = AO, w = roughness factor), c = a_color (x = roughness, y = metalness, z = glow)

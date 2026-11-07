@@ -44,6 +44,7 @@
 #include "rtmat_spv.h"  // SPIR-V of rt_mat.comp (generated): average colour of a material
 #include "rtwater_spv.h"  // SPIR-V of rt_water.comp (generated): reflections on the game's water picture
 #include "rtice_spv.h"    // SPIR-V of rt_water.comp with -DICE (generated): reflections on ice, on the main frame
+#include "rtsurf_spv.h"   // SPIR-V of rt_water.comp with -DSURF (generated): reflections on MeshSh models by their own roughness and normal maps
 #include "rtbounds_spv.h"  // SPIR-V of rt_bounds.comp (generated): measures a mesh before it enters the ray scene
 #include "rtpf_spv.h"   // SPIR-V of rt.comp with -DPOSFETCH (generated): trace pass for GPUs with position fetch
 #include "skyrt_version.h"     // SKYRT_VERSION_STR; SKYRT_BUILD comes from the build (GitHub: run number + commit)
@@ -105,6 +106,7 @@ static std::atomic<bool> g_fpsOn{false};   // FPS counter in the corner (Ctrl+F,
 static int g_fpsCfg = -1;                 // last fps= value read from SkyRT.cfg (a change there switches the counter)
 static int g_castProbe = 0;       // cfg castprobe=1: every 2 s the log names the geometry that sun shadow rays run into (diagnostic)
 static int g_meshXf = 1;          // cfg meshxf: cached meshes placed by their draw's model matrix (fixes phantoms)
+static float g_surfRefl = 1.0f, g_surfRough = 0.6f;   // cfg surfrefl (strength of the rays' reflections on MeshSh models, 0 = off) / surfrough (rougher surfaces keep the game's own)
 static int g_surfTex = 1;          // cfg surftex: the game's normal maps / roughness of MeshSh models are read in the rays
 static const uint64_t kMeshShFs = 0xc7e04cd8a8bb69c0ull;   // MeshSh-13f fragment shader (u_normTex at set 1 binding 7)
 struct DescUbo { VkBuffer buf = VK_NULL_HANDLE; VkDeviceSize off = 0; bool dyn = false; };
@@ -364,8 +366,11 @@ struct GeoS {                // where the ray shaders find the surface of a geom
     float nscale;            // u_normTexScale: uv of the normal map = a_uv0.xy * nscale
     uint32_t posStride;      // stride of the positions (float3)
     uint64_t pos;            // device address of the position of vertex 0
+    uint64_t nrm;            // device address of a_normal (loc2, 4 x snorm8) of vertex 0
+    uint32_t nrmStride, pad;
+    float xf[12];            // the placement matrix (3 rows of 4, like VkTransformMatrixKHR); identity when the mesh has none
 };
-static_assert(sizeof(GeoS) == 48, "GeoS is 48 bytes in rt.comp");
+static_assert(sizeof(GeoS) == 112, "GeoS is 112 bytes in rt.comp / rt_water.comp");
 static const uint32_t kTexMax = 4096;   // slots of the surface texture table
 struct DeviceData;
 static uint64_t FsOfKey(DeviceData* d, GeoKey k);   // shader of a cached mesh (keyFs is recorded without the matrix)
@@ -711,6 +716,7 @@ struct DeviceData {
     uint64_t domeGen = ~0ull;   // the level the sky panorama belongs to; another level clears it
     VkPipeline waterPipe = VK_NULL_HANDLE;
     VkPipeline icePipe = VK_NULL_HANDLE;              // rt_water.comp -DICE: reflections on ice, on the main frame
+    VkPipeline surfPipe = VK_NULL_HANDLE;             // rt_water.comp -DSURF: reflections on MeshSh models
     VkDescriptorSet waterSets[16] = {};   // a ring as long as the trace pass's: a set is not rewritten while a frame in flight uses it
     uint32_t waterRing = 0;
     VkAccelerationStructureKHR lastTlas = VK_NULL_HANDLE;   // the TLAS and parameter buffer of the last trace pass, for the water pass
@@ -2898,6 +2904,7 @@ struct FxParams {
     float wat[4];        // water: x = base reflectivity (cfg waterf0), y = 1: show only the reflection (cfg waterdebug); z, w = ice reflectivity / strength
     uint32_t ice[4];     // x,y = per-triangle table of the level ground (address lo, hi): 2 bytes each, ice and snow weight; z = triangles; w = bit0 ice, bit1 sparkles
     float spark[4];      // snow sparkles: x = strength, y = share of crystals, z = crystal size (m)
+    float surf[4];       // surface reflections (MeshSh): x = strength (cfg surfrefl, 0 = off), y = roughest surface that still reflects (cfg surfrough)
 };
 static_assert(sizeof(FxParams) <= 512, "the parameter buffers are 512 bytes");
 static const uint32_t kLightMax = 256, kLightBufBytes = 16 + 256 * 32 + 64 * 48;   // header, candidates (2 x vec4), 64 persistent lights (3 x vec4)
@@ -2967,6 +2974,7 @@ static bool EnsurePaintResources(DeviceData* d) {
     if (!d->paintPipe || !d->fxPipe) return false;
     if (d->posFetch) d->deepPipe = MakeComputePipe(d, kRtDeepSpv, sizeof(kRtDeepSpv), "deep trace");
     d->icePipe = MakeComputePipe(d, kRtIceSpv, sizeof(kRtIceSpv), "ice reflections");   // optional
+    if (d->descIdx) d->surfPipe = MakeComputePipe(d, kRtSurfSpv, sizeof(kRtSurfSpv), "surface reflections");   // optional
     d->waterPipe = MakeComputePipe(d, kRtWaterSpv, sizeof(kRtWaterSpv), "water reflections");   // optional   // optional: without it the deep bounce mode is unavailable
     Logf("rt: deep bounce mode %s", d->deepPipe ? "available (Ctrl+] on/off, Ctrl+Up/Down = bounces)" : "unavailable (GPU/driver lacks position fetch)");
     d->lightPipe = MakeComputePipe(d, kRtLightSpv, sizeof(kRtLightSpv), "lights");   // optional: without it the emissive light is simply off
@@ -3755,8 +3763,8 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
     }
     const uint32_t matId = bufsOk ? MatForDraw(d, cb, vsHash, fsHash) : 0;
     // surface textures (MeshSh): a_uv0 (loc3), a_color (loc1), u_normTex (set 1 binding 7), u_normTexScale (set 1 binding 0, offset 0)
-    struct SurfPipe { uint32_t uvB = 8, uvOff = 0, uvStride = 0, uvFmt = 0, colB = 8, colOff = 0, colStride = 0; } sp;
-    uint64_t surfUvA = 0, surfColA = 0;
+    struct SurfPipe { uint32_t uvB = 8, uvOff = 0, uvStride = 0, uvFmt = 0, colB = 8, colOff = 0, colStride = 0, nB = 8, nOff = 0, nStride = 0; } sp;
+    uint64_t surfUvA = 0, surfColA = 0, surfNA = 0;
     uint32_t surfTex = 0;
     float surfScale = 1.0f;
     if (bufsOk && d->descIdx && g_surfTex && fsHash == kMeshShFs) {
@@ -3768,10 +3776,12 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
                     if (a.loc == 3) { sp.uvB = a.binding; sp.uvOff = a.offset;
                         sp.uvFmt = a.format == (uint32_t)VK_FORMAT_R16G16B16A16_SFLOAT ? 1u : a.format == (uint32_t)VK_FORMAT_R16G16_SFLOAT ? 2u : (a.format == (uint32_t)VK_FORMAT_R32G32_SFLOAT || a.format == (uint32_t)VK_FORMAT_R32G32B32A32_SFLOAT) ? 3u : 0u; }
                     if (a.loc == 1 && a.format == (uint32_t)VK_FORMAT_R8G8B8A8_UNORM) { sp.colB = a.binding; sp.colOff = a.offset; }
+                    if (a.loc == 2 && a.format == (uint32_t)VK_FORMAT_R8G8B8A8_SNORM) { sp.nB = a.binding; sp.nOff = a.offset; }
                 }
                 for (const DeviceData::PipeInfo::Bind& bd : pit->second.binds) {
                     if (bd.binding == sp.uvB && bd.rate == 0) sp.uvStride = bd.stride;
                     if (bd.binding == sp.colB && bd.rate == 0) sp.colStride = bd.stride;
+                    if (bd.binding == sp.nB && bd.rate == 0) sp.nStride = bd.stride;
                 }
             }
         }
@@ -3796,6 +3806,7 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
         if (sp.uvFmt && sp.uvStride && sp.colStride && nv) {
             surfUvA = addr(sp.uvB);
             surfColA = addr(sp.colB);
+            if (sp.nStride) surfNA = addr(sp.nB);
             surfTex = TexSlotFor(d, nv);
             float raw[4] = {0, 0, 0, 0};
             bool readOk = false;
@@ -3923,6 +3934,12 @@ static void MainDraw(DeviceData* d, VkCommandBuffer cb, bool indirect, VkBuffer 
                 gs.nscale = surfScale;
                 gs.pos = g.geometry.triangles.vertexData.deviceAddress;
                 gs.posStride = (uint32_t)g.geometry.triangles.vertexStride;
+                if (surfNA) {
+                    gs.nrm = surfNA + st.vbOff[sp.nB] + sp.nOff + (uint64_t)c.vertexOffset * sp.nStride;
+                    gs.nrmStride = sp.nStride;
+                    if (gs.nrm & 3) { gs.nrm = 0; gs.nrmStride = 0; }
+                }
+                gs.xf[0] = gs.xf[5] = gs.xf[10] = 1.0f;
                 if ((gs.uv & 3) || (gs.col & 3)) gs = GeoS{};   // the shaders read 4-byte words
             }
             fg.surf.push_back(gs);
@@ -4241,6 +4258,8 @@ static void LoadCfg(bool logIt) {  // SkyRT.cfg next to the DLL, re-read while t
         else if (!strcmp(key, "bounds")) g_boundsCheck = v != 0.0;
         else if (!strcmp(key, "menuswitch")) g_menuSwitch = v != 0.0;
         else if (!strcmp(key, "surftex")) g_surfTex = v != 0.0;
+        else if (!strcmp(key, "surfrefl")) g_surfRefl = (float)std::max(0.0, std::min(4.0, v));
+        else if (!strcmp(key, "surfrough")) g_surfRough = (float)std::max(0.05, std::min(1.0, v));
         else if (!strcmp(key, "modelsall")) g_modelsAll = v != 0.0;
         else if (!strcmp(key, "castprobe")) g_castProbe = v != 0.0;
         else if (!strcmp(key, "icefx")) g_iceOn = v != 0.0;
@@ -5021,6 +5040,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
                 e.xf = xf;
                 e.hasXf = hasXf;
                 if (i < pg.surf.size()) e.s = pg.surf[i];
+                if (hasXf) memcpy(e.s.xf, &xf.matrix[0][0], sizeof e.s.xf);
                 d->geoCache.emplace(pg.keys[i], e);
                 d->buildMems.insert(pg.mems[i].first);
                 d->buildMems.insert(pg.mems[i].second);
@@ -5685,6 +5705,7 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
     const bool matOn = g_matTrack && d->matPipe;
     par->mat[0] = (g_guard && d->castPtr ? 64u : 0u) | (d->domeView ? 32u : 0u) | (g_castProbe && d->castPtr ? 16u : 0u) | (matOn && g_matAlbedo.load(std::memory_order_relaxed) ? 1u : 0u) | (matOn && (g_view == 8 || g_view == 10) ? 2u : 0u) | (matOn && g_view == 9 ? 4u : 0u) | (matOn && g_view == 10 ? 8u : 0u);
     par->mat[1] = (uint32_t)(slot - d->rtSlots);
+    par->surf[0] = g_surfRefl; par->surf[1] = g_surfRough; par->surf[2] = 0.0f; par->surf[3] = 0.0f;
     par->mat[0] |= (g_view == 11 ? 128u : 0u) | (g_view == 12 ? 256u : 0u) | (g_view == 13 ? 512u : 0u) |
                    (d->descIdx && g_surfTex && d->surfPtr && par->mat[1] < 8 && d->geoVOk[par->mat[1]] ? 1024u : 0u);
     par->mat[2] = (uint32_t)(g_matGain * 256.0f);
@@ -5933,6 +5954,18 @@ static void InjectPaint(DeviceData* d, VkCommandBuffer cb, const DeviceData::Mai
         static std::atomic<uint64_t> iceRuns{0};
         const uint64_t ir = ++iceRuns;
         if (ir == 1 || ir % 6000 == 0) Logf("rt: ice reflections: pass #%llu (%u ice-able ground triangles)", (unsigned long long)ir, par->ice[2]);
+    }
+
+    if (d->surfPipe && par->surf[0] > 0.0f && (par->mat[0] & 1024u) && g_view == 0) {   // pass 4: reflections on the models, by their own roughness and normal maps
+        VkMemoryBarrier sb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        sb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        sb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &sb, 0, nullptr, 0, nullptr);
+        d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->surfPipe);
+        d->CmdDispatch(cb, (m.w + 7) / 8, (m.h + 7) / 8, 1);
+        static std::atomic<uint64_t> sr{0};
+        const uint64_t n = ++sr;
+        if (n == 1 || n % 6000 == 0) Logf("rt: surface reflections: pass #%llu (strength %.2f, up to roughness %.2f)", (unsigned long long)n, par->surf[0], par->surf[1]);
     }
 
     VkImageMemoryBarrier post = {};

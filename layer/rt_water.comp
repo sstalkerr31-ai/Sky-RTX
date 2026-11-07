@@ -37,6 +37,7 @@ layout(set = 0, binding = 5, std140) uniform Params {
     vec4 wat;       // x = base reflectivity (straight down), y = 1: show only the reflection (debug); z, w = the same and the strength for ice
     uvec4 ice;      // x,y = per-triangle table of the level ground (2 bytes: ice, snow weight), z = triangles, w = bit0 ice, bit1 sparkles
     vec4 spark;     // snow sparkles: x = strength, y = share of crystals, z = crystal size (m)
+    vec4 surf;      // surface reflections: x = strength, y = roughest surface that still reflects
 } u;
 
 uint hash3(uvec3 v) {   // a small integer hash (PCG-like)
@@ -52,6 +53,74 @@ uint read32(uvec2 a, uint off) {
     uint lo = uaddCarry(a.x, off, carry);
     return U32(uvec2(lo, a.y + carry)).v;
 }
+#ifdef SURF
+#extension GL_EXT_nonuniform_qualifier : require
+// ---- the surface of a MeshSh model at a hit, as the game shades it: smooth vertex normal, tangents from the uv, the game's normal map
+layout(set = 0, binding = 17) uniform sampler2D uTex[];
+struct GeoS { uvec2 idx; uvec2 uv; uvec2 col; uint strides; uint tex; float nscale; uint posStride; uvec2 pos; uvec2 nrm; uint nrmStride; uint pad; vec4 xf0; vec4 xf1; vec4 xf2; };
+layout(set = 0, binding = 18, std430) readonly buffer GeoSurf { GeoS geoS[]; };
+layout(set = 0, binding = 19, std430) readonly buffer TexAlive { uint texAlive[]; };
+uint read16(uvec2 a, uint off) {
+    uint carry;
+    uint lo = uaddCarry(a.x, off, carry);
+    return (U32(uvec2(lo & ~3u, a.y + carry)).v >> ((lo & 2u) * 8u)) & 0xFFFFu;
+}
+vec3 readPos(uvec2 a, uint off) { return vec3(uintBitsToFloat(read32(a, off)), uintBitsToFloat(read32(a, off + 4u)), uintBitsToFloat(read32(a, off + 8u))); }
+// N: world normal with the normal map; rough / metal as the game computes them. pix = one screen pixel at the hit (m), for the mip level
+bool surfaceAt(uint geom, uint prim, vec2 bary, float pix, out vec3 N, out vec3 Ng, out float rough, out float metal) {
+    N = vec3(0.0, 1.0, 0.0); Ng = N; rough = 1.0; metal = 0.0;
+    if ((u.mat.x & 1024u) == 0u || geom >= 30000u) return false;
+    GeoS s = geoS[u.mat.y * 30000u + geom];
+    uint slot = s.tex & 0xFFFFu;
+    if (slot == 0u || texAlive[slot - 1u] == 0u || s.posStride == 0u) return false;
+    uint us = s.strides & 0xFFFFu, cs = s.strides >> 16, fmt = s.tex >> 16;
+    vec3 w = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+    vec3 pk[3]; vec2 tk[3];
+    vec2 uv = vec2(0.0);
+    vec4 c = vec4(0.0);
+    vec3 nv = vec3(0.0);
+    for (uint k = 0u; k < 3u; ++k) {
+        uint vi = read16(s.idx, (prim * 3u + k) * 2u);
+        tk[k] = (fmt == 3u ? vec2(uintBitsToFloat(read32(s.uv, vi * us)), uintBitsToFloat(read32(s.uv, vi * us + 4u))) : unpackHalf2x16(read32(s.uv, vi * us))) * s.nscale;
+        uv += tk[k] * w[k];
+        c += unpackUnorm4x8(read32(s.col, vi * cs)) * w[k];
+        pk[k] = readPos(s.pos, vi * s.posStride);
+        if (s.nrmStride != 0u) nv += unpackSnorm4x8(read32(s.nrm, vi * s.nrmStride)).xyz * w[k];
+    }
+    vec3 e1 = pk[1] - pk[0], e2 = pk[2] - pk[0];
+    vec3 fn = cross(e1, e2);
+    float aw = length(fn);
+    if (aw < 1e-12) return false;
+    fn /= aw;
+    vec3 n0 = dot(nv, nv) > 1e-6 ? normalize(nv) : fn;
+    vec2 d1 = tk[1] - tk[0], d2 = tk[2] - tk[0];
+    float det = d1.x * d2.y - d1.y * d2.x;
+    vec2 ts = vec2(textureSize(uTex[nonuniformEXT(slot - 1u)], 0));
+    float texPerM = sqrt(abs(det) / aw) * max(ts.x, ts.y);
+    float lod = clamp(log2(max(pix * texPerM, 1e-4)), 0.0, 12.0);
+    vec4 tn = textureLod(uTex[nonuniformEXT(slot - 1u)], uv, lod);
+    vec3 nl = n0;
+    if (abs(det) > 1e-12) {
+        vec3 T = (e1 * d2.y - e2 * d1.y) / det;
+        vec3 B = (e2 * d1.x - e1 * d2.x) / det;
+        T = T - n0 * dot(n0, T);
+        if (dot(T, T) > 1e-12) {
+            T = normalize(T);
+            vec3 Bo = cross(n0, T) * (dot(cross(n0, T), B) < 0.0 ? -1.0 : 1.0);
+            vec2 m = tn.xy * 2.0078125 - 1.0078125;             // the game's decoding (MeshSh)
+            float mm = dot(m, m);
+            vec3 mt = mm <= 0.99755859 ? vec3(m, sqrt(1.0 - mm)) : vec3(m * (0.99853515625 * inversesqrt(mm)), 0.0447);
+            nl = normalize(T * mt.x + Bo * mt.y + n0 * mt.z);
+        }
+    }
+    mat3 M = transpose(mat3(s.xf0.xyz, s.xf1.xyz, s.xf2.xyz));   // rows -> the 3x3 part of world = M * local
+    N = normalize(M * nl);
+    Ng = normalize(M * fn);
+    rough = max(0.03, c.x * tn.w);
+    metal = c.y;
+    return true;
+}
+#endif
 // normal of a triangle of the level ground (read from its own buffers)
 vec3 groundNormal(uint prim) {
     vec3 v[3];
@@ -224,6 +293,24 @@ void main() {
     }
     if (abs(groundNormal(prim).y) < 0.8 && !lid) return;   // ice lies flat
     float edge = smoothstep(0.3, 0.8, iceW);       // where the ice blends into snow the reflection fades
+#elif defined(SURF)
+    // a model: the camera ray, looking only at the cached scene (instance mask 1), must meet it at this pixel's depth on a MeshSh surface
+    if (u.surf.x <= 0.0) return;
+    rayQueryEXT rc;
+    rayQueryInitializeEXT(rc, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0x01, u.cam.xyz, 0.0, V, dist * 1.03 + 0.3);
+    while (rayQueryProceedEXT(rc)) {}
+    if (rayQueryGetIntersectionTypeEXT(rc, true) == gl_RayQueryCommittedIntersectionNoneEXT || rayQueryGetIntersectionInstanceIdEXT(rc, true) != 0) return;
+    if (abs(rayQueryGetIntersectionTEXT(rc, true) - dist) > max(0.15, dist * 0.02)) return;   // something else (a character, fog) is what the frame shows here
+    ivec2 qn = min(p + ivec2(1, 0), sz - 1);
+    float zn = texelFetch(uWDepth, qn, 0).r;
+    float pix = zn > 0.0 ? min(length(worldAt(qn, sz, zn) - P), dist * 0.01) : dist * 0.001;
+    vec3 Nn, Ngw;
+    float rough, metal;
+    if (!surfaceAt(uint(rayQueryGetIntersectionGeometryIndexEXT(rc, true)), uint(rayQueryGetIntersectionPrimitiveIndexEXT(rc, true)),
+                   rayQueryGetIntersectionBarycentricsEXT(rc, true), pix, Nn, Ngw, rough, metal)) return;
+    if (rough >= u.surf.y) return;   // rough: the game's own blurred reflection is right
+    if (dot(Ngw, V) > 0.0) { Nn = -Nn; Ngw = -Ngw; }   // the side the camera sees
+    float edge = 1.0 - smoothstep(u.surf.y * 0.5, u.surf.y, rough);
 #else
     // the water's own geometry is in the ray scene as the only non-opaque geometry: a pixel is water only if the camera ray meets
     // the water right at this pixel's depth. Clouds, fog and everything else in this picture are left alone.
@@ -252,14 +339,24 @@ void main() {
     // smooth, with the faintest unevenness so it does not look like glass
     vec2 hn = fract(sin(vec2(dot(floor(P.xz * 4.0), vec2(12.9898, 78.233)), dot(floor(P.xz * 4.0), vec2(39.346, 11.135)))) * 43758.5453) - 0.5;
     vec3 N = normalize(vec3(hn.x * 0.012, 1.0, hn.y * 0.012));
+#elif defined(SURF)
+    vec3 N = Nn;
 #else
     vec3 N = rippleNormal(P.xz, float(u.misc.w & 1023u) * 0.05);
 #endif
     vec3 R = reflect(V, N);
+#ifdef SURF
+    if (dot(R, Ngw) < 0.02) R = normalize(R - Ngw * (dot(R, Ngw) - 0.02));   // a normal-mapped bump must not send the ray into the model itself
+#else
     if (R.y < 0.0) R.y = -R.y;   // ripples must not send the ray into the water itself
+#endif
     vec3 refl;
     rayQueryEXT rr;
+#ifdef SURF
+    rayQueryInitializeEXT(rr, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0xFF, P + Ngw * 0.03, 0.0, R, 3000.0);
+#else
     rayQueryInitializeEXT(rr, uTlas, gl_RayFlagsCullNoOpaqueEXT, 0xFF, P + N * 0.05, 0.0, R, 3000.0);
+#endif
     while (rayQueryProceedEXT(rr)) {}
     vec3 wc = imageLoad(uWater, p).rgb;
     vec3 sky = skyToward(R, wc);
@@ -308,11 +405,20 @@ void main() {
     float cosv = max(dot(-V, N), 0.0);
 #ifdef ICE
     float F0 = clamp(u.wat.z, 0.0, 1.0), strength = u.wat.w;
+#elif defined(SURF)
+    float F0 = mix(0.04, 0.6, metal), strength = u.surf.x;
 #else
     float F0 = clamp(u.wat.x, 0.0, 1.0), strength = u.fx2.y;
 #endif
+#ifdef SURF
+    // the game's own Fresnel (MeshSh): a rough surface reflects less at a glancing angle
+    float F = F0 + (max(1.0 - rough, F0) - F0) * pow(1.0 - cosv, 5.0);
+    float k = clamp(F * strength, 0.0, 0.9) * edge;
+    if (metal > 0.5) refl *= wc / max(dot(wc, vec3(0.2126, 0.7152, 0.0722)), 1e-3) * 0.5 + 0.5;   // metal tints what it reflects
+#else
     float F = F0 + (1.0 - F0) * pow(1.0 - cosv, 5.0);
     float k = clamp(F * strength * 2.0, 0.0, 0.95) * edge;
+#endif
     if (u.wat.y > 0.5) k = 1.0;   // debug: only the reflection
     vec3 outc = mix(wc, refl, k);
     if (u.wat.y > 1.5) outc = dbg * 0.5;
